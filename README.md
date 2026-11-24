@@ -35,7 +35,17 @@ dsh plugin --profile web add /path/to/dsh-cad-studio
 # 重启 dsh 使 host 侧工具挂载；client 侧刷新页面即可
 ```
 
-配置项（cordis 配置）：`freecadPath`（默认自动探测 `/usr/bin/freecadcmd` 等）、`timeoutMs`（默认 180000）、`modelsDir`（默认跟随会话工作区的 `cad-models/`）、`trustedHosts`。
+配置项（cordis 配置）：
+
+| 键 | 默认 | 说明 |
+|---|---|---|
+| `freecadPath` | `''`（自动探测 5 个位置） | `freecadcmd` 路径 |
+| `timeoutMs` | `180000` | 单次脚本超时 |
+| `modelsDir` | `''` | 模型工程目录；空 = 跟随调用会话工作区的 `cad-models/` |
+| `autoOpen` | `'session'` | 面板何时自己占位右栏：`session` = 只有做 CAD 的会话（默认）、`always` = 每个会话、`off` = 从不（页签留在「+」菜单里） |
+| `trustedHosts` | `[]` | 额外允许访问 `/cad-studio/*` 的主机名（本机回环默认允许） |
+
+`autoOpen: 'session'` 的判据是宿主侧的两个信号：这个会话最近一次发布过场景（`lastSession`），或它拥有更早发布过的场景。也就是说——只有真正在这里建过模的对话，右栏才会自动让出位置；别的对话不受打扰。
 
 ## 场景 JSON 协议
 

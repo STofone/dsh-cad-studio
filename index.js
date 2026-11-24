@@ -34,6 +34,12 @@ const DEFAULTS = {
   trustedHosts: [],
   /** Where parametric model documents live; '' = the calling session's workspace. */
   modelsDir: '',
+  /**
+   * When the panel may place its tab in the right sidebar on its own:
+   * 'session' = only for sessions that already published a scene (default),
+   * 'always' = every session, 'off' = never (the tab stays in the "+" menu).
+   */
+  autoOpen: 'session',
 }
 
 /** Resolve the effective config without depending on a schema library. */
@@ -44,6 +50,7 @@ function normalizeConfig(raw) {
     timeoutMs: Number.isFinite(source.timeoutMs) ? Math.max(5000, Number(source.timeoutMs)) : DEFAULTS.timeoutMs,
     trustedHosts: Array.isArray(source.trustedHosts) ? source.trustedHosts.filter((v) => typeof v === 'string') : DEFAULTS.trustedHosts,
     modelsDir: typeof source.modelsDir === 'string' ? source.modelsDir : DEFAULTS.modelsDir,
+    autoOpen: ['session', 'always', 'off'].includes(source.autoOpen) ? source.autoOpen : DEFAULTS.autoOpen,
   }
 }
 
@@ -402,6 +409,10 @@ class FreeCadBridge {
       // (the meshes stay in the scene file; only placements are small).
       modelsDir: this.modelsDir ?? '',
       modelsDirs: this.modelsSeen.slice(0, 12),
+      // Which session last published: the panel only places its tab in the
+      // sidebar for that session (or one that owns older scenes), so unrelated
+      // conversations never get a CAD pane pushed into them.
+      lastSession: this.lastSession ?? '',
       // Merge with what an earlier process wrote: this process may only know
       // about the assemblies it touched, and an unrelated publish must not wipe
       // the others (the panel drives them by hydrating on demand).
@@ -431,6 +442,7 @@ class FreeCadBridge {
       const pointer = JSON.parse(await readFile(join(FreeCadBridge.dataDir, 'state.json'), 'utf8'))
       if (!this.modelsDir && typeof pointer.modelsDir === 'string') this.modelsDir = pointer.modelsDir
       if (Array.isArray(pointer.modelsDirs)) this.modelsSeen = [...new Set([...this.modelsSeen, ...pointer.modelsDirs.filter((d) => typeof d === 'string' && d)])].slice(0, 12)
+      if (!this.lastSession && typeof pointer.lastSession === 'string') this.lastSession = pointer.lastSession
       const disk = Array.isArray(pointer.history) ? pointer.history : []
       const seen = new Set(this.history.map((h) => h.id))
       const merged = [...this.history, ...disk.filter((h) => !seen.has(h.id))]
@@ -440,6 +452,7 @@ class FreeCadBridge {
   }
 
   async publishScene(scene, title, session = this.currentSession ?? '') {
+    if (session) this.lastSession = session
     await this.hydrateHistory()
     // Scene ids are the on-disk filenames: after a restart the counter must
     // resume above whatever is already published, or the first new scene would
@@ -2018,10 +2031,10 @@ if _TARGET:
         try {
           const parsed = JSON.parse(await readFile(join(dir, 'state.json'), 'utf8'))
           const setup = setupStatus(bridge, { withVersion: false })
-          return send(200, JSON.stringify({ runtime, setup, latest: parsed.latest ?? null, assemblies: parsed.assemblies ?? [] }))
+          return send(200, JSON.stringify({ runtime, setup, config: { autoOpen: resolved.autoOpen }, latest: parsed.latest ?? null, lastSession: parsed.lastSession ?? '', assemblies: parsed.assemblies ?? [] }))
         } catch {
           const setup = setupStatus(bridge, { withVersion: false })
-          return send(200, JSON.stringify({ runtime, setup, latest: null }))
+          return send(200, JSON.stringify({ runtime, setup, config: { autoOpen: resolved.autoOpen }, latest: null, lastSession: '' }))
         }
       }
       if (url.pathname === `${ROUTE_PREFIX}/scenes`) {

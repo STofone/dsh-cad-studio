@@ -961,6 +961,10 @@ window.__ModuleLoader__.load({
     // stamps every publish with the session id of the tool call that made it;
     // the client learns its id from the session store as soon as it appears.
     let panelSession = ''
+    /** Host config: 'session' | 'always' | 'off' — see index.js DEFAULTS.autoOpen. */
+    let cadAutoOpen = 'session'
+    /** Memo for "does this session own CAD work", keyed by session id. */
+    let ownsCache = { id: '', owns: false, at: 0 }
 
     function Viewport({ payload, visibility, options, handleRef: externalHandle }) {
       const hostRef = useRef(null)
@@ -1356,6 +1360,10 @@ const FILE_EXTS = ['step', 'stp', 'iges', 'igs', 'brep', 'stl']
             if (!res.ok) throw new Error(`state HTTP ${res.status}`)
             const next = await res.json()
             if (!alive) return
+            // The host owns the policy; the panel only obeys it.
+            if (next && next.config && ['session', 'always', 'off'].includes(next.config.autoOpen)) {
+              cadAutoOpen = next.config.autoOpen
+            }
             setState(next)
             setError('')
             let history = []
@@ -2392,6 +2400,66 @@ const FILE_EXTS = ['step', 'stp', 'iges', 'igs', 'brep', 'stl']
             } catch (err) { /* best-effort: the host's own presentation stands */ }
           }, delayMs)
         }
+        // Auto-placing the tab is what makes the pane discoverable, but doing it
+        // on every session switch hijacks conversations that never touch CAD.
+        // Default gate: only sessions that already own a published scene, or
+        // that live in the CAD workspace, get the bar opened for them.
+        // The conversation id is published on the shell's own DOM
+        // (`data-conversation-session`) — the one signal that has stayed stable
+        // across host versions; the session store snapshot is a bonus.
+        const readDomSession = () => {
+          const el = document.querySelector('[data-conversation-session]')
+            || document.querySelector('[data-sidebar-right-session]')
+          const value = el && (el.getAttribute('data-conversation-session') || el.getAttribute('data-sidebar-right-session'))
+          return typeof value === 'string' ? value : ''
+        }
+        const uiSession = ctx.get?.('uiSession')
+        const current = uiSession && uiSession.adapter && uiSession.adapter.current
+        const readSession = () => {
+          let id = ''
+          try {
+            if (current != null && typeof current.getSnapshot === 'function') {
+              const snap = current.getSnapshot()
+              id = (snap && (snap.sessionId || snap.id || (snap.session && snap.session.id) || (snap.header && snap.header.id))) || ''
+            }
+          } catch (err) { /* no snapshot shape we recognise */ }
+          if (!id) id = readDomSession()
+          if (typeof id === 'string' && id && id !== panelSession) {
+            panelSession = id
+            ownsCache = { id: '', owns: false, at: 0 }
+          }
+          return panelSession
+        }
+
+        // The host owns the policy and both "did CAD happen here" signals, so a
+        // single probe settles it: /state carries the mode plus the last session
+        // that published, /scenes carries who owns the older ones.
+        const sessionOwnsCad = async () => {
+          const id = panelSession || ''
+          if (id && ownsCache.id === id && Date.now() - ownsCache.at < 15000) return ownsCache.owns
+          let owns = false
+          try {
+            const [resState, resScenes] = await Promise.all([
+              fetch(`${ROUTE}/state`, { headers: { accept: 'application/json' } }),
+              fetch(`${ROUTE}/scenes`, { headers: { accept: 'application/json' } }),
+            ])
+            if (resState.ok) {
+              const st = await resState.json()
+              const mode = st && st.config && st.config.autoOpen
+              if (['session', 'always', 'off'].includes(mode)) cadAutoOpen = mode
+              if (id && st && st.lastSession === id) owns = true
+            }
+            if (!owns && id && resScenes.ok) {
+              const data = await resScenes.json()
+              owns = (data.scenes || []).some((sc) => sc && sc.session === id)
+            }
+          } catch (err) { /* a failed probe must not open the bar */ }
+          if (cadAutoOpen === 'off') return false
+          if (cadAutoOpen === 'always') return true
+          if (!id) return false
+          if (id) ownsCache = { id, owns, at: Date.now() }
+          return owns
+        }
         const AUTO_OPEN_DELAYS = [300, 900, 1800, 3000, 5000]
         const openPane = (index) => {
           const ctrl = ctx.get?.('sidebarRight')
@@ -2404,12 +2472,29 @@ const FILE_EXTS = ['step', 'stp', 'iges', 'igs', 'brep', 'stl']
           }
           if (index < AUTO_OPEN_DELAYS.length) setTimeout(() => openPane(index + 1), AUTO_OPEN_DELAYS[index])
         }
-        openPane(0)
+        // Debug surface: `window.__cadStudioAutoOpen` answers "why did the pane
+        // open / not open" without digging through the bundle.
+        const autoOpenTrace = { mode: '', session: '', owns: null, opened: 0, why: 'boot' }
+        try {
+          Object.defineProperty(window, '__cadStudioAutoOpen', {
+            configurable: true,
+            get: () => ({ ...autoOpenTrace, mode: cadAutoOpen, session: panelSession }),
+          })
+        } catch (err) { /* a stale definition from a previous apply is fine */ }
+        const maybeOpen = () => {
+          readSession()
+          autoOpenTrace.why = 'probe'
+          sessionOwnsCad().then((owns) => {
+            autoOpenTrace.owns = owns
+            if (owns) { autoOpenTrace.opened += 1; autoOpenTrace.why = 'opened'; openPane(0) } else autoOpenTrace.why = 'gated'
+          }).catch(() => { autoOpenTrace.why = 'probe-failed' })
+        }
+        maybeOpen()
         // Every session carries its OWN rightbar layout, so entering a session
         // replaces the bar with that session's tabs. Re-place ours whenever the
         // route or the current session changes; a slow caught-up retry covers
         // hosts that notify neither way.
-        const kick = () => openPane(0)
+        const kick = () => maybeOpen()
         const kickSoon = () => setTimeout(kick, 400)
         try {
           window.addEventListener('hashchange', kickSoon)
@@ -2420,21 +2505,26 @@ const FILE_EXTS = ['step', 'stp', 'iges', 'igs', 'brep', 'stl']
           })
         } catch (err) { /* no window: nothing to stage against */ }
         for (const delay of [2000, 5000, 9000, 14000]) setTimeout(kick, delay)
-        const uiSession = ctx.get?.('uiSession')
-        const current = uiSession && uiSession.adapter && uiSession.adapter.current
         if (current != null && typeof current.subscribe === 'function' && typeof current.getSnapshot === 'function') {
-          const readSession = () => {
-            try {
-              const snap = current.getSnapshot()
-              const id = snap && (snap.sessionId || snap.id || (snap.session && snap.session.id) || (snap.header && snap.header.id))
-              if (typeof id === 'string' && id) panelSession = id
-            } catch (err) { /* no snapshot shape we recognise */ }
-          }
-          readSession()
           try {
-            const unsubscribe = current.subscribe(() => { readSession(); openPane(0) })
+            const unsubscribe = current.subscribe(() => { readSession(); maybeOpen() })
             ctx.effect?.(() => unsubscribe)
           } catch (err) { /* no session store on this host: boot-time placement is all */ }
+          // Switching conversations rewrites that attribute without always
+          // firing a store event, so watch it directly; the observer is cheap.
+          try {
+            let lastSeen = ''
+            const observer = new MutationObserver(() => {
+              const next = readDomSession()
+              if (next && next !== lastSeen) { lastSeen = next; readSession(); maybeOpen() }
+            })
+            observer.observe(document.documentElement, {
+              subtree: true,
+              attributes: true,
+              attributeFilter: ['data-conversation-session', 'data-sidebar-right-session'],
+            })
+            ctx.effect?.(() => observer.disconnect())
+          } catch (err) { /* no MutationObserver: the store path above still runs */ }
         }
       },
     }
