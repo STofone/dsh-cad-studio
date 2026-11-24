@@ -69,7 +69,7 @@ window.__ModuleLoader__.load({
       // ── activity rail (VSCode's left bar, sized for a 1/3-screen pane) ──
       rail: { flex: 'none', width: 28, display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 2, padding: '4px 0', borderRight: '1px solid' },
       railBtn: (active) => ({
-        width: 24, height: 24, display: 'flex', alignItems: 'center', justifyContent: 'center',
+        width: 26, height: 26, display: 'flex', alignItems: 'center', justifyContent: 'center',
         border: 'none', borderRadius: 5, padding: 0, cursor: 'pointer', background: active ? 'rgba(77,107,254,0.16)' : 'transparent',
         color: active ? '#4d6bfe' : 'inherit', opacity: active ? 1 : 0.62,
         boxShadow: active ? 'inset 2px 0 0 #4d6bfe' : 'none',
@@ -367,7 +367,7 @@ window.__ModuleLoader__.load({
 
     /** Rail glyphs — 15px so the 28px rail stays a strip, not a column. */
     function RailIcon({ name }) {
-      const common = { width: 15, height: 15, viewBox: '0 0 16 16', fill: 'none', stroke: 'currentColor', strokeWidth: 1.3, strokeLinecap: 'round', strokeLinejoin: 'round', 'aria-hidden': 'true' }
+      const common = { width: 17, height: 17, viewBox: '0 0 16 16', fill: 'none', stroke: 'currentColor', strokeWidth: 1.25, strokeLinecap: 'round', strokeLinejoin: 'round', 'aria-hidden': 'true' }
       if (name === 'parts') {
         return h('svg', common, [
           h('path', { key: 'a', d: 'M8 1.6 13.7 4.9v6.2L8 14.4 2.3 11.1V4.9L8 1.6Z' }),
