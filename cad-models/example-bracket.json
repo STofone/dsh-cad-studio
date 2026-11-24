@@ -1,0 +1,51 @@
+{
+ "name": "example-bracket",
+ "kind": "features",
+ "features": [
+  {
+   "id": "f1",
+   "kind": "box",
+   "label": "底板",
+   "params": {
+    "size": [
+     80,
+     50,
+     12
+    ]
+   },
+   "enabled": true
+  },
+  {
+   "id": "f2",
+   "kind": "cut",
+   "label": "通孔",
+   "params": {
+    "with": {
+     "kind": "cylinder",
+     "r": 9,
+     "h": 40,
+     "at": [
+      40,
+      25,
+      -5
+     ]
+    }
+   },
+   "enabled": true
+  },
+  {
+   "id": "f3",
+   "kind": "fillet",
+   "label": "圆角",
+   "params": {
+    "r": 2
+   },
+   "enabled": true
+  }
+ ],
+ "params": {},
+ "run": 1,
+ "createdAt": "2026-11-24T05:52:11.412Z",
+ "updatedAt": "2026-11-24T05:52:11.413Z",
+ "note": "create"
+}

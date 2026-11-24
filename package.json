@@ -1,0 +1,27 @@
+{
+  "name": "dsh-cad-studio",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "CAD Studio — FreeCAD bridge for AI plus a live model panel",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./locale/*.json": "./locale/*.json"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "locale/*.json"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true
+    }
+  }
+}

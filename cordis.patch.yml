@@ -1,0 +1,4 @@
+# dsh-cad-studio bundle patch: register the plugin row.
+- insert:
+    - id: cad-studio
+      name: dsh-cad-studio

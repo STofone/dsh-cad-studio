@@ -1,0 +1,13 @@
+# 生成物：导出的 STEP、截图、实验台、模型工程文件
+exports/
+shots/
+experiments/
+cad-models/*
+!cad-models/example-*.json
+
+# 依赖与临时
+node_modules/
+*.bak
+*.bak-*
+*.log
+.DS_Store

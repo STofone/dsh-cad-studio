@@ -1,0 +1,2100 @@
+/**
+ * dsh-cad-studio — Host half.
+ *
+ * Two jobs:
+ *   1. Bridge FreeCAD to the agent: `freecadcmd` runs inside one long-lived
+ *      helper process, so a script does not pay the 60-135 ms startup each call
+ *      and can keep documents alive between calls.
+ *   2. Publish what it built: every successful build stores a `scene` payload
+ *      (parts + instances) that the panel fetches and renders.
+ *
+ * Routes (all under /cad-studio, loopback-only):
+ *   GET /cad-studio/state        runtime + latest published scene summary
+ *   GET /cad-studio/scene/:id    the scene payload itself
+ *   GET /cad-studio/client.js    the panel bundle (dev-mode serving)
+ */
+import { spawn } from 'node:child_process'
+import { existsSync } from 'node:fs'
+import { mkdtemp, mkdir, readdir, readFile, rm, stat, unlink, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { fileURLToPath } from 'node:url'
+import { join } from 'node:path'
+
+export const name = 'dsh-cad-studio'
+
+// Import marker: tells us whether a hot reload really re-evaluated this module.
+globalThis.__cadStudioImportMark = (globalThis.__cadStudioImportMark ?? 0) + 1
+
+export const inject = ['tools', 'webServer']
+
+/** Defaults; the row's config object overrides them field by field. */
+const DEFAULTS = {
+  freecadPath: '',
+  timeoutMs: 180000,
+  trustedHosts: [],
+  /** Where parametric model documents live; '' = the calling session's workspace. */
+  modelsDir: '',
+}
+
+/** Resolve the effective config without depending on a schema library. */
+function normalizeConfig(raw) {
+  const source = raw && typeof raw === 'object' ? raw : {}
+  return {
+    freecadPath: typeof source.freecadPath === 'string' ? source.freecadPath : DEFAULTS.freecadPath,
+    timeoutMs: Number.isFinite(source.timeoutMs) ? Math.max(5000, Number(source.timeoutMs)) : DEFAULTS.timeoutMs,
+    trustedHosts: Array.isArray(source.trustedHosts) ? source.trustedHosts.filter((v) => typeof v === 'string') : DEFAULTS.trustedHosts,
+    modelsDir: typeof source.modelsDir === 'string' ? source.modelsDir : DEFAULTS.modelsDir,
+  }
+}
+
+const ROUTE_PREFIX = '/cad-studio'
+/** Package root, so the panel can load the vendored three.js assets. */
+const PLUGIN_DIR = fileURLToPath(new URL('.', import.meta.url))
+const ASSET_NAME = /^[A-Za-z0-9._-]+\.js$/
+
+const LOOPBACK = new Set(['localhost', '127.0.0.1', '[::1]', '::1'])
+
+function isTrusted(req, extra) {
+  const host = String(req.headers.host ?? '').toLowerCase()
+  const bare = host.replace(/:\d+$/, '')
+  if (LOOPBACK.has(bare)) return true
+  return extra.includes(host) || extra.includes(bare)
+}
+
+const CANDIDATES = [
+  '/usr/bin/freecadcmd',
+  '/usr/local/bin/freecadcmd',
+  '/usr/bin/FreeCADCmd',
+  '/opt/freecad/bin/freecadcmd',
+  '/Applications/FreeCAD.app/Contents/MacOS/FreeCADCmd',
+]
+
+function probeBinary(configured) {
+  if (configured) return existsSync(configured) ? configured : undefined
+  return CANDIDATES.find((p) => existsSync(p))
+}
+
+/** JSON markers; the helper prints exactly one RESULT block per script. */
+const BEGIN = '###CAD_STUDIO_RESULT###'
+const END = '###CAD_STUDIO_END###'
+
+/** File types FreeCAD's Part.read understands (extension decides the importer). */
+const SUPPORTED_FILE_EXTS = ['step', 'stp', 'iges', 'igs', 'brep', 'stl']
+
+const SUPPORTED_HINT = `支持的格式：${SUPPORTED_FILE_EXTS.map((e) => `.${e}`).join(' / ')}`
+
+/**
+ * freecadcmd wraps any Python exception as
+ *   Exception while processing file: /tmp/.../job.py [<exception message>]
+ * The bracket is the only part a caller can act on; the script path is noise.
+ */
+function freecadException(text) {
+  const m = /Exception while processing file: .*? \[([\s\S]*?)\]\s*$/m.exec(text)
+  return m ? m[1].trim() : null
+}
+
+function hintForException(message) {
+  if (!message) return undefined
+  if (/Unknown extension/i.test(message)) {
+    return `FreeCAD 不认识这个文件的扩展名，只支持 ${SUPPORTED_FILE_EXTS.map((e) => `.${e}`).join(' / ')}（.FCStd / .3mf / .obj 它都读不了）`
+  }
+  if (/not existing or not readable|does not exist|No such file/i.test(message)) {
+    return '文件不存在或不可读：确认路径是容器内可访问的绝对路径。'
+  }
+  if (/no supported file format/i.test(message)) {
+    return `Import 无法识别该文件格式，确认是 ${SUPPORTED_FILE_EXTS.map((e) => `.${e}`).join(' / ')} 之一。`
+  }
+  return undefined
+}
+
+/**
+ * Rigid-body helpers for joints. Scene instances carry a row-major 3×3 matrix
+ * (local→world, columns = the instance's axes) plus a translation; a joint is a
+ * rotation about (axis, origin) or a translation along axis, applied on top.
+ */
+const round6 = (v) => {
+  const r = Math.round(v * 1e6) / 1e6
+  return Object.is(r, -0) ? 0 : r
+}
+const addVec = (a, b) => [a[0] + b[0], a[1] + b[1], a[2] + b[2]]
+const subVec = (a, b) => [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
+const scaleVec = (a, k) => [a[0] * k, a[1] * k, a[2] * k]
+const dotVec = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+const normVec = (a) => {
+  const len = Math.hypot(a[0] ?? 0, a[1] ?? 0, a[2] ?? 0)
+  return len > 1e-9 ? [a[0] / len, a[1] / len, a[2] / len] : [0, 0, 1]
+}
+/** Row-major 3×3 product. */
+const mulMat = (a, b) => {
+  const out = new Array(9).fill(0)
+  for (let r = 0; r < 3; r += 1) {
+    for (let c = 0; c < 3; c += 1) {
+      out[r * 3 + c] = a[r * 3] * b[c] + a[r * 3 + 1] * b[3 + c] + a[r * 3 + 2] * b[6 + c]
+    }
+  }
+  return out
+}
+const mulVec = (m, v) => [
+  m[0] * v[0] + m[1] * v[1] + m[2] * v[2],
+  m[3] * v[0] + m[4] * v[1] + m[5] * v[2],
+  m[6] * v[0] + m[7] * v[1] + m[8] * v[2],
+]
+/** Rodrigues rotation matrix (row-major) about a unit axis, degrees. */
+function axisAngle(axis, deg) {
+  const [x, y, z] = normVec(axis)
+  const t = (deg * Math.PI) / 180
+  const c = Math.cos(t)
+  const s = Math.sin(t)
+  const k = 1 - c
+  return [
+    c + x * x * k, x * y * k - z * s, x * z * k + y * s,
+    y * x * k + z * s, c + y * y * k, y * z * k - x * s,
+    z * x * k - y * s, z * y * k + x * s, c + z * z * k,
+  ]
+}
+
+/** Local-space bounding box of a part's tessellation (8 corners is enough). */
+function partLocalBox(parts, partId) {
+  const part = (parts || []).find((p) => p.id === partId)
+  const verts = part?.verts
+  if (!verts?.length) return null
+  const mn = [Infinity, Infinity, Infinity]
+  const mx = [-Infinity, -Infinity, -Infinity]
+  for (let i = 0; i + 2 < verts.length; i += 3) {
+    for (let k = 0; k < 3; k += 1) {
+      const c = verts[i + k]
+      if (c < mn[k]) mn[k] = c
+      if (c > mx[k]) mx[k] = c
+    }
+  }
+  return { mn, mx }
+}
+
+/** World-space centre of one instance (used as the explode direction). */
+function instanceCenter(parts, inst) {
+  const box = partLocalBox(parts, inst.part)
+  if (!box) return inst.translate.slice()
+  const mn = [Infinity, Infinity, Infinity]
+  const mx = [-Infinity, -Infinity, -Infinity]
+  for (let i = 0; i < 8; i += 1) {
+    const p = [
+      i & 1 ? box.mx[0] : box.mn[0],
+      i & 2 ? box.mx[1] : box.mn[1],
+      i & 4 ? box.mx[2] : box.mn[2],
+    ]
+    const w = addVec(mulVec(inst.rot, p), inst.translate)
+    for (let k = 0; k < 3; k += 1) {
+      if (w[k] < mn[k]) mn[k] = w[k]
+      if (w[k] > mx[k]) mx[k] = w[k]
+    }
+  }
+  return scaleVec(addVec(mn, mx), 0.5)
+}
+
+function bboxCenterOfInstances(parts, instances) {
+  const centers = instances.map((inst) => instanceCenter(parts, inst))
+  if (!centers.length) return [0, 0, 0]
+  const sum = centers.reduce((acc, c) => addVec(acc, c), [0, 0, 0])
+  return scaleVec(sum, 1 / centers.length)
+}
+
+/** Normalise one joint spec against the assembly it belongs to. */
+function normalizeJoint(record, spec) {
+  const inst = record.base.find((b) => b.name === spec.instance)
+  if (!inst) throw new Error(`装配里没有这个实例：${spec.instance}`)
+  const type = spec.type === 'linear' ? 'linear' : 'revolute'
+  const fallbackAxis = type === 'linear' ? [1, 0, 0] : [0, 0, 1]
+  const axis = normVec(Array.isArray(spec.axis) && spec.axis.length === 3 ? spec.axis : fallbackAxis)
+  // Rotating about the instance's own centre is the useful default (a spinning
+  // wheel); a hinge passes an explicit origin on the edge.
+  const origin = Array.isArray(spec.origin) && spec.origin.length === 3 ? spec.origin.map(Number) : inst.center.slice()
+  const min = Number.isFinite(spec.min) ? Number(spec.min) : type === 'linear' ? -1000 : -180
+  const max = Number.isFinite(spec.max) ? Number(spec.max) : type === 'linear' ? 1000 : 180
+  const value = Math.min(max, Math.max(min, Number.isFinite(spec.value) ? Number(spec.value) : 0))
+  const id = typeof spec.id === 'string' && spec.id.trim() ? spec.id.trim() : `${type}-${record.joints.length + 1}`
+  return { id, instance: spec.instance, type, axis, origin, min, max, value }
+}
+
+/** Base placements + joints + explode → a scene payload ready to publish. */
+function assembleScene(record) {
+  const explode = record.explode ?? 0
+  const instances = record.base.map((base) => {
+    let rot = base.rot.slice()
+    let translate = base.translate.slice()
+    for (const joint of record.joints) {
+      if (joint.instance !== base.name) continue
+      const axis = normVec(joint.axis)
+      if (joint.type === 'linear') {
+        translate = addVec(translate, scaleVec(axis, joint.value))
+      } else {
+        const R = axisAngle(axis, joint.value)
+        translate = addVec(joint.origin, mulVec(R, subVec(translate, joint.origin)))
+        rot = mulMat(R, rot)
+      }
+    }
+    if (explode) translate = addVec(translate, scaleVec(subVec(base.center, record.center), explode))
+    return { name: base.name, part: base.part, rot: rot.map(round6), translate: translate.map(round6) }
+  })
+  return {
+    parts: record.parts,
+    instances,
+    assembly: {
+      id: record.id,
+      title: record.title,
+      explode: round6(explode),
+      joints: record.joints.map((j) => ({
+        id: j.id,
+        instance: j.instance,
+        type: j.type,
+        value: round6(j.value),
+        min: round6(j.min),
+        max: round6(j.max),
+      })),
+    },
+  }
+}
+
+class FreeCadBridge {
+  constructor(getConfig, log) {
+    this.getConfig = getConfig
+    this.log = log
+    this.bin = probeBinary(getConfig().freecadPath)
+    this.scenes = new Map()
+    this.latest = undefined
+    this.seq = 0
+    this.history = []
+    /** Assemblies keep their base placements so joints can re-place instances. */
+    this.assemblies = new Map()
+    this.assemblySeq = 0
+    /**
+     * Models live in the session's workspace, but the panel posts without a
+     * session — remember the last dir a tool used so its edits land in the same
+     * place, and persist it so a restart keeps pointing at the right folder.
+     */
+    this.modelsDir = ''
+    /** Every models dir a tool has used (panel posts carry no session). */
+    this.modelsSeen = []
+  }
+
+  /** Remember a models dir: newest first, deduped, bounded. */
+  noteModelsDir(dir) {
+    if (typeof dir !== 'string' || !dir) return
+    this.modelsDir = dir
+    this.modelsSeen = [dir, ...this.modelsSeen.filter((d) => d !== dir)].slice(0, 12)
+  }
+
+  /** Candidate models dirs, most recently used first (falls back to config). */
+  modelsCandidates() {
+    const out = [this.modelsDir, ...this.modelsSeen, this.getConfig().modelsDir, modelsDirFor(undefined)]
+    return [...new Set(out.filter((d) => typeof d === 'string' && d))]
+  }
+
+  refresh() {
+    this.bin = probeBinary(this.getConfig().freecadPath)
+    return this.bin
+  }
+
+  status() {
+    return {
+      binary: this.bin ?? '',
+      available: Boolean(this.bin),
+      scenes: this.scenes.size,
+      latest: this.latest?.id ?? '',
+    }
+  }
+
+  /** Directory where published scenes and the state pointer live. */
+  static get dataDir() {
+    return join(tmpdir(), 'dsh-cad-studio')
+  }
+
+  /** In-memory assembly records merged with the ones already on disk. */
+  assembleRecords(disk) {
+    const byId = new Map((Array.isArray(disk) ? disk : []).map((a) => [a.id, a]))
+    for (const [id, rec] of this.assemblies) byId.set(id, rec)
+    return byId
+  }
+
+  async persist() {
+    const dir = FreeCadBridge.dataDir
+    await mkdir(join(dir, 'scenes'), { recursive: true })
+    // Whatever an earlier process registered stays registered.
+    let prevAssemblies = []
+    try {
+      const prev = JSON.parse(await readFile(join(dir, 'state.json'), 'utf8'))
+      prevAssemblies = Array.isArray(prev.assemblies) ? prev.assemblies : []
+    } catch {}
+    // Keep new ids clear of the ones already in use.
+    for (const rec of this.assembleRecords(prevAssemblies).values()) {
+      const n = Number(String(rec.id).replace(/\D+/g, ''))
+      if (Number.isFinite(n)) this.assemblySeq = Math.max(this.assemblySeq, n)
+    }
+    const latest = this.latest
+    if (latest) await writeFile(join(dir, 'scenes', `${latest.id}.json`), JSON.stringify(latest.scene), 'utf8')
+    const pointer = {
+      runtime: this.status(),
+      latest: latest ? { id: latest.id, title: latest.title, at: latest.at } : null,
+      // Newest first, trimmed: the panel's model switcher reads this list.
+      history: this.history.slice(0, 30),
+      // Joints/explode are UI state: the panel needs them without asking a tool.
+      // Base placements ride along so a restarted process can still drive them
+      // (the meshes stay in the scene file; only placements are small).
+      modelsDir: this.modelsDir ?? '',
+      modelsDirs: this.modelsSeen.slice(0, 12),
+      // Merge with what an earlier process wrote: this process may only know
+      // about the assemblies it touched, and an unrelated publish must not wipe
+      // the others (the panel drives them by hydrating on demand).
+      assemblies: [...this.assembleRecords(prevAssemblies).values()].map((a) => ({
+        id: a.id,
+        title: a.title,
+        sceneId: a.sceneId,
+        base: a.base,
+        center: a.center,
+        joints: a.joints.map((j) => ({ id: j.id, instance: j.instance, type: j.type, value: j.value, min: j.min, max: j.max, axis: j.axis, origin: j.origin })),
+        explode: a.explode,
+      })),
+    }
+    await writeFile(join(dir, 'state.json'), JSON.stringify(pointer), 'utf8')
+  }
+
+  /** Publish a scene payload: sequence it, record stats, mirror it to disk. */
+  /**
+   * Fold whatever an earlier process published into this one's history: the
+   * scene files outlive the process, but the list lives in memory, so without
+   * this a restart (or a second process) would hide every earlier model.
+   */
+  async hydrateHistory() {
+    if (this.historyHydrated) return
+    this.historyHydrated = true
+    try {
+      const pointer = JSON.parse(await readFile(join(FreeCadBridge.dataDir, 'state.json'), 'utf8'))
+      if (!this.modelsDir && typeof pointer.modelsDir === 'string') this.modelsDir = pointer.modelsDir
+      if (Array.isArray(pointer.modelsDirs)) this.modelsSeen = [...new Set([...this.modelsSeen, ...pointer.modelsDirs.filter((d) => typeof d === 'string' && d)])].slice(0, 12)
+      const disk = Array.isArray(pointer.history) ? pointer.history : []
+      const seen = new Set(this.history.map((h) => h.id))
+      const merged = [...this.history, ...disk.filter((h) => !seen.has(h.id))]
+      merged.sort((a, b) => String(b.at || '').localeCompare(String(a.at || '')))
+      this.history = merged.slice(0, 30)
+    } catch {}
+  }
+
+  async publishScene(scene, title, session = this.currentSession ?? '') {
+    await this.hydrateHistory()
+    // Scene ids are the on-disk filenames: after a restart the counter must
+    // resume above whatever is already published, or the first new scene would
+    // overwrite an older one.
+    if (!this.seqRecovered) {
+      this.seqRecovered = true
+      try {
+        const names = await readdir(join(FreeCadBridge.dataDir, 'scenes'))
+        for (const name of names) {
+          const hit = /^scene-(\d+)\.json$/.exec(name)
+          if (hit) this.seq = Math.max(this.seq, Number(hit[1]))
+        }
+      } catch {}
+    }
+    const id = `scene-${++this.seq}`
+    this.scenes.set(id, scene)
+    // Count what the viewport shows: per-instance totals and only the parts an
+    // instance actually references (a scene may carry unreferenced parts).
+    const partMap = new Map((scene.parts || []).map((p) => [p.id, p]))
+    const usedParts = new Set()
+    let triangles = 0
+    let volume = 0
+    for (const inst of scene.instances || []) {
+      const part = partMap.get(inst.part)
+      if (!part) continue
+      usedParts.add(inst.part)
+      triangles += (part.tris || []).length / 3
+      volume += part.volume || 0
+    }
+    const stats = {
+      id,
+      title,
+      session,
+      at: new Date().toISOString(),
+      instances: (scene.instances || []).length,
+      parts: usedParts.size,
+      triangles,
+      volume,
+    }
+    this.history = [stats, ...this.history.filter((h) => h.id !== id)].slice(0, 30)
+    this.latest = { id, title, at: stats.at, scene }
+    // Persist so a restarted process (and any stale route closure left by a
+    // hot reload) still serves the newest scene.
+    await this.persist()
+    return { id, stats }
+  }
+
+  /** Register the base placements of a published assembly so joints can move it. */
+  registerAssembly({ title, sceneId, scene, joints }) {
+    const id = `asm-${++this.assemblySeq}`
+    const record = {
+      id,
+      title,
+      sceneId,
+      parts: scene.parts,
+      base: scene.instances.map((inst) => ({
+        name: inst.name,
+        part: inst.part,
+        rot: inst.rot.slice(),
+        translate: inst.translate.slice(),
+        center: instanceCenter(scene.parts, inst),
+      })),
+      center: bboxCenterOfInstances(scene.parts, scene.instances),
+      joints: joints ?? [],
+      explode: 0,
+    }
+    this.assemblies.set(id, record)
+    return record
+  }
+
+  setJoint(record, spec) {
+    const value = normalizeJoint(record, spec)
+    const existing = record.joints.find((j) => j.id === spec.id)
+    if (existing) Object.assign(existing, value)
+    else record.joints.push(value)
+    return value
+  }
+
+  driveJoint(record, jointId, rawValue) {
+    const joint = record.joints.find((j) => j.id === jointId)
+    if (!joint) return null
+    const next = Number(rawValue)
+    if (!Number.isFinite(next)) return null
+    joint.value = Math.min(joint.max, Math.max(joint.min, next))
+    record.explode = record.explode ?? 0
+    return joint
+  }
+
+  setExplode(record, factor) {
+    const next = Number(factor)
+    if (!Number.isFinite(next)) return null
+    record.explode = Math.max(0, Math.min(4, next))
+    return record.explode
+  }
+
+  /** Recompute instance placements from base + joints + explode, then publish. */
+  async republishAssembly(record, titleSuffix) {
+    const scene = assembleScene(record)
+    const published = await this.publishScene(scene, titleSuffix ? `${record.title} · ${titleSuffix}` : record.title)
+    record.sceneId = published.id
+    return published
+  }
+
+  /**
+   * Rebuild an assembly record from disk. The meshes are not duplicated into
+   * the pointer: base placements come from state.json, the parts from the
+   * scene file (geometry never changes when a joint moves, so any scene of
+   * this assembly carries the right parts).
+   */
+  async loadAssembly(id) {
+    if (id && this.assemblies.has(id)) return this.assemblies.get(id)
+    let pointer
+    try {
+      pointer = JSON.parse(await readFile(join(FreeCadBridge.dataDir, 'state.json'), 'utf8'))
+    } catch {
+      return null
+    }
+    const metas = Array.isArray(pointer.assemblies) ? pointer.assemblies : []
+    const meta = id ? metas.find((a) => a.id === id) : metas[metas.length - 1]
+    if (!meta) return null
+    const candidates = [meta.sceneId, pointer.latest?.id].filter(Boolean)
+    for (const sceneId of candidates) {
+      try {
+        const scene = JSON.parse(await readFile(join(FreeCadBridge.dataDir, 'scenes', `${sceneId}.json`), 'utf8'))
+        if (!Array.isArray(scene.parts)) continue
+        const seq = Number(String(meta.id).replace(/^asm-/, ''))
+        if (Number.isFinite(seq) && seq > this.assemblySeq) this.assemblySeq = seq
+        const record = { ...meta, parts: scene.parts }
+        this.assemblies.set(record.id, record)
+        return record
+      } catch {}
+    }
+    return null
+  }
+
+  async run(code, { title, publishHint = true, meta = null } = {}) {
+    const bin = this.refresh()
+    if (!bin) {
+      return { ok: false, error: 'freecadcmd not found; set freecadPath in the plugin config' }
+    }
+    const cfg = this.getConfig()
+    const dir = await mkdtemp(join(tmpdir(), 'cad-studio-'))
+    const script = join(dir, 'job.py')
+    // Models reach for `scene = box` far more often than for `__out["scene"]`, and a
+    // silent no-publish makes them claim success that never happened. Accept both:
+    // any shape bound to scene/shape/result is tessellated and published.
+    const autoScene = `
+if not (isinstance(globals().get("__out"), dict) and __out.get("scene")):
+    for __name in ("scene", "shape", "result", "part"):
+        __cand = globals().get(__name)
+        if __cand is not None and hasattr(__cand, "tessellate"):
+            __m = _mesh(__cand)
+            if not isinstance(globals().get("__out"), dict):
+                __out = {"ok": True}
+            __out.setdefault("scene", {
+                "parts": [{"id": "p1", "verts": __m["verts"], "tris": __m["tris"], "volume": round(__cand.Volume, 3)}],
+                "instances": [{"name": __name, "part": "p1", "rot": [1,0,0, 0,1,0, 0,0,1], "translate": [0, 0, 0]}],
+            })
+            __out.setdefault("volume", round(__cand.Volume, 3))
+            break
+`
+    const wrapped = `${code}\n${autoScene}\nimport json as __json\n_payload = __out if "__out" in globals() else {"ok": True}
+print("${BEGIN}" + __json.dumps(_safe(_payload)) + "${END}", flush=True)\n`
+    await writeFile(script, wrapped, 'utf8')
+    try {
+      const result = await new Promise((resolvePromise) => {
+        const child = spawn(bin, [script], { stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, PYTHONUNBUFFERED: '1' } })
+        let out = ''
+        let err = ''
+        const timer = setTimeout(() => child.kill('SIGKILL'), cfg.timeoutMs)
+        child.stdout.on('data', (b) => { out += b })
+        child.stderr.on('data', (b) => { err += b })
+        child.on('close', (rc) => {
+          clearTimeout(timer)
+          resolvePromise({ rc, out, err })
+        })
+        child.on('error', (e) => {
+          clearTimeout(timer)
+          resolvePromise({ rc: -1, out, err: String(e?.message ?? e) })
+        })
+      })
+      const marker = result.out.indexOf(BEGIN)
+      if (marker < 0) {
+        const rawErr = result.err.slice(-4000)
+        const message = freecadException(rawErr)
+        const failure = { ok: false, stderr: rawErr.trim(), stdout: result.out.slice(-4000), exitCode: result.rc }
+        if (message) failure.error = message
+        const hint = hintForException(message)
+        if (hint) failure.hint = hint
+        return failure
+      }
+      const end = result.out.indexOf(END, marker)
+      const payload = result.out.slice(marker + BEGIN.length, end < 0 ? undefined : end)
+      let value
+      try {
+        value = JSON.parse(payload)
+      } catch (error) {
+        return { ok: false, error: `helper returned non-JSON: ${String(error?.message ?? error)}`, raw: payload.slice(0, 500) }
+      }
+      if (value?.scene) {
+        // A shape bound to `scene = box` arrives with the variable name as the
+        // instance label; the caller's title is what a human expects in the tree.
+        const first = value.scene.instances?.[0]
+        if (title && first && ['scene', 'shape', 'result', 'part'].includes(first.name)) first.name = title
+        // `meta` rides inside the scene payload: the panel reads the feature list
+        // (and the assembly block) from there instead of calling a tool per frame.
+        const scene = meta ? { ...value.scene, ...meta } : value.scene
+        const published = await this.publishScene(scene, title ?? value.title ?? 'untitled')
+        value.sceneId = published.id
+        delete value.scene
+      }
+      const clean = { ok: true, ...value }
+      clean.published = Boolean(clean.sceneId)
+      if (!clean.published && publishHint) {
+        clean.hint = 'nothing published: bind the shape you want shown to a `scene` variable (or __out["scene"])'
+      }
+      const errTail = result.err.slice(-2000)
+      if (errTail) clean.stderr = errTail
+      else delete clean.stderr
+      return clean
+    } finally {
+      await rm(dir, { recursive: true, force: true }).catch(() => {})
+    }
+  }
+}
+
+/** Shared Python prelude for tool scripts: geometry helpers + scene building. */
+const PRELUDE = `
+import json, math
+import Part, Import, FreeCAD
+Vector = FreeCAD.Vector
+
+def _safe(v):
+    # DSH rejects -0 and NaN in tool output; FreeCAD hands both out freely.
+    if isinstance(v, float):
+        if v != v or v in (float("inf"), float("-inf")):
+            return None
+        return 0.0 if v == 0 else v
+    if isinstance(v, (list, tuple)):
+        return [_safe(x) for x in v]
+    if isinstance(v, dict):
+        return {str(k): _safe(x) for k, x in v.items()}
+    return v
+
+def _bounds(shape):
+    b = shape.BoundBox
+    return {"x": [b.XMin, b.XMax], "y": [b.YMin, b.YMax], "z": [b.ZMin, b.ZMax], "diagonal": b.DiagonalLength}
+
+def _mesh(shape, deflection=0.25):
+    # Tessellate face by face: a single shape-wide tessellation shares vertices
+    # between a flat face and the curved face it meets, so the viewer's smoothed
+    # normals bleed across the edge and paint a dark fan over flat surfaces.
+    # Duplicating the seam keeps each face's normals its own while a curved face
+    # (hole wall, fillet) still shares its vertices and stays smooth.
+    verts = []
+    tris = []
+    for face in shape.Faces:
+        try:
+            fv, ff = face.tessellate(deflection)
+        except Exception:
+            continue
+        base = len(verts) // 3
+        for p in fv:
+            verts.extend((p.x, p.y, p.z))
+        for f in ff:
+            tris.extend((base + f[0], base + f[1], base + f[2]))
+    return {"verts": verts, "tris": tris}
+
+def describe(path):
+    shape = Part.Shape()
+    shape.read(path)
+    mesh = _mesh(shape)
+    return {
+        "path": path,
+        "volume": round(shape.Volume, 3),
+        "area": round(shape.Area, 3),
+        "bounds": _bounds(shape),
+        "faces": len(shape.Faces),
+        "triangles": len(mesh["tris"]) // 3,
+    }
+`
+
+
+/**
+ * Python source for a declarative feature list. One emitter for both entry
+ * points — the one-shot `cad_studio_feature` tool and every rebuild of a
+ * `kind:'features'` model document — so a typed list and an edited-and-rebuilt
+ * one cannot drift apart.
+ */
+const featuresScript = (ops, exportPath) => `${PRELUDE}
+import os
+_OPS = ${JSON.stringify(ops)}
+_EXPORT = ${exportPath ? JSON.stringify(exportPath) : 'None'}
+
+def _v3(x, d=(0.0, 0.0, 0.0)):
+    if not x:
+        return Vector(float(d[0]), float(d[1]), float(d[2]))
+    return Vector(float(x[0]), float(x[1]), float(x[2]))
+
+def _dir(x, d=(0.0, 0.0, 1.0)):
+    v = _v3(x, d)
+    return v if v.Length > 1e-9 else _v3(d, (0.0, 0.0, 1.0))
+
+def _prim(op):
+    k = op.get("kind")
+    at = _v3(op.get("at"))
+    if k == "box":
+        s = op.get("size") or [10, 10, 10]
+        return Part.makeBox(float(s[0]), float(s[1]), float(s[2]), at)
+    if k == "cylinder":
+        return Part.makeCylinder(float(op["r"]), float(op["h"]), at, _dir(op.get("axis")))
+    if k == "sphere":
+        return Part.makeSphere(float(op["r"]), at)
+    if k == "cone":
+        return Part.makeCone(float(op["r1"]), float(op["r2"]), float(op["h"]), at, _dir(op.get("axis")))
+    if k == "torus":
+        return Part.makeTorus(float(op["r1"]), float(op["r2"]), at, _dir(op.get("axis")))
+    if k == "extrude":
+        base = float(op.get("base", 0.0))
+        h = float(op["h"])
+        ps = [Vector(float(p[0]), float(p[1]), base) for p in op["points"]]
+        return Part.Face(Part.makePolygon(ps + [ps[0]])).extrude(Vector(0.0, 0.0, h))
+    if k == "revolve":
+        ps = [Vector(float(p[0]), 0.0, float(p[1])) for p in op["points"]]
+        ang = float(op.get("angle", 360.0))
+        return Part.Face(Part.makePolygon(ps + [ps[0]])).revolve(Vector(0.0, 0.0, 0.0), Vector(0.0, 0.0, 1.0), ang)
+    raise RuntimeError("未知图元：" + str(k))
+
+_shape = None
+for _idx, _op in enumerate(_OPS):
+    _k = _op.get("kind")
+    try:
+        if _k in ("box", "cylinder", "sphere", "cone", "torus", "extrude", "revolve"):
+            _s = _prim(_op)
+            _shape = _s if _shape is None else _shape.fuse(_s)
+        elif _k in ("fuse", "cut", "common"):
+            _s = _prim(_op["with"])
+            _shape = _shape.fuse(_s) if _k == "fuse" else (_shape.cut(_s) if _k == "cut" else _shape.common(_s))
+        elif _k == "fillet":
+            _shape = _shape.makeFillet(float(_op["r"]), _shape.Edges)
+        elif _k == "chamfer":
+            _shape = _shape.makeChamfer(float(_op["d"]), _shape.Edges)
+        elif _k == "shell":
+            _t = float(_op["t"])
+            _open = _op.get("open", "none")
+            _inner = _shape.makeOffsetShape(-_t, 1e-6)
+            _shell = _shape.cut(_inner)
+            if _open in ("top", "bottom"):
+                _b = _shape.BoundBox
+                _zw = (_b.ZMax - _t) if _open == "top" else _b.ZMin
+                _box = Part.makeBox(_b.XLength * 2 + 10, _b.YLength * 2 + 10, _t * 6,
+                                    Vector(_b.XMin - _b.XLength / 2 - 5, _b.YMin - _b.YLength / 2 - 5, _zw - (_t * 6 if _open == "bottom" else 0)))
+                _shell = _shell.cut(_box)
+            _shape = _shell
+        elif _k == "pattern_linear":
+            _base = _shape
+            _d = _v3(_op["delta"])
+            for _i in range(1, int(_op["count"])):
+                _base = _base.fuse(_shape.translated(Vector(_d.x * _i, _d.y * _i, _d.z * _i)))
+            _shape = _base
+        elif _k == "pattern_circular":
+            _base = _shape
+            _ax = _dir(_op.get("axis"), (0.0, 0.0, 1.0))
+            _ctr = _v3(_op.get("at"))
+            _n = int(_op["count"])
+            _ang = float(_op.get("angle", 360.0))
+            _step = _ang / _n if abs(_ang) >= 359.999 else _ang / max(_n - 1, 1)
+            for _i in range(1, _n):
+                _base = _base.fuse(_shape.rotate(_ctr, _ax, _step * _i))
+            _shape = _base
+        elif _k == "translate":
+            _shape = _shape.translated(_v3(_op["v"]))
+        elif _k == "rotate":
+            _shape = _shape.rotate(_v3(_op.get("at")), _dir(_op.get("axis")), float(_op["deg"]))
+        elif _k == "mirror":
+            _shape = _shape.mirror(_v3(_op.get("at")), _dir(_op.get("normal")))
+        else:
+            raise RuntimeError("未知特征：" + str(_k))
+    except Exception as _e:
+        raise RuntimeError("第 %d 步（%s）失败：%s" % (_idx + 1, _k, _e))
+
+if _shape is None:
+    raise RuntimeError("ops 为空：至少给一个图元")
+_shape = _shape.removeSplitter()
+scene = _shape
+__out = {
+    "ok": True,
+    "features": len(_OPS),
+    "volume": round(_shape.Volume, 3),
+    "area": round(_shape.Area, 3),
+    "faces": len(_shape.Faces),
+    "bounds": _bounds(_shape),
+}
+if _EXPORT:
+    os.makedirs(os.path.dirname(_EXPORT) or ".", exist_ok=True)
+    _shape.exportStep(_EXPORT)
+    __out["exported"] = _EXPORT
+    __out["bytes"] = os.path.getsize(_EXPORT)
+`
+/**
+ * One bridge per process, not per plugin load: a hot reload cannot release the
+ * prefix route it left behind, so the surviving handler must read the current
+ * state rather than a dead closure.
+ *
+ * The reverse hazard is worse than a missing bridge: a bridge built by an older
+ * module version survives the reload and is reused, so the new code calls
+ * methods that instance simply does not have (the assembly routes threw, and the
+ * web server turned that into a bare 400). Check the shape, not just existence —
+ * rebuilding is cheap, the scene store on disk is the source of truth.
+ */
+const BRIDGE_API = [
+  'run', 'publishScene', 'hydrateHistory', 'registerAssembly', 'loadAssembly',
+  'setJoint', 'driveJoint', 'setExplode', 'republishAssembly', 'status', 'refresh',
+]
+
+function sharedState(resolved, logger) {
+  const box = (globalThis.__dshCadStudio ??= {})
+  box.config = resolved
+  const stale = !box.bridge || BRIDGE_API.some((name) => typeof box.bridge[name] !== 'function')
+  if (stale) box.bridge = new FreeCadBridge(() => box.config, logger)
+  else box.bridge.getConfig = () => box.config
+  return box
+}
+
+const MODELS_DIRNAME = 'cad-models'
+/** Fallback when neither config nor the session provides a workspace (e.g. a test stub). */
+const GLOBAL_MODELS_DIR = '/workspace/cad-models'
+
+/** The calling session's workspace directory, when the runtime exposes one. */
+function sessionWorkspace(exec) {
+  const session = exec?.agent?.session
+  const cwd = session?.header?.cwd ?? session?.cwd
+  return typeof cwd === 'string' && cwd.startsWith('/') ? cwd : ''
+}
+
+export function apply(ctx, config) {
+  const resolved = normalizeConfig(config)
+  /**
+   * Model documents belong to the session's workspace: an explicit `modelsDir`
+   * wins, otherwise <session cwd>/cad-models, otherwise the container-global
+   * directory (tests and sessions without a workspace).
+   */
+  const modelsDirFor = (exec) => {
+    if (resolved.modelsDir) return resolved.modelsDir
+    const workspace = sessionWorkspace(exec)
+    return workspace ? join(workspace, MODELS_DIRNAME) : GLOBAL_MODELS_DIR
+  }
+  const state = sharedState(resolved, ctx.logger)
+  const bridge = state.bridge
+  ctx.logger?.info?.('cad-studio: freecadcmd %s', bridge.status().binary ?? '(not found)')
+
+  // The exported model layout is `<model>/parts/b12-create_prim.step`, so the
+  // file name alone says nothing useful in a tab strip. Prefer the model folder
+  // and keep the part stem as a suffix, so two parts of one model still differ.
+  const modelLabelOf = (path) => {
+    const segs = String(path).split('/').filter(Boolean)
+    const base = segs[segs.length - 1] || String(path)
+    const stem = base.replace(/\.[^.]+$/, '')
+    const parent = segs[segs.length - 2] || ''
+    const model = segs[segs.length - 3] || ''
+    if (parent === 'parts' && model) return `${model} · ${stem}`
+    return stem
+  }
+
+  /** Read a model file, describe it, and publish one static instance. */
+  const openPath = async (path) => {
+    const label = modelLabelOf(path)
+    const ext = /\.[A-Za-z0-9]+$/.exec(path)?.[0].slice(1).toLowerCase() ?? ''
+    if (!SUPPORTED_FILE_EXTS.includes(ext)) {
+      return {
+        ok: false,
+        error: ext ? `unsupported file type: .${ext}` : 'unsupported file type: (no extension)',
+        hint: `cad_studio_open 只读 ${SUPPORTED_FILE_EXTS.map((e) => `.${e}`).join(' / ')}；换一个格式，或先用 FreeCAD 转出 STEP。`,
+      }
+    }
+    // FreeCAD 0.20's Part.read handles BREP/IGES/STEP but NOT STL — mesh formats
+    // go through the Mesh module. Mixing them up is exactly what produced
+    // "Unknown extension" on a .stl click.
+    const meshBranch = ext === 'stl'
+    const py = `
+_p = ${JSON.stringify(path)}
+if ${JSON.stringify(ext)} == "stl":
+    import Mesh
+    _m = Mesh.Mesh(_p)
+    _verts = [c for v in _m.Points for c in (v.x, v.y, v.z)]
+    _tris = [i for f in _m.Facets for i in f.PointIndices]
+    _vol = float(_m.Volume) if getattr(_m, "Volume", None) else 0.0
+    _xs = _verts[0::3] or [0.0]
+    _ys = _verts[1::3] or [0.0]
+    _zs = _verts[2::3] or [0.0]
+    _bb = {"x": [min(_xs), max(_xs)], "y": [min(_ys), max(_ys)], "z": [min(_zs), max(_zs)]}
+    _faces = 0
+else:
+    _shape = Part.Shape()
+    _shape.read(_p)
+    _mesh_ = _mesh(_shape)
+    _verts, _tris = _mesh_["verts"], _mesh_["tris"]
+    _vol = round(_shape.Volume, 3)
+    _bb = _bounds(_shape)
+    _faces = len(_shape.Faces)
+__out = {
+    "ok": True,
+    "path": _p,
+    "format": ${JSON.stringify(ext)},
+    "kind": ${JSON.stringify(meshBranch ? 'mesh' : 'brep')},
+    "volume": _vol,
+    "triangles": len(_tris) // 3,
+    "faces": _faces,
+    "bounds": _bb,
+    "title": ${JSON.stringify(label)},
+    "scene": {
+        "parts": [{"id": "p1", "verts": _verts, "tris": _tris, "volume": _vol}],
+        "instances": [{"name": ${JSON.stringify(label)}, "part": "p1", "rot": [1,0,0, 0,1,0, 0,0,1], "translate": [0, 0, 0]}],
+    },
+}
+`
+    return bridge.run(`${PRELUDE}\n${py}`, { title: label })
+  }
+
+  // ---- Agent tools -------------------------------------------------------
+
+  // Every tool call belongs to a session: stamp it on the published scene so
+  // the panel's live tab can follow its own session instead of the process.
+  const sessionOf = (exec) => {
+    const id = exec?.agent?.session?.id ?? exec?.agent?.session?.header?.id ?? ''
+    return typeof id === 'string' ? id : ''
+  }
+  const tool = (definition) => ctx.effect(() => ctx.tools.register({
+    ...definition,
+    execute: async (args, exec) => {
+      bridge.currentSession = sessionOf(exec)
+      return definition.execute(args, exec)
+    },
+  }))
+
+  tool({
+    name: 'cad_studio_env',
+    description: 'Report the CAD Studio runtime: whether freecadcmd is available, its path, and the latest published scene.',
+    parameters: { type: 'object', properties: {}, additionalProperties: false },
+    output: {
+      schema: { type: 'object', properties: { available: { type: 'boolean' }, binary: { type: 'string' }, scenes: { type: 'number' }, latest: { type: 'string' } } },
+      render: (_args, value) => [{ type: 'text', text: JSON.stringify(value, null, 2) }],
+    },
+    execute: async () => bridge.status(),
+  })
+
+  tool({
+    name: 'cad_studio_run',
+    description: 'Run a FreeCAD Python script in freecadcmd headless. Bind the shape to show to a variable named `scene` (e.g. `scene = Part.makeBox(80,40,10)`) — it is tessellated and published to the CAD Studio panel; the result reports sceneId and published. Put extra data in the `__out` dict (or `__out["scene"]` for full control of parts/instances/colors).',
+    parameters: {
+      type: 'object',
+      properties: {
+        code: { type: 'string', description: 'FreeCAD Python source. Import Part/Import yourself; helpers describe(path)/_mesh(shape) are preloaded.' },
+        title: { type: 'string', description: 'Panel title for the published scene.' },
+      },
+      required: ['code'],
+      additionalProperties: false,
+    },
+    output: {
+      schema: { type: 'object', properties: { ok: { type: 'boolean' }, sceneId: { type: 'string' }, stderr: { type: 'string' } } },
+      render: (_args, value) => [{ type: 'text', text: JSON.stringify(value, null, 2) }],
+    },
+    execute: async (args) => bridge.run(`${PRELUDE}\n${args.code}`, { title: args.title }),
+  })
+
+  tool({
+    name: 'cad_studio_open',
+    description: 'Open a STEP/STP/BREP/FCStd file, report its geometry, and publish it to the CAD Studio panel.',
+    parameters: {
+      type: 'object',
+      properties: { path: { type: 'string', description: 'Absolute path of the model file.' } },
+      required: ['path'],
+      additionalProperties: false,
+    },
+    output: {
+      schema: { type: 'object', properties: { ok: { type: 'boolean' }, sceneId: { type: 'string' }, volume: { type: 'number' }, triangles: { type: 'number' } } },
+      render: (_args, value) => [{ type: 'text', text: JSON.stringify(value, null, 2) }],
+    },
+    execute: async (args) => openPath(args.path),
+  })
+
+  // ---- Artifact tools (export / drawing / measure / assembly) -------------
+
+  const extOf = (p) => (/\.[A-Za-z0-9]+$/.exec(p ?? '')?.[0].slice(1).toLowerCase() ?? '')
+
+  /** Python lines that leave the source shapes in `_shapes`. */
+  const shapesFrom = ({ source, code }) => {
+    if (source) {
+      if (extOf(source) === 'stl') {
+        return `import Mesh, MeshPart
+_mesh = Mesh.Mesh(${JSON.stringify(source)})
+_shapes = [Part.Shape().makeShapeFromMesh(_mesh.Topology, 0.05)]
+`
+      }
+      return `_src = Part.Shape()
+_src.read(${JSON.stringify(source)})
+_shapes = [_src]
+`
+    }
+    return `${code}
+_shapes = []
+for _name in ("export_shapes", "shapes"):
+    _v = globals().get(_name)
+    if isinstance(_v, (list, tuple)) and _v:
+        _shapes = list(_v)
+        break
+if not _shapes:
+    for _name in ("scene", "shape", "result", "part"):
+        _c = globals().get(_name)
+        if _c is not None and hasattr(_c, "tessellate"):
+            _shapes = [_c]
+            break
+`
+  }
+
+  const writeShapeFile = (target, src) => {
+    const py = `${PRELUDE}
+${src}
+if not _shapes:
+    __out = {"ok": False, "error": "nothing to export: pass a source path or bind scene / export_shapes"}
+else:
+    import os
+    _target = ${JSON.stringify(target)}
+    _fmt = _target.rsplit(".", 1)[-1].lower()
+    os.makedirs(os.path.dirname(_target) or ".", exist_ok=True)
+    if _fmt in ("step", "stp"):
+        # Part.export([shape]) writes a 1.6 KB STEP that reads back as a NULL shape;
+        # Shape.exportStep / compound exportStep is the API that produces a valid file.
+        Part.makeCompound(_shapes).exportStep(_target)
+    elif _fmt == "brep":
+        _shapes[0].exportBrep(_target)
+    elif _fmt in ("iges", "igs"):
+        Part.makeCompound(_shapes).exportIges(_target)
+    elif _fmt == "stl":
+        # Mesh.export rejects doc-less meshes in FreeCAD 0.20, so emit ASCII STL here.
+        _lines = []
+        for _s in _shapes:
+            _verts, _facets = _s.tessellate(0.2)
+            _lines.append("solid cad_studio")
+            for _f in _facets:
+                _a, _b, _c = (_verts[i] for i in _f)
+                _lines.append("facet normal 0 0 0\\n outer loop")
+                for _p in (_a, _b, _c):
+                    _lines.append("  vertex %r %r %r" % (_p.x, _p.y, _p.z))
+                _lines.append(" endloop\\nendfacet")
+            _lines.append("endsolid cad_studio")
+        open(_target, "w").write("\\n".join(_lines) + "\\n")
+    else:
+        raise RuntimeError("unsupported export format: ." + _fmt + " (use .step/.stp/.brep/.iges/.igs/.stl)")
+    __out = {"ok": True, "path": _target, "format": _fmt, "bytes": os.path.getsize(_target)}
+`
+    return bridge.run(py, { title: `export → ${target}`, publishHint: false })
+  }
+
+  tool({
+    name: 'cad_studio_export',
+    description: 'Export geometry to STEP/STP/BREP/IGES/STL. Give either `source` (an existing model file) or `code` (FreeCAD Python that binds `scene` or `export_shapes`).',
+    parameters: {
+      type: 'object',
+      properties: {
+        target: { type: 'string', description: 'Absolute output path; the extension picks the format (.step/.stp/.brep/.iges/.igs/.stl).' },
+        source: { type: 'string', description: 'Existing model file to export (STEP/IGES/BREP/STL).' },
+        code: { type: 'string', description: 'FreeCAD Python that produces the geometry; bind `scene` or `export_shapes`.' },
+      },
+      required: ['target'],
+      additionalProperties: false,
+    },
+    output: {
+      schema: { type: 'object', properties: { ok: { type: 'boolean' }, path: { type: 'string' }, bytes: { type: 'number' } } },
+      render: (_a, v) => [{ type: 'text', text: JSON.stringify(v, null, 2) }],
+    },
+    execute: async ({ target, source, code }) => {
+      if (!target || extOf(target) === '') return { ok: false, error: 'target must be an absolute path with an extension' }
+      const src = shapesFrom({ source, code })
+      if (!src) return { ok: false, error: 'pass either source (a model file) or code (FreeCAD Python)' }
+      return writeShapeFile(target, src)
+    },
+  })
+
+  tool({
+    name: 'cad_studio_drawing',
+    description: 'Write a first-angle engineering drawing (top / front / right HLR views) as SVG. Give either `source` (STEP/IGES/BREP) or `code`.',
+    parameters: {
+      type: 'object',
+      properties: {
+        target: { type: 'string', description: 'Absolute .svg output path.' },
+        source: { type: 'string', description: 'Existing BRep model file (STEP/IGES/BREP).' },
+        code: { type: 'string', description: 'FreeCAD Python that binds `scene` or `export_shapes`.' },
+        views: { type: 'array', items: { type: 'string' }, description: 'Subset of ["top","front","right"] (default all three).' },
+        scale: { type: 'number', description: 'Drawing scale (default 1.0).' },
+      },
+      required: ['target'],
+      additionalProperties: false,
+    },
+    output: {
+      schema: { type: 'object', properties: { ok: { type: 'boolean' }, path: { type: 'string' }, views: { type: 'array', items: { type: 'string' } } } },
+      render: (_a, v) => [{ type: 'text', text: JSON.stringify(v, null, 2) }],
+    },
+    execute: async ({ target, source, code, views, scale }) => {
+      const src = shapesFrom({ source, code })
+      if (!src) return { ok: false, error: 'pass either source (a model file) or code (FreeCAD Python)' }
+      const wanted = Array.isArray(views) && views.length ? views : ['top', 'front', 'right']
+      const py = `${PRELUDE}
+${src}
+import os, TechDraw
+_dirs = {"top": (0, 0, 1), "front": (0, -1, 0), "right": (1, 0, 0)}
+_scale = float(${Number(scale) || 1})
+if not _shapes:
+    __out = {"ok": False, "error": "nothing to draw: pass a source path or bind scene / export_shapes"}
+else:
+    _shape = _shapes[0]
+    _bb = _shape.BoundBox
+    _w, _h, _d = _bb.XLength, _bb.YLength, _bb.ZLength
+    _wanted = [v for v in ${JSON.stringify(wanted)} if v in _dirs] or ["top", "front", "right"]
+    # Sheet layout: top view above, front below-left, right to its right.
+    _gap = 20.0
+    _top = _bb.XLength, _bb.YLength
+    _front = _bb.XLength, _bb.ZLength
+    _right = _bb.YLength, _bb.ZLength
+    _cells = {"top": (0.0, 0.0, _top), "front": (0.0, _top[1] + _gap, _front), "right": (_front[0] + _gap, _top[1] + _gap, _right)}
+    _sheet_w = max(c[0] + c[2][0] for c in _cells.values()) * _scale + 2 * _gap
+    _sheet_h = max(c[1] + c[2][1] for c in _cells.values()) * _scale + 2 * _gap
+    _body = []
+    for _v in _wanted:
+        _dx, _dy, _size = _cells[_v]
+        _frag = TechDraw.projectToSVG(_shape, FreeCAD.Vector(*_dirs[_v]))
+        _body.append('<g transform="translate(%r %r) scale(%r)">%s</g>' % (
+            _gap + _dx * _scale, _gap + _dy * _scale, _scale, _frag))
+    _svg = ('<svg xmlns="http://www.w3.org/2000/svg" width="%rmm" height="%rmm" viewBox="0 0 %r %r">'
+            '<rect width="100%%" height="100%%" fill="white"/>'
+            '<g transform="translate(0 %r) scale(1 -1)" stroke="#111" stroke-width="0.3" fill="none">%s</g></svg>'
+            ) % (_sheet_w, _sheet_h, _sheet_w, _sheet_h, _sheet_h, "".join(_body))
+    os.makedirs(os.path.dirname(${JSON.stringify(target)}) or ".", exist_ok=True)
+    open(${JSON.stringify(target)}, "w").write(_svg)
+    __out = {"ok": True, "path": ${JSON.stringify(target)}, "bytes": os.path.getsize(${JSON.stringify(target)}),
+             "views": _wanted, "sheet_mm": [round(_sheet_w, 1), round(_sheet_h, 1)]}
+`
+      return bridge.run(py, { title: `drawing → ${target}`, publishHint: false })
+    },
+  })
+
+  tool({
+    name: 'cad_studio_measure',
+    description: 'Measure a model: volume, surface area, bounding box, centroid, face/edge counts, and optionally the distance between two points.',
+    parameters: {
+      type: 'object',
+      properties: {
+        source: { type: 'string', description: 'Existing model file (STEP/IGES/BREP/STL).' },
+        code: { type: 'string', description: 'FreeCAD Python that binds `scene` or `export_shapes`.' },
+        from: { type: 'array', items: { type: 'number' }, description: 'First point [x,y,z] for a distance measurement.' },
+        to: { type: 'array', items: { type: 'number' }, description: 'Second point [x,y,z].' },
+      },
+      additionalProperties: false,
+    },
+    output: {
+      schema: { type: 'object', properties: { ok: { type: 'boolean' }, volume: { type: 'number' }, area: { type: 'number' } } },
+      render: (_a, v) => [{ type: 'text', text: JSON.stringify(v, null, 2) }],
+    },
+    execute: async ({ source, code, from, to }) => {
+      if (!source && !code) return { ok: false, error: 'pass either source (a model file) or code (FreeCAD Python)' }
+      const src = shapesFrom({ source, code })
+      const pair = Array.isArray(from) && Array.isArray(to) && from.length === 3 && to.length === 3
+      const py = `${PRELUDE}
+${src}
+if not _shapes:
+    __out = {"ok": False, "error": "nothing to measure"}
+else:
+    _s = _shapes[0]
+    _bb = _s.BoundBox
+    _c = getattr(_s, "CenterOfMass", None) or _bb.Center
+    __out = {
+        "ok": True,
+        "volume": round(sum(x.Volume for x in _shapes), 3),
+        "area": round(sum(x.Area for x in _shapes), 3),
+        "bounds": {"x": [round(_bb.XMin, 3), round(_bb.XMax, 3)], "y": [round(_bb.YMin, 3), round(_bb.YMax, 3)], "z": [round(_bb.ZMin, 3), round(_bb.ZMax, 3)]},
+        "size": [round(_bb.XLength, 3), round(_bb.YLength, 3), round(_bb.ZLength, 3)],
+        "centroid": [round(_c.x, 3), round(_c.y, 3), round(_c.z, 3)],
+        "faces": sum(len(x.Faces) for x in _shapes),
+        "edges": sum(len(x.Edges) for x in _shapes),
+    }
+${pair ? `    __out["distance"] = round((FreeCAD.Vector(${JSON.stringify(from)}) - FreeCAD.Vector(${JSON.stringify(to)})).Length, 3)` : ''}
+`
+      return bridge.run(py, { title: 'measure', publishHint: false })
+    },
+  })
+
+  // ---- Declarative features: the common jobs without writing Python ------
+  // A list of ops applied in order. `run` stays the escape hatch; this is the
+  // path for "60×40×20 的盒子挖个 φ16 通孔、倒 2mm 圆角".
+
+  const FEATURE_KINDS = ['box', 'cylinder', 'sphere', 'cone', 'torus', 'extrude', 'revolve', 'fuse', 'cut', 'common', 'fillet', 'chamfer', 'shell', 'pattern_linear', 'pattern_circular', 'translate', 'rotate', 'mirror']
+
+  tool({
+    name: 'cad_studio_feature',
+    description: `Build a part from a list of declarative ops (no Python needed), publish it and optionally export STEP. Kinds: ${FEATURE_KINDS.join(', ')}. Ops run in order; the first primitive starts the body, later ones fuse into it, and fillet/chamfer/shell/pattern/translate/rotate/mirror rewrite it.`,
+    parameters: {
+      type: 'object',
+      properties: {
+        ops: {
+          type: 'array',
+          description: `Ordered ops. Examples — box {kind:"box",size:[60,40,20],at?}; cylinder {kind:"cylinder",r,h,at?,axis?}; cone {kind:"cone",r1?,r2,h,at?,axis?}; sphere {kind:"sphere",r,at?}; torus {kind:"torus",r1,r2,at?}; cut/fuse/common {kind:"cut",with:<primitive op>}; fillet {kind:"fillet",r}; chamfer {kind:"chamfer",d}; shell {kind:"shell",t,open?:"none"|"top"|"bottom"}; pattern_linear {kind:"pattern_linear",delta:[dx,dy,dz],count}; pattern_circular {kind:"pattern_circular",axis?,at?,angle?,count}; translate {kind:"translate",v:[x,y,z]}; rotate {kind:"rotate",axis?,at?,deg}; mirror {kind:"mirror",normal?,at?}.`,
+          items: { type: 'object' },
+        },
+        title: { type: 'string', description: 'Panel title for the published scene.' },
+        export: { type: 'string', description: 'Optional .step/.stp path to also write the result.' },
+      },
+      required: ['ops'],
+      additionalProperties: false,
+    },
+    output: {
+      schema: { type: 'object', properties: { ok: { type: 'boolean' }, sceneId: { type: 'string' }, volume: { type: 'number' }, features: { type: 'number' } } },
+      render: (_a, v) => [{ type: 'text', text: JSON.stringify(v, null, 2) }],
+    },
+    execute: async ({ ops, title, export: exportPath }) => {
+      if (!Array.isArray(ops) || !ops.length) return { ok: false, error: 'ops 不能为空：至少给一个图元' }
+      const unknown = ops.find((op) => !op || !FEATURE_KINDS.includes(op.kind))
+      if (unknown) return { ok: false, error: `不支持的特征：${unknown?.kind ?? '(空)'}（可用 ${FEATURE_KINDS.join(' / ')}）` }
+      const py = featuresScript(ops, exportPath)
+      return bridge.run(py, { title: title ?? 'feature' })
+    },
+  })
+
+  tool({
+    name: 'cad_studio_assembly',
+    description: 'Assemble parts by file reference (STEP/IGES/BREP), publish the assembly to the panel, and optionally export it as one STEP. Each part file is read once; instances share the same geometry.',
+    parameters: {
+      type: 'object',
+      properties: {
+        parts: {
+          type: 'array',
+          description: 'Unique part files: [{name, path}].',
+          items: { type: 'object', properties: { name: { type: 'string' }, path: { type: 'string' }, color: { type: 'array', items: { type: 'number' } } }, required: ['name', 'path'] },
+        },
+        instances: {
+          type: 'array',
+          description: 'Placements: [{name, part, at:[x,y,z], rot?:[rx,ry,rz] degrees}].',
+          items: { type: 'object', properties: { name: { type: 'string' }, part: { type: 'string' }, at: { type: 'array', items: { type: 'number' } }, rot: { type: 'array', items: { type: 'number' } } }, required: ['name', 'part'] },
+        },
+        target: { type: 'string', description: 'Optional .step/.stp output path for the whole assembly.' },
+        title: { type: 'string', description: 'Panel title.' },
+        assembly: { type: 'string', description: 'Assembly label for cad_studio_joint / cad_studio_drive / cad_studio_explode (defaults to the title).' },
+        joints: {
+          type: 'array',
+          description: 'Joints to declare up front: [{id?, instance, type:"revolute"|"linear", axis?, origin?, value?, min?, max?}]. Rotating about the instance centre is the default; pass origin for a hinge.',
+          items: {
+            type: 'object',
+            properties: {
+              id: { type: 'string' },
+              instance: { type: 'string' },
+              type: { type: 'string', enum: ['revolute', 'linear'] },
+              axis: { type: 'array', items: { type: 'number' } },
+              origin: { type: 'array', items: { type: 'number' } },
+              value: { type: 'number' },
+              min: { type: 'number' },
+              max: { type: 'number' },
+            },
+            required: ['instance'],
+          },
+        },
+      },
+      required: ['parts', 'instances'],
+      additionalProperties: false,
+    },
+    output: {
+      schema: { type: 'object', properties: { ok: { type: 'boolean' }, sceneId: { type: 'string' }, instances: { type: 'number' }, assembly: { type: 'string' } } },
+      render: (_a, v) => [{ type: 'text', text: JSON.stringify(v, null, 2) }],
+    },
+    execute: async ({ parts, instances, target, title, assembly, joints }) => {
+      if (!Array.isArray(parts) || !parts.length) return { ok: false, error: 'parts must be a non-empty array' }
+      if (!Array.isArray(instances) || !instances.length) return { ok: false, error: 'instances must be a non-empty array' }
+      // Only referenced parts are read and tessellated: an export set often
+      // carries bodies no instance places, and pushing those into the scene
+      // bloats the payload and mislabels the part count.
+      const referenced = new Set(instances.map((i) => i.part))
+      const missing = [...referenced].filter((name) => !parts.some((p) => p.name === name))
+      if (missing.length) return { ok: false, error: `instances reference unknown parts: ${missing.slice(0, 5).join(', ')}` }
+      const used = parts.filter((p) => referenced.has(p.name))
+      const py = `${PRELUDE}
+import os
+_PART_FILES = ${JSON.stringify(used.map((p) => (p.color ? { name: p.name, path: p.path, color: p.color } : { name: p.name, path: p.path })))}
+_INSTS = ${JSON.stringify(instances.map((i) => ({ name: i.name, part: i.part, at: i.at ?? [0, 0, 0], rot: i.rot ?? [0, 0, 0] })))}
+_TARGET = ${target ? JSON.stringify(target) : 'None'}
+
+_shapes = {}
+_parts = []
+for _p in _PART_FILES:
+    if not os.path.isfile(_p["path"]):
+        raise RuntimeError("part file not found: " + _p["path"])
+    _s = Part.Shape()
+    _s.read(_p["path"])
+    _shapes[_p["name"]] = _s
+    _m = _mesh(_s)
+    _part = {"id": _p["name"], "verts": _m["verts"], "tris": _m["tris"], "volume": round(_s.Volume, 3)}
+    if "color" in _p and _p["color"]:
+        _part["color"] = _p["color"]
+    _parts.append(_part)
+
+_placed = []
+_instances = []
+for _i in _INSTS:
+    if _i["part"] not in _shapes:
+        raise RuntimeError("instance '" + _i["name"] + "' references unknown part '" + _i["part"] + "'")
+    _rx, _ry, _rz = _i["rot"]
+    _R = FreeCAD.Rotation(FreeCAD.Vector(0, 0, 1), _rz) * FreeCAD.Rotation(FreeCAD.Vector(0, 1, 0), _ry) * FreeCAD.Rotation(FreeCAD.Vector(1, 0, 0), _rx)
+    _ax = _R.multVec(FreeCAD.Vector(1, 0, 0))
+    _ay = _R.multVec(FreeCAD.Vector(0, 1, 0))
+    _az = _R.multVec(FreeCAD.Vector(0, 0, 1))
+    _rot = [_ax.x, _ay.x, _az.x, _ax.y, _ay.y, _az.y, _ax.z, _ay.z, _az.z]
+    _instances.append({"name": _i["name"], "part": _i["part"], "rot": _rot, "translate": [float(c) for c in _i["at"]]})
+    _copy = _shapes[_i["part"]].copy()
+    _copy.Placement = FreeCAD.Placement(FreeCAD.Vector(*_i["at"]), _R)
+    _placed.append(_copy)
+
+__out = {"ok": True, "instances": len(_instances), "parts": len(_parts),
+         "scene": {"parts": _parts, "instances": _instances}}
+if _TARGET:
+    os.makedirs(os.path.dirname(_TARGET) or ".", exist_ok=True)
+    Part.makeCompound(_placed).exportStep(_TARGET)
+    __out["exported"] = _TARGET
+    __out["bytes"] = os.path.getsize(_TARGET)
+`
+      const out = await bridge.run(py, { title: title ?? 'assembly' })
+      if (!out.ok || !out.sceneId) return out
+      // Keep the base placements: without them a joint has nothing to move.
+      const scene = bridge.scenes.get(out.sceneId)
+      if (!scene) return out
+      const record = bridge.registerAssembly({ title: assembly || title || 'assembly', sceneId: out.sceneId, scene, joints: [] })
+      for (const spec of joints ?? []) {
+        try {
+          bridge.setJoint(record, spec)
+        } catch (error) {
+          out.jointWarning = String(error?.message ?? error)
+        }
+      }
+      scene.assembly = {
+        id: record.id,
+        title: record.title,
+        explode: 0,
+        joints: record.joints.map((j) => ({ id: j.id, instance: j.instance, type: j.type, value: round6(j.value), min: round6(j.min), max: round6(j.max) })),
+      }
+      await bridge.persist()
+      out.assembly = record.id
+      out.joints = record.joints.length
+      return out
+    },
+  })
+
+  // ---- Joints, motion and exploded views ---------------------------------
+  // A joint is a rigid transform applied on top of an instance's base
+  // placement, so motion never touches the geometry: re-placing is a matrix
+  // multiply, and the panel can drive it frame by frame.
+
+  const findAssembly = (id) => {
+    const key = typeof id === 'string' ? id.trim() : ''
+    if (key && bridge.assemblies.has(key)) return bridge.assemblies.get(key)
+    // Convenience: a unique title, or the newest assembly when none is given.
+    const all = [...bridge.assemblies.values()]
+    if (key) {
+      const byTitle = all.filter((a) => a.title === key)
+      if (byTitle.length === 1) return byTitle[0]
+      throw new Error(`没有这个装配：${key}（可用 ${all.map((a) => a.id).join(', ') || '（无）'}）`)
+    }
+    if (!all.length) throw new Error('还没有装配：先 cad_studio_assembly 建一个')
+    return all[all.length - 1]
+  }
+
+  tool({
+    name: 'cad_studio_joint',
+    description: 'Declare, list or remove joints on a published assembly. A revolute joint rotates its instance about (axis, origin); a linear joint slides it along axis. Driving a joint republishes the scene.',
+    parameters: {
+      type: 'object',
+      properties: {
+        action: { type: 'string', enum: ['set', 'list', 'remove'], description: 'Default: set.' },
+        assembly: { type: 'string', description: 'Assembly id (asm-1) or its label. Default: newest.' },
+        joint: { type: 'string', description: 'Joint id for remove.' },
+        instance: { type: 'string', description: 'Instance name the joint moves (set).' },
+        type: { type: 'string', enum: ['revolute', 'linear'], description: 'Default: revolute.' },
+        axis: { type: 'array', items: { type: 'number' }, description: 'Rotation/slide axis in world space. Default [0,0,1] revolute / [1,0,0] linear.' },
+        origin: { type: 'array', items: { type: 'number' }, description: 'Point the rotation axis passes through. Default: the instance centre.' },
+        value: { type: 'number', description: 'Current value in degrees (revolute) or mm (linear).' },
+        min: { type: 'number' },
+        max: { type: 'number' },
+        id: { type: 'string', description: 'Joint id (default revolute-1 / linear-1).' },
+      },
+      additionalProperties: false,
+    },
+    output: {
+      schema: { type: 'object', properties: { ok: { type: 'boolean' }, assembly: { type: 'string' }, sceneId: { type: 'string' } } },
+      render: (_a, v) => [{ type: 'text', text: JSON.stringify(v, null, 2) }],
+    },
+    execute: async ({ action, assembly, joint, ...spec }) => {
+      let record
+      try {
+        record = findAssembly(assembly)
+      } catch (error) {
+        return { ok: false, error: String(error?.message ?? error) }
+      }
+      const mode = action ?? 'set'
+      if (mode === 'list') {
+        return {
+          ok: true,
+          assembly: record.id,
+          title: record.title,
+          sceneId: record.sceneId,
+          explode: record.explode,
+          joints: record.joints.map((j) => ({ id: j.id, instance: j.instance, type: j.type, axis: j.axis.map(round6), origin: j.origin.map(round6), value: round6(j.value), min: round6(j.min), max: round6(j.max) })),
+        }
+      }
+      if (mode === 'remove') {
+        const before = record.joints.length
+        record.joints = record.joints.filter((j) => j.id !== joint)
+        if (record.joints.length === before) return { ok: false, error: `没有这个关节：${joint ?? '(未指定)'}` }
+        const published = await bridge.republishAssembly(record, '')
+        return { ok: true, assembly: record.id, removed: joint, sceneId: published.id, joints: record.joints.length }
+      }
+      let stored
+      try {
+        stored = bridge.setJoint(record, { ...spec, id: spec.id })
+      } catch (error) {
+        return { ok: false, error: String(error?.message ?? error) }
+      }
+      const published = await bridge.republishAssembly(record, `${stored.id} ${round6(stored.value)}`)
+      return {
+        ok: true,
+        assembly: record.id,
+        sceneId: published.id,
+        joint: { id: stored.id, instance: stored.instance, type: stored.type, axis: stored.axis.map(round6), origin: stored.origin.map(round6), value: round6(stored.value), min: round6(stored.min), max: round6(stored.max) },
+        joints: record.joints.length,
+      }
+    },
+  })
+
+  tool({
+    name: 'cad_studio_drive',
+    description: 'Drive a joint to a new value (degrees for revolute, mm for linear) and republish the assembly scene. This is the motion step: the geometry is untouched, only instance placements are re-solved.',
+    parameters: {
+      type: 'object',
+      properties: {
+        assembly: { type: 'string' },
+        joint: { type: 'string', description: 'Joint id. Default: the assembly\'s first joint.' },
+        value: { type: 'number', description: 'New value (clamped to the joint range).' },
+      },
+      required: ['value'],
+      additionalProperties: false,
+    },
+    output: {
+      schema: { type: 'object', properties: { ok: { type: 'boolean' }, sceneId: { type: 'string' }, value: { type: 'number' } } },
+      render: (_a, v) => [{ type: 'text', text: JSON.stringify(v, null, 2) }],
+    },
+    execute: async ({ assembly, joint, value }) => {
+      let record
+      try {
+        record = findAssembly(assembly)
+      } catch (error) {
+        return { ok: false, error: String(error?.message ?? error) }
+      }
+      if (!record.joints.length) return { ok: false, error: '这个装配还没有关节：先 cad_studio_joint set 建一个' }
+      const id = joint ?? record.joints[0].id
+      const moved = bridge.driveJoint(record, id, value)
+      if (!moved) return { ok: false, error: `没有这个关节：${id}（现有 ${record.joints.map((j) => j.id).join(', ')}）` }
+      const published = await bridge.republishAssembly(record, `${id} ${round6(moved.value)}`)
+      return {
+        ok: true,
+        assembly: record.id,
+        sceneId: published.id,
+        joint: moved.id,
+        instance: moved.instance,
+        value: round6(moved.value),
+        instances: published.stats.instances,
+        volume: round6(published.stats.volume),
+      }
+    },
+  })
+
+  tool({
+    name: 'cad_studio_explode',
+    description: 'Exploded view: push every instance radially away from the assembly centre by `factor` (0 = assembled, 0.5 = half the distance outward). Republished scene only — geometry and exports are untouched.',
+    parameters: {
+      type: 'object',
+      properties: {
+        assembly: { type: 'string' },
+        factor: { type: 'number', description: '0 assembled … 4 fully exploded. Default 1.' },
+      },
+      additionalProperties: false,
+    },
+    output: {
+      schema: { type: 'object', properties: { ok: { type: 'boolean' }, sceneId: { type: 'string' }, explode: { type: 'number' } } },
+      render: (_a, v) => [{ type: 'text', text: JSON.stringify(v, null, 2) }],
+    },
+    execute: async ({ assembly, factor }) => {
+      let record
+      try {
+        record = findAssembly(assembly)
+      } catch (error) {
+        return { ok: false, error: String(error?.message ?? error) }
+      }
+      const next = bridge.setExplode(record, factor ?? 1)
+      if (next === null) return { ok: false, error: 'factor 必须是数字' }
+      const published = await bridge.republishAssembly(record, next ? `爆炸 ${round6(next)}` : '合拢')
+      return { ok: true, assembly: record.id, sceneId: published.id, explode: round6(next), instances: published.stats.instances }
+    },
+  })
+
+
+  // ---- Model documents: the state that makes "chat and draw" incremental ----
+  // A model is {name, params, script, history}. Every rebuild replays the same
+  // script against the current params, so "把高度改成 120" is a one-field edit
+  // instead of the agent re-sending (and me re-deriving) the whole script.
+
+  const MODEL_NAME = /^[\p{L}\p{N}_-]{1,60}$/u
+  const modelFile = (name, dir) => join(dir, `${name}.json`)
+
+  const checkName = (raw) => {
+    const value = String(raw ?? '').trim()
+    if (!MODEL_NAME.test(value)) {
+      throw new Error('模型名只能用中英文、数字、下划线或连字符（1–60 字）')
+    }
+    return value
+  }
+
+  const readModel = async (name, dir) => {
+    const key = checkName(name)
+    let text
+    try {
+      text = await readFile(modelFile(key, dir), 'utf8')
+    } catch {
+      throw new Error(`没有这个模型：${key}（可先 cad_studio_doc list 看看有哪些）`)
+    }
+    const doc = JSON.parse(text)
+    doc.params = doc.params && typeof doc.params === 'object' ? doc.params : {}
+    doc.history = Array.isArray(doc.history) ? doc.history : []
+    // Two document shapes share one file format: a Python script with params, or
+    // a declarative feature list. Older files predate the field and are scripts.
+    doc.kind = doc.kind === 'features' ? 'features' : 'script'
+    doc.features = Array.isArray(doc.features) ? doc.features : []
+    return doc
+  }
+
+  const writeModel = async (doc, dir) => {
+    await mkdir(dir, { recursive: true })
+    const body = JSON.stringify(doc, null, 2)
+    await writeFile(modelFile(doc.name, dir), body, 'utf8')
+    return doc
+  }
+
+  /** Public view of a feature list: what the panel renders as editable rows. */
+  const publicFeatures = (doc) => doc.features.map((f) => ({
+    id: f.id,
+    kind: f.kind,
+    label: f.label ?? '',
+    params: f.params ?? {},
+    enabled: f.enabled !== false,
+  }))
+
+  /** Feature objects to flat ops (`{kind, ...params}`) for the Python emitter. */
+  const featureOps = (doc) => doc.features
+    .filter((f) => f.enabled !== false)
+    .map((f) => ({ kind: f.kind, ...(f.params ?? {}) }))
+
+  const FEATURE_FIELDS = ['id', 'kind', 'label', 'params', 'enabled']
+
+  /**
+   * Accept both shapes: `{kind:'box', params:{size:…}}` and the flatter
+   * `{kind:'box', size:…}` an agent tends to write.
+   */
+  const normalizeFeature = (doc, raw) => {
+    if (!raw || typeof raw !== 'object') throw new Error('feature 必须是对象（至少给 kind）')
+    const kind = String(raw.kind ?? '')
+    if (!FEATURE_KINDS.includes(kind)) {
+      throw new Error(`不支持的特征：${kind || '(空)'}（可用 ${FEATURE_KINDS.join(' / ')}）`)
+    }
+    const params = raw.params && typeof raw.params === 'object' ? { ...raw.params } : {}
+    for (const [k, v] of Object.entries(raw)) if (!FEATURE_FIELDS.includes(k)) params[k] = v
+    let maxId = 0
+    for (const f of doc.features) {
+      const hit = /^f(\d+)$/.exec(String(f.id ?? ''))
+      if (hit) maxId = Math.max(maxId, Number(hit[1]))
+    }
+    const id = /^f\d+$/.test(String(raw.id ?? '')) ? String(raw.id) : `f${maxId + 1}`
+    return {
+      id,
+      kind,
+      label: String(raw.label ?? '').slice(0, 40),
+      params: JSON.parse(JSON.stringify(params)),
+      enabled: raw.enabled !== false,
+    }
+  }
+
+  /**
+   * Rebuild a model. Script documents replay `script` against `params`; feature
+   * documents re-emit the whole feature list — which is why editing one feature
+   * is cheap and cannot leave the model half-updated.
+   */
+  const rebuild = async (doc, dir, { note } = {}) => {
+    const isFeatures = doc.kind === 'features'
+    const code = isFeatures
+      ? featuresScript(featureOps(doc))
+      : `${PRELUDE}\nP = ${JSON.stringify(doc.params ?? {})}\n${doc.script}`
+    const meta = isFeatures ? { model: doc.name, features: publicFeatures(doc) } : null
+    doc.run = (doc.run ?? 0) + 1
+    doc.updatedAt = new Date().toISOString()
+    const out = await bridge.run(code, { title: doc.name, meta })
+    if (out.ok === false) return { ...out, name: doc.name, params: doc.params }
+    doc.stats = {
+      volume: out.volume ?? null,
+      triangles: out.triangles ?? null,
+      bounds: out.bounds ?? null,
+      sceneId: out.sceneId ?? '',
+      at: doc.updatedAt,
+    }
+    if (note) doc.note = note
+    await writeModel(doc, dir)
+    return {
+      ok: true,
+      name: doc.name,
+      dir,
+      run: doc.run,
+      params: doc.params,
+      volume: doc.stats.volume,
+      triangles: doc.stats.triangles,
+      sceneId: doc.stats.sceneId,
+      published: Boolean(doc.stats.sceneId),
+      updatedAt: doc.updatedAt,
+    }
+  }
+
+  tool({
+    name: 'cad_studio_doc',
+    description: 'Create/read/update a parametric model document. A model stores its Python script plus a params dict; updating params rebuilds the same script, so a follow-up edit ("把高度改成 120") only changes one field instead of rewriting the model. With kind="features" the document is a declarative feature list instead, editable one feature at a time via cad_studio_features. The script sees the params as `P` (e.g. `h = P.get("高", 107)`) and must bind the shape to show to `scene`.',
+    parameters: {
+      type: 'object',
+      properties: {
+        action: { type: 'string', enum: ['list', 'show', 'create', 'update', 'revert', 'delete'], description: 'list / show / create / update / revert / delete' },
+        name: { type: 'string', description: 'Model name (中英文/数字/下划线/连字符).' },
+        script: { type: 'string', description: 'FreeCAD Python source; reads params from `P`, binds the result to `scene`. Required for create unless kind is "features".' },
+        kind: { type: 'string', enum: ['script', 'features'], description: 'script (default): a Python script + params. features: a declarative feature list you can edit one feature at a time (see cad_studio_features).' },
+        features: { type: 'array', items: { type: 'object' }, description: 'For kind="features": the initial feature list, each {kind, label?, params?} (flat params such as {kind:"box", size:[60,40,20]} also work).' },
+        params: { type: 'object', description: 'Parameter dict. On update these are merged into the existing params (set a key to null to delete it).' },
+        note: { type: 'string', description: 'What this revision changed (kept in history).' },
+      },
+      required: ['action'],
+      additionalProperties: false,
+    },
+    output: {
+      schema: { type: 'object', properties: { ok: { type: 'boolean' }, name: { type: 'string' }, sceneId: { type: 'string' }, models: { type: 'number' } } },
+      render: (_args, value) => [{ type: 'text', text: JSON.stringify(value, null, 2) }],
+    },
+    execute: async (args, exec) => {
+      try {
+        return await runDocAction(args, modelsDirFor(exec))
+      } catch (err) {
+        // Tool errors are data, not exceptions: the agent needs to read the
+        // message and try something else, and a throw would also skip cleanup.
+        return { ok: false, error: String((err && err.message) || err) }
+      }
+    },
+  })
+
+  /**
+   * Feature-list editing: the "chat and draw" loop at feature granularity.
+   * Every mutating action rebuilds the whole list (one FreeCAD run, ~0.2–0.6 s),
+   * so the model can never be left half-edited — a failed edit is rolled back.
+   */
+  const runFeatureAction = async (args, dir) => {
+    bridge.noteModelsDir(dir)
+    const action = String(args.action ?? 'list')
+    const doc = await readModel(args.model, dir)
+    if (doc.kind !== 'features') {
+      throw new Error(`${doc.name} 是脚本模型，没有特征列表（用 cad_studio_doc update 改 params，或新建 kind="features" 的模型）`)
+    }
+    if (action === 'list') {
+      return { ok: true, model: doc.name, kind: doc.kind, features: publicFeatures(doc), stats: doc.stats ?? null }
+    }
+    const before = JSON.parse(JSON.stringify(doc.features))
+    const feature = args.feature && typeof args.feature === 'object' ? args.feature : {}
+    const wanted = String(args.id ?? feature.id ?? '')
+    const findAt = () => doc.features.findIndex((f) => String(f.id) === wanted)
+
+    if (action === 'add') {
+      doc.features.push(normalizeFeature(doc, feature))
+    } else if (action === 'update') {
+      const at = findAt()
+      if (at < 0) throw new Error(`没有这个特征：${wanted || '(空)'}（现有 ${doc.features.map((f) => f.id).join(', ')}）`)
+      const current = doc.features[at]
+      const merged = normalizeFeature(doc, {
+        ...current,
+        ...feature,
+        id: current.id,
+        kind: feature.kind ?? current.kind,
+        params: { ...(current.params ?? {}), ...(feature.params && typeof feature.params === 'object' ? feature.params : {}) },
+      })
+      doc.features[at] = merged
+    } else if (action === 'remove') {
+      const at = findAt()
+      if (at < 0) throw new Error(`没有这个特征：${wanted || '(空)'}`)
+      doc.features.splice(at, 1)
+    } else if (action === 'move') {
+      const at = findAt()
+      if (at < 0) throw new Error(`没有这个特征：${wanted || '(空)'}`)
+      const [item] = doc.features.splice(at, 1)
+      const to = Number.isFinite(Number(args.to)) ? Math.max(0, Math.min(doc.features.length, Math.round(Number(args.to)))) : doc.features.length
+      doc.features.splice(to, 0, item)
+    } else if (action === 'toggle') {
+      const at = findAt()
+      if (at < 0) throw new Error(`没有这个特征：${wanted || '(空)'}`)
+      const want = feature.enabled !== undefined ? feature.enabled !== false : doc.features[at].enabled === false
+      doc.features[at].enabled = want
+    } else {
+      throw new Error(`未知 action：${action}（可用 list / add / update / remove / move / toggle）`)
+    }
+    if (!doc.features.length) throw new Error('特征列表不能为空：至少留一个图元')
+
+    const result = await rebuild(doc, dir, { note: `${action} ${wanted || feature.kind || ''}`.trim() })
+    if (result.ok === false) {
+      doc.features = before
+      await writeModel(doc, dir)
+      return { ...result, reverted: true, hint: '这次修改没跑通，特征列表已回退到上一版；改完再试。' }
+    }
+    doc.history.push({
+      at: doc.updatedAt,
+      note: `${action} ${wanted || feature.kind || ''}`.trim(),
+      params: JSON.parse(JSON.stringify(doc.params)),
+      features: JSON.parse(JSON.stringify(doc.features)),
+      run: doc.run,
+      prev: { script: doc.script, params: JSON.parse(JSON.stringify(doc.params)), features: before },
+    })
+    doc.history = doc.history.slice(-20)
+    await writeModel(doc, dir)
+    return {
+      ok: true,
+      model: doc.name,
+      kind: doc.kind,
+      action,
+      features: publicFeatures(doc),
+      volume: doc.stats?.volume ?? null,
+      triangles: doc.stats?.triangles ?? null,
+      sceneId: doc.stats?.sceneId ?? '',
+      run: doc.run,
+    }
+  }
+
+  tool({
+    name: 'cad_studio_features',
+    description: `Edit a feature-list model one feature at a time (the "边画边改" path): change one feature's parameters and the whole list is re-derived in ~0.2–0.6 s. Actions: list / add / update / remove / move / toggle. Feature kinds: ${FEATURE_KINDS.join(', ')}. A feature is {kind, label?, params} — params hold that kind's fields (box: size:[dx,dy,dz], at?; cylinder: r,h,at?,axis?; cut/fuse/common: with:<primitive>; fillet: r; chamfer: d; shell: t,open?; pattern_linear: delta,count; rotate: axis?,at?,deg; mirror: normal?,at?). Flat form ({kind:'box', size:[…]}) is accepted too.`,
+    parameters: {
+      type: 'object',
+      properties: {
+        model: { type: 'string', description: 'Feature-list model name (created with cad_studio_doc kind="features").' },
+        action: { type: 'string', enum: ['list', 'add', 'update', 'remove', 'move', 'toggle'] },
+        feature: { type: 'object', description: 'add: the feature to append. update/toggle: {id, ...fields to change}. remove/move: {id}.' },
+        id: { type: 'string', description: 'Feature id (f1, f2 …); alternative to feature.id.' },
+        to: { type: 'integer', description: 'move: target index (0-based). Default: to the end.' },
+      },
+      required: ['model', 'action'],
+      additionalProperties: false,
+    },
+    output: {
+      schema: { type: 'object', properties: { ok: { type: 'boolean' }, model: { type: 'string' }, sceneId: { type: 'string' }, volume: { type: 'number' }, features: { type: 'array' } } },
+      render: (_args, value) => [{ type: 'text', text: JSON.stringify(value, null, 2) }],
+    },
+    execute: async (args, exec) => {
+      try {
+        return await runFeatureAction(args, modelsDirFor(exec))
+      } catch (err) {
+        return { ok: false, error: String((err && err.message) || err) }
+      }
+    },
+  })
+
+  async function runDocAction(args, dir) {
+      bridge.noteModelsDir(dir)
+      const action = String(args.action ?? '')
+      if (action === 'list') {
+        await mkdir(dir, { recursive: true })
+        const names = (await readdir(dir)).filter((f) => f.endsWith('.json')).map((f) => f.slice(0, -5))
+        const models = []
+        for (const n of names) {
+          try {
+            const doc = await readModel(n, dir)
+            models.push({ name: doc.name, kind: doc.kind, features: doc.features.length, params: doc.params, runs: doc.run ?? 0, updatedAt: doc.updatedAt ?? '', volume: doc.stats?.volume ?? null, triangles: doc.stats?.triangles ?? null })
+          } catch { /* a hand-edited file that no longer parses is skipped, not fatal */ }
+        }
+        models.sort((a, b) => String(b.updatedAt).localeCompare(String(a.updatedAt)))
+        return { ok: true, models: models.length, items: models, dir }
+      }
+
+      if (action === 'show') {
+        const doc = await readModel(args.name, dir)
+        return {
+          ok: true,
+          name: doc.name,
+          kind: doc.kind,
+          params: doc.params,
+          ...(typeof doc.script === 'string' ? { script: doc.script } : {}),
+          ...(doc.kind === 'features' ? { features: publicFeatures(doc) } : {}),
+          runs: doc.run ?? 0,
+          updatedAt: doc.updatedAt ?? '',
+          stats: doc.stats ?? null,
+          history: doc.history.slice(-10).map((h) => ({ at: h.at, note: h.note ?? '', params: h.params })),
+        }
+      }
+
+      if (action === 'create') {
+        const key = checkName(args.name)
+        const wantFeatures = args.kind === 'features' || Array.isArray(args.features)
+        if (!wantFeatures && (typeof args.script !== 'string' || !args.script.trim())) {
+          throw new Error('create 需要 script（FreeCAD Python，读 P、写 scene），或用 kind="features" 建特征列表模型')
+        }
+        try {
+          await readModel(key, dir)
+          throw new Error(`模型已存在：${key}（要改的话用 action=update）`)
+        } catch (err) {
+          if (/模型已存在/.test(String(err.message))) throw err
+        }
+        if (wantFeatures) {
+          const doc = {
+            name: key,
+            kind: 'features',
+            features: [],
+            params: args.params && typeof args.params === 'object' ? args.params : {},
+            run: 0,
+            createdAt: new Date().toISOString(),
+            history: [],
+          }
+          for (const raw of Array.isArray(args.features) ? args.features : []) {
+            doc.features.push(normalizeFeature(doc, raw))
+          }
+          if (!doc.features.length) throw new Error('特征模型至少要有一个 feature，例如 {kind:"box", size:[60,40,20]}')
+          const result = await rebuild(doc, dir, { note: args.note ?? 'create' })
+          if (result.ok === false) return result
+          doc.history.push({ at: doc.updatedAt, note: args.note ?? 'create', params: JSON.parse(JSON.stringify(doc.params)), features: JSON.parse(JSON.stringify(doc.features)), run: doc.run })
+          await writeModel(doc, dir)
+          return { ...result, kind: 'features', features: publicFeatures(doc) }
+        }
+        const doc = {
+          name: key,
+          kind: 'script',
+          script: args.script,
+          params: args.params && typeof args.params === 'object' ? args.params : {},
+          run: 0,
+          createdAt: new Date().toISOString(),
+          history: [],
+        }
+        const result = await rebuild(doc, dir, { note: args.note ?? 'create' })
+        if (result.ok === false) return result
+        doc.history.push({ at: doc.updatedAt, note: args.note ?? 'create', params: JSON.parse(JSON.stringify(doc.params)), run: doc.run })
+        await writeModel(doc, dir)
+        return result
+      }
+
+      if (action === 'update') {
+        const doc = await readModel(args.name, dir)
+        const before = {
+          script: doc.script,
+          params: JSON.parse(JSON.stringify(doc.params)),
+          features: JSON.parse(JSON.stringify(doc.features)),
+        }
+        if (args.params && typeof args.params === 'object') {
+          for (const [k, v] of Object.entries(args.params)) {
+            if (v === null) delete doc.params[k]
+            else doc.params[k] = v
+          }
+        }
+        if (Array.isArray(args.features)) {
+          if (doc.kind !== 'features') throw new Error(`${doc.name} 是脚本模型；要换成特征列表请新建一个 kind="features" 的模型`)
+          doc.features = []
+          for (const raw of args.features) doc.features.push(normalizeFeature(doc, raw))
+          if (!doc.features.length) throw new Error('features 不能为空：至少留一个图元')
+        }
+        if (typeof args.script === 'string' && args.script.trim()) doc.script = args.script
+        const result = await rebuild(doc, dir, { note: args.note ?? 'update' })
+        if (result.ok === false) {
+          // A failed rebuild must not corrupt the document: put the old state back.
+          doc.script = before.script
+          doc.params = before.params
+          doc.features = before.features
+          await writeModel(doc, dir)
+          return { ...result, reverted: true, hint: '这次修改没跑通，模型已回退到上一版；改完再试。' }
+        }
+        doc.history.push({ at: doc.updatedAt, note: args.note ?? 'update', params: JSON.parse(JSON.stringify(doc.params)), features: JSON.parse(JSON.stringify(doc.features)), run: doc.run, prev: before })
+        doc.history = doc.history.slice(-20)
+        await writeModel(doc, dir)
+        return { ...result, kind: doc.kind, ...(doc.kind === 'features' ? { features: publicFeatures(doc) } : {}) }
+      }
+
+      if (action === 'revert') {
+        const doc = await readModel(args.name, dir)
+        const last = doc.history.pop()
+        if (!last) throw new Error(`${doc.name} 没有可回退的历史`)
+        if (last.prev) {
+          doc.script = last.prev.script
+          doc.params = last.prev.params
+          if (Array.isArray(last.prev.features)) doc.features = JSON.parse(JSON.stringify(last.prev.features))
+        } else if (last.params) {
+          doc.params = last.params
+        }
+        const result = await rebuild(doc, dir, { note: `revert to ${last.at}` })
+        await writeModel(doc, dir)
+        return result
+      }
+
+      if (action === 'delete') {
+        const key = checkName(args.name)
+        await unlink(modelFile(key, dir)).catch(() => { throw new Error(`没有这个模型：${key}`) })
+        return { ok: true, name: key, deleted: true, dir }
+      }
+
+      throw new Error(`未知 action：${action}`)
+  }
+
+  // ---- Panel routes ------------------------------------------------------
+
+  const mountRoutes = () => ctx.webServer.register({
+    kind: 'prefix',
+    path: ROUTE_PREFIX,
+    handler: async (req, res) => {
+      if (!isTrusted(req, resolved.trustedHosts)) {
+        res.writeHead(403, { 'content-type': 'text/plain' })
+        res.end('forbidden host')
+        return
+      }
+      const url = new URL(req.url ?? '/', 'http://localhost')
+      const send = (status, body, type = 'application/json; charset=utf-8') => {
+        res.writeHead(status, { 'content-type': type, 'cache-control': 'no-cache' })
+        res.end(body)
+      }
+      const dir = FreeCadBridge.dataDir
+      if (url.pathname === `${ROUTE_PREFIX}/state`) {
+        // Runtime is live (the binary may have been installed after boot);
+        // only the published scene pointer is persisted.
+        bridge.refresh()
+        const runtime = bridge.status()
+        try {
+          const parsed = JSON.parse(await readFile(join(dir, 'state.json'), 'utf8'))
+          return send(200, JSON.stringify({ runtime, latest: parsed.latest ?? null, assemblies: parsed.assemblies ?? [] }))
+        } catch {
+          return send(200, JSON.stringify({ runtime, latest: null }))
+        }
+      }
+      if (url.pathname === `${ROUTE_PREFIX}/scenes`) {
+        // Model switcher feed: the persisted history is the truth, so a stale
+        // route closure left by a hot reload still lists what is on disk.
+        try {
+          const parsed = JSON.parse(await readFile(join(dir, 'state.json'), 'utf8'))
+          return send(200, JSON.stringify({ latest: parsed.latest ?? null, scenes: parsed.history ?? [] }))
+        } catch {
+          return send(200, JSON.stringify({ latest: null, scenes: [] }))
+        }
+      }
+      const bodyOf = async () => {
+        const raw = await new Promise((resolve) => {
+          let data = ''
+          req.on('data', (chunk) => { data += chunk; if (data.length > 1 << 20) req.destroy() })
+          req.on('end', () => resolve(data))
+          req.on('error', () => resolve(''))
+        })
+        try { return JSON.parse(raw) } catch { return null }
+      }
+
+      if (url.pathname === `${ROUTE_PREFIX}/feature` && req.method === 'POST') {
+        // The panel edits features directly; the same code path as the tool, so
+        // a slider/number edit and an agent edit produce identical documents.
+        const body = await bodyOf()
+        if (!body || typeof body.model !== 'string' || !body.model) return send(400, JSON.stringify({ error: 'bad request' }))
+        try {
+          // The panel posts without a session, so resolve the models dir the way
+          // a tool would: explicit config, the last dir a tool used, or the one
+          // recorded in the state pointer (a restart forgets the in-memory copy).
+          // `dir` here is the plugin's data dir (scenes + pointer), not the
+          // models dir — the pointer records where the session's models live.
+          if (!bridge.modelsSeen.length) {
+            try {
+              const pointer = JSON.parse(await readFile(join(dir, 'state.json'), 'utf8'))
+              if (typeof pointer.modelsDir === 'string' && pointer.modelsDir) bridge.noteModelsDir(pointer.modelsDir)
+              if (Array.isArray(pointer.modelsDirs)) pointer.modelsDirs.forEach((d) => bridge.noteModelsDir(d))
+            } catch {}
+          }
+          // The panel posts without a session, so pick the candidate dir that
+          // actually holds this model (several workspaces may each have one).
+          const candidates = resolved.modelsDir ? [resolved.modelsDir, ...bridge.modelsCandidates()] : bridge.modelsCandidates()
+          const modelsDir = candidates.find((d) => existsSync(join(d, `${body.model}.json`))) || candidates[0] || modelsDirFor(undefined)
+          const result = await runFeatureAction(body, modelsDir)
+          return send(200, JSON.stringify(result))
+        } catch (error) {
+          return send(400, JSON.stringify({ ok: false, error: String(error?.message ?? error) }))
+        }
+      }
+
+      if (url.pathname === `${ROUTE_PREFIX}/select` && req.method === 'POST') {
+        // Switch the visible model without republishing: only the pointer moves.
+        const raw = await new Promise((resolve) => {
+          let data = ''
+          req.on('data', (chunk) => { data += chunk; if (data.length > 4096) req.destroy() })
+          req.on('end', () => resolve(data))
+          req.on('error', () => resolve(''))
+        })
+        let body = null
+        try { body = JSON.parse(raw) } catch { body = null }
+        const id = typeof body?.id === 'string' ? body.id : ''
+        if (!/^scene-\d+$/.test(id)) return send(400, JSON.stringify({ error: 'bad scene id' }))
+        // Reading a model must not rewrite what "latest" means: the live tab
+        // follows modelling, the model tab is whatever the user opened. This
+        // only resolves the id to its metadata.
+        try {
+          const parsed = JSON.parse(await readFile(join(dir, 'state.json'), 'utf8'))
+          const entry = (parsed.history ?? []).find((h) => h.id === id)
+          if (!entry) return send(404, JSON.stringify({ error: 'unknown scene' }))
+          return send(200, JSON.stringify({ ok: true, scene: { id: entry.id, title: entry.title, at: entry.at, session: entry.session ?? '' } }))
+        } catch {
+          return send(404, JSON.stringify({ error: 'unknown scene' }))
+        }
+      }
+      if (url.pathname === `${ROUTE_PREFIX}/assembly` && req.method === 'GET') {
+        // Joints + explode for the panel's motion controls.
+        const live = state.bridge
+        let records = [...live.assemblies.values()]
+        if (!records.length) {
+          // A restarted process has no in-memory assemblies yet; the pointer
+          // carries enough (placements + joints) to list and drive them.
+          try {
+            const pointer = JSON.parse(await readFile(join(dir, 'state.json'), 'utf8'))
+            records = Array.isArray(pointer.assemblies) ? pointer.assemblies : []
+          } catch {}
+        }
+        const list = records.map((a) => ({
+          id: a.id,
+          title: a.title,
+          sceneId: a.sceneId,
+          explode: a.explode,
+          joints: (a.joints || []).map((j) => ({ id: j.id, instance: j.instance, type: j.type, value: round6(j.value), min: round6(j.min), max: round6(j.max) })),
+        }))
+        return send(200, JSON.stringify({ assemblies: list }))
+      }
+      if ((url.pathname === `${ROUTE_PREFIX}/drive` || url.pathname === `${ROUTE_PREFIX}/explode`) && req.method === 'POST') {
+        const raw = await new Promise((resolve) => {
+          let data = ''
+          req.on('data', (chunk) => { data += chunk; if (data.length > 8192) req.destroy() })
+          req.on('end', () => resolve(data))
+          req.on('error', () => resolve(''))
+        })
+        let body = null
+        try { body = JSON.parse(raw) } catch { body = null }
+        const live = state.bridge
+        const record = await live.loadAssembly(typeof body?.assembly === 'string' ? body.assembly : null)
+        if (!record) return send(404, JSON.stringify({ error: 'no assembly' }))
+        if (url.pathname.endsWith('/drive')) {
+          const jointId = typeof body?.joint === 'string' ? body.joint : record.joints[0]?.id
+          const moved = live.driveJoint(record, jointId, body?.value)
+          if (!moved) return send(400, JSON.stringify({ error: 'bad joint or value' }))
+          const published = await live.republishAssembly(record, `${moved.id} ${round6(moved.value)}`)
+          return send(200, JSON.stringify({ ok: true, sceneId: published.id, joint: moved.id, value: round6(moved.value) }))
+        }
+        const next = live.setExplode(record, body?.factor ?? 1)
+        if (next === null) return send(400, JSON.stringify({ error: 'bad factor' }))
+        const published = await live.republishAssembly(record, next ? `爆炸 ${round6(next)}` : '合拢')
+        return send(200, JSON.stringify({ ok: true, sceneId: published.id, explode: round6(next) }))
+      }
+      if (url.pathname.startsWith(`${ROUTE_PREFIX}/scene/`)) {
+        const id = decodeURIComponent(url.pathname.slice(`${ROUTE_PREFIX}/scene/`.length))
+        if (!/^scene-\d+$/.test(id)) return send(400, JSON.stringify({ error: 'bad scene id' }))
+        try {
+          const body = await readFile(join(dir, 'scenes', `${id}.json`), 'utf8')
+          return send(200, body)
+        } catch {
+          return send(404, JSON.stringify({ error: 'unknown scene' }))
+        }
+      }
+      if (url.pathname === `${ROUTE_PREFIX}/open` && req.method === 'POST') {
+        // The sidebar file viewer asks the Host to open a path it cannot read
+        // itself (the browser has no direct filesystem access).
+        const raw = await new Promise((resolve) => {
+          let data = ''
+          req.on('data', (chunk) => { data += chunk; if (data.length > 8192) req.destroy() })
+          req.on('end', () => resolve(data))
+          req.on('error', () => resolve(''))
+        })
+        let body = null
+        try { body = JSON.parse(raw) } catch { body = null }
+        const path = typeof body?.path === 'string' ? body.path.trim() : ''
+        if (!path || path.includes('\u0000') || !path.startsWith('/')) {
+          return send(400, JSON.stringify({ error: 'bad path' }))
+        }
+        try {
+          const info = await stat(path)
+          if (!info.isFile()) return send(400, JSON.stringify({ error: 'not a file' }))
+        } catch {
+          return send(404, JSON.stringify({ error: 'no such file' }))
+        }
+        try {
+          const result = await openPath(path)
+          return send(200, JSON.stringify(result))
+        } catch (error) {
+          return send(500, JSON.stringify({ error: String(error?.message ?? error) }))
+        }
+      }
+      if (url.pathname.startsWith(`${ROUTE_PREFIX}/assets/`)) {
+        const name = url.pathname.slice(`${ROUTE_PREFIX}/assets/`.length)
+        if (!ASSET_NAME.test(name)) return send(400, JSON.stringify({ error: 'bad asset name' }))
+        try {
+          const body = await readFile(join(PLUGIN_DIR, 'assets', name))
+          res.writeHead(200, { 'content-type': 'text/javascript; charset=utf-8', 'cache-control': 'no-cache' })
+          res.end(body)
+        } catch {
+          send(404, JSON.stringify({ error: 'unknown asset' }))
+        }
+        return
+      }
+      send(404, JSON.stringify({ error: 'not found' }))
+    },
+  })
+
+  try {
+    ctx.effect(mountRoutes)
+  } catch (error) {
+    // A hot reload cannot release a prefix route the previous instance left
+    // behind; without a restart the panel route stays stale, so say so loudly.
+    ctx.logger?.warn?.('cad-studio: route %s not remounted (%s); restart dsh web to reclaim it', ROUTE_PREFIX, String(error?.message ?? error))
+  }
+}
