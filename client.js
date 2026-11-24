@@ -375,11 +375,19 @@ window.__ModuleLoader__.load({
         ])
       }
       if (name === 'view') {
+        // A camera: which angle am I looking from, and what gets drawn.
         return h('svg', common, [
-          h('path', { key: 'x', d: 'M2.6 12.6 9 6.2' }),
-          h('path', { key: 'y', d: 'M2.6 12.6h9.2' }),
-          h('path', { key: 'z', d: 'M2.6 12.6V3.4' }),
-          h('path', { key: 'xh', d: 'M9 6.2l-2.2.6 1.6 1.6' }),
+          h('path', { key: 'body', d: 'M2.3 5.9h11.4a1 1 0 0 1 1 1v5.4a1 1 0 0 1-1 1H2.3a1 1 0 0 1-1-1V6.9a1 1 0 0 1 1-1Z' }),
+          h('path', { key: 'bump', d: 'M5.5 5.9 6.5 4.2h3l1 1.7' }),
+          h('circle', { key: 'lens', cx: 8, cy: 9.6, r: 2.2 }),
+        ])
+      }
+      if (name === 'features') {
+        // A ziggurat: the shape as a stack of machining steps.
+        return h('svg', common, [
+          h('path', { key: 'b1', d: 'M2.4 10.2h11.2v3.3H2.4z' }),
+          h('path', { key: 'b2', d: 'M3.9 6.9h8.2v3.3H3.9z' }),
+          h('path', { key: 'b3', d: 'M5.4 3.6h5.2v3.3H5.4z' }),
         ])
       }
       if (name === 'models') {
@@ -397,12 +405,11 @@ window.__ModuleLoader__.load({
         ])
       }
       if (name === 'motion') {
-        // A joint/pivot: an axis with an arc around it.
+        // A revolute joint: rotation axis with a circular arrow around it.
         return h('svg', common, [
-          h('path', { key: 'a', d: 'M8 2.4v11.2' }),
-          h('path', { key: 'b', d: 'M3.1 8a4.9 4.9 0 0 1 4.9-4.9' }),
-          h('path', { key: 'c', d: 'M12.9 8A4.9 4.9 0 0 1 8 12.9' }),
-          h('path', { key: 'd', d: 'M10.6 3.1 8 2.4l-.7 2.6M5.4 12.9 8 13.6l.7-2.6' }),
+          h('path', { key: 'a', d: 'M8 3.2v9.6' }),
+          h('path', { key: 'b', d: 'M8 5.1a2.9 2.9 0 1 1-2.8 3.6' }),
+          h('path', { key: 'c', d: 'M5.3 8.6 4.2 8l-.2 1.5' }),
         ])
       }
       return h('svg', common, [
@@ -2386,6 +2393,7 @@ const FILE_EXTS = ['step', 'stp', 'iges', 'igs', 'brep', 'stl']
             style: styles.railBtn(panel === item.id),
             'data-cad-rail': item.id,
             'aria-pressed': panel === item.id ? 'true' : 'false',
+            'aria-label': item.label,
             title: item.label,
             onClick: () => { setAddOpen(false); setPanel((p) => (p === item.id ? '' : item.id)) },
           }, h(RailIcon, { name: item.id })))),
