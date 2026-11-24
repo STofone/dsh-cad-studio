@@ -146,6 +146,8 @@ window.__ModuleLoader__.load({
       propLabel: { fontSize: 10.5, opacity: 0.62, flex: 'none', width: 34 },
       propValue: { marginLeft: 'auto', fontSize: 10, opacity: 0.75, fontVariantNumeric: 'tabular-nums', flex: 'none' },
       slider: { flex: '1 1 auto', minWidth: 0, height: 14, accentColor: '#4d6bfe', cursor: 'pointer' },
+      jointNum: { width: 52, flex: '0 0 auto', padding: '1px 3px', fontSize: 10.5, textAlign: 'right', color: 'inherit', background: 'rgba(125,135,155,0.12)', border: '1px solid transparent', borderRadius: 4, outline: 'none', fontVariantNumeric: 'tabular-nums' },
+      sliderRow: { display: 'flex', alignItems: 'center', gap: 6, padding: '0 8px 5px 8px' },
       propBtn: { font: 'inherit', fontSize: 10.5, padding: '3px 8px', borderRadius: 5, border: '1px solid', background: 'transparent', color: 'inherit', cursor: 'pointer', whiteSpace: 'nowrap' },
       propBtns: { display: 'flex', flexWrap: 'wrap', gap: 5, padding: '6px 2px 2px' },
       propEmpty: { padding: '10px 6px', fontSize: 10.5, opacity: 0.6, lineHeight: 1.7 },
@@ -1640,21 +1642,52 @@ const FILE_EXTS = ['step', 'stp', 'iges', 'igs', 'brep', 'stl']
           ...(assembly.joints || []).map((joint) => {
             const value = motionDraft[joint.id] !== undefined ? motionDraft[joint.id] : joint.value
             const unit = joint.type === 'linear' ? ' mm' : '°'
-            return h('div', { key: joint.id, style: styles.propRow, 'data-cad-joint': joint.id }, [
-              h('span', { key: 'l', style: jointLabel, title: `${joint.id} · ${joint.instance}` }, joint.instance),
-              h('span', { key: 'v', style: styles.propValue, 'data-cad-joint-value': joint.id }, `${Math.round(value * 10) / 10}${unit}`),
-              h('input', {
-                key: 's',
-                type: 'range',
-                style: styles.slider,
-                'data-cad-joint-slider': joint.id,
-                min: joint.min,
-                max: joint.max,
-                step: 1,
-                value,
-                title: `${joint.id}（${joint.type === 'linear' ? '滑动 mm' : '旋转 °'}）`,
-                onInput: (event) => driveJoint(joint.id, Number(event.target.value)),
-              }),
+            const clamp = (raw) => Math.max(joint.min, Math.min(joint.max, Math.round(raw)))
+            return h('div', { key: joint.id, 'data-cad-joint': joint.id }, [
+              h('div', { key: 'r', style: styles.propRow }, [
+                h('span', { key: 'l', style: jointLabel, title: `${joint.id} · ${joint.instance}` }, joint.instance),
+                h('span', { key: 'v', style: styles.propValue, 'data-cad-joint-value': joint.id }, `${Math.round(value * 10) / 10}${unit}`),
+                // Typing beats dragging for exact values: 180° across this narrow
+                // slider makes a hand-hit 0° almost impossible.
+                h('input', {
+                  key: 'n',
+                  type: 'number',
+                  style: styles.jointNum,
+                  'data-cad-joint-input': joint.id,
+                  min: joint.min,
+                  max: joint.max,
+                  step: 1,
+                  value: String(Math.round(value * 10) / 10),
+                  title: '输入数值后回车',
+                  onChange: (event) => {
+                    const next = Number(event.target.value)
+                    if (Number.isFinite(next)) driveJoint(joint.id, clamp(next))
+                  },
+                  onKeyDown: (event) => { if (event.key === 'Enter') event.currentTarget.blur() },
+                }),
+                h('button', {
+                  key: 'z',
+                  type: 'button',
+                  style: styles.microBtn,
+                  'data-cad-joint-zero': joint.id,
+                  title: `把 ${joint.id} 设回 0`,
+                  onClick: () => driveJoint(joint.id, 0),
+                }, '归零'),
+              ]),
+              h('div', { key: 's', style: styles.sliderRow }, [
+                h('input', {
+                  key: 'sl',
+                  type: 'range',
+                  style: styles.slider,
+                  'data-cad-joint-slider': joint.id,
+                  min: joint.min,
+                  max: joint.max,
+                  step: 1,
+                  value,
+                  title: `${joint.id}（${joint.type === 'linear' ? '滑动 mm' : '旋转 °'}）`,
+                  onInput: (event) => driveJoint(joint.id, Number(event.target.value)),
+                }),
+              ]),
             ])
           }),
           h('div', { key: 'eh', style: styles.treeHint }, '爆炸图'),

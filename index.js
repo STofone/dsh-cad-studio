@@ -444,6 +444,18 @@ class FreeCadBridge {
       if (Array.isArray(pointer.modelsDirs)) this.modelsSeen = [...new Set([...this.modelsSeen, ...pointer.modelsDirs.filter((d) => typeof d === 'string' && d)])].slice(0, 12)
       if (!this.lastSession && typeof pointer.lastSession === 'string') this.lastSession = pointer.lastSession
       const disk = Array.isArray(pointer.history) ? pointer.history : []
+      const asmTitles = new Map()
+      for (const a of Array.isArray(pointer.assemblies) ? pointer.assemblies : []) {
+        if (a && typeof a.id === 'string' && typeof a.title === 'string') asmTitles.set(`asm:${a.id}`, a.title)
+      }
+      // Earlier builds appended the joint value / explode factor to the model
+      // name (`运动演示 · hinge 60`). Rewrite those rows to the plain title.
+      const SUFFIX = /\s·\s(?:合拢|爆炸\s-?\d+(?:\.\d+)?|[A-Za-z_][\w-]*\s-?\d+(?:\.\d+)?)$/
+      for (const row of [...this.history, ...disk]) {
+        if (!row || typeof row.title !== 'string') continue
+        const base = typeof row.docKey === 'string' && asmTitles.has(row.docKey) ? asmTitles.get(row.docKey) : row.title.replace(SUFFIX, '')
+        row.title = base
+      }
       const seen = new Set(this.history.map((h) => h.id))
       const merged = [...this.history, ...disk.filter((h) => !seen.has(h.id))]
       merged.sort((a, b) => String(b.at || '').localeCompare(String(a.at || '')))
@@ -573,9 +585,11 @@ class FreeCadBridge {
   }
 
   /** Recompute instance placements from base + joints + explode, then publish. */
-  async republishAssembly(record, titleSuffix) {
+  async republishAssembly(record) {
     const scene = assembleScene(record)
-    const title = titleSuffix ? `${record.title} · ${titleSuffix}` : record.title
+    // The title is the model's name, never its state: dragging a joint or
+    // changing the explode factor must not rename the model.
+    const title = record.title
     // In place: the assembly owns one scene id and one row in the models list.
     const published = await this.publishScene(scene, title, this.currentSession ?? '', {
       docKey: `asm:${record.id}`,
@@ -1550,7 +1564,7 @@ if _TARGET:
         const before = record.joints.length
         record.joints = record.joints.filter((j) => j.id !== joint)
         if (record.joints.length === before) return { ok: false, error: `没有这个关节：${joint ?? '(未指定)'}` }
-        const published = await bridge.republishAssembly(record, '')
+        const published = await bridge.republishAssembly(record)
         return { ok: true, assembly: record.id, removed: joint, sceneId: published.id, joints: record.joints.length }
       }
       let stored
@@ -1559,7 +1573,7 @@ if _TARGET:
       } catch (error) {
         return { ok: false, error: String(error?.message ?? error) }
       }
-      const published = await bridge.republishAssembly(record, `${stored.id} ${round6(stored.value)}`)
+      const published = await bridge.republishAssembly(record)
       return {
         ok: true,
         assembly: record.id,
@@ -1598,7 +1612,7 @@ if _TARGET:
       const id = joint ?? record.joints[0].id
       const moved = bridge.driveJoint(record, id, value)
       if (!moved) return { ok: false, error: `没有这个关节：${id}（现有 ${record.joints.map((j) => j.id).join(', ')}）` }
-      const published = await bridge.republishAssembly(record, `${id} ${round6(moved.value)}`)
+      const published = await bridge.republishAssembly(record)
       return {
         ok: true,
         assembly: record.id,
@@ -1636,7 +1650,7 @@ if _TARGET:
       }
       const next = bridge.setExplode(record, factor ?? 1)
       if (next === null) return { ok: false, error: 'factor 必须是数字' }
-      const published = await bridge.republishAssembly(record, next ? `爆炸 ${round6(next)}` : '合拢')
+      const published = await bridge.republishAssembly(record)
       return { ok: true, assembly: record.id, sceneId: published.id, explode: round6(next), instances: published.stats.instances }
     },
   })
@@ -2207,12 +2221,12 @@ if _TARGET:
           const jointId = typeof body?.joint === 'string' ? body.joint : record.joints[0]?.id
           const moved = live.driveJoint(record, jointId, body?.value)
           if (!moved) return send(400, JSON.stringify({ error: 'bad joint or value' }))
-          const published = await live.republishAssembly(record, `${moved.id} ${round6(moved.value)}`)
+          const published = await live.republishAssembly(record)
           return send(200, JSON.stringify({ ok: true, sceneId: published.id, at: published.stats.at, joint: moved.id, value: round6(moved.value) }))
         }
         const next = live.setExplode(record, body?.factor ?? 1)
         if (next === null) return send(400, JSON.stringify({ error: 'bad factor' }))
-        const published = await live.republishAssembly(record, next ? `爆炸 ${round6(next)}` : '合拢')
+        const published = await live.republishAssembly(record)
         return send(200, JSON.stringify({ ok: true, sceneId: published.id, at: published.stats.at, explode: round6(next) }))
       }
       if (url.pathname.startsWith(`${ROUTE_PREFIX}/scene/`)) {
