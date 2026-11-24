@@ -970,7 +970,6 @@ window.__ModuleLoader__.load({
     /** Host config: 'session' | 'always' | 'off' — see index.js DEFAULTS.autoOpen. */
     let cadAutoOpen = 'session'
     /** Memo for "does this session own CAD work", keyed by session id. */
-    let ownsCache = { id: '', owns: false, at: 0 }
 
     function Viewport({ payload, visibility, options, handleRef: externalHandle }) {
       const hostRef = useRef(null)
@@ -2525,40 +2524,11 @@ const FILE_EXTS = ['step', 'stp', 'iges', 'igs', 'brep', 'stl']
           if (!id) id = readDomSession()
           if (typeof id === 'string' && id && id !== panelSession) {
             panelSession = id
-            ownsCache = { id: '', owns: false, at: 0 }
           }
           return panelSession
         }
+        readSession()
 
-        // The host owns the policy and both "did CAD happen here" signals, so a
-        // single probe settles it: /state carries the mode plus the last session
-        // that published, /scenes carries who owns the older ones.
-        const sessionOwnsCad = async () => {
-          const id = panelSession || ''
-          if (id && ownsCache.id === id && Date.now() - ownsCache.at < 15000) return ownsCache.owns
-          let owns = false
-          try {
-            const [resState, resScenes] = await Promise.all([
-              fetch(`${ROUTE}/state`, { headers: { accept: 'application/json' } }),
-              fetch(`${ROUTE}/scenes`, { headers: { accept: 'application/json' } }),
-            ])
-            if (resState.ok) {
-              const st = await resState.json()
-              const mode = st && st.config && st.config.autoOpen
-              if (['session', 'always', 'off'].includes(mode)) cadAutoOpen = mode
-              if (id && st && st.lastSession === id) owns = true
-            }
-            if (!owns && id && resScenes.ok) {
-              const data = await resScenes.json()
-              owns = (data.scenes || []).some((sc) => sc && sc.session === id)
-            }
-          } catch (err) { /* a failed probe must not open the bar */ }
-          if (cadAutoOpen === 'off') return false
-          if (cadAutoOpen === 'always') return true
-          if (!id) return false
-          if (id) ownsCache = { id, owns, at: Date.now() }
-          return owns
-        }
         const AUTO_OPEN_DELAYS = [300, 900, 1800, 3000, 5000]
         const openPane = (index) => {
           const ctrl = ctx.get?.('sidebarRight')
@@ -2573,49 +2543,90 @@ const FILE_EXTS = ['step', 'stp', 'iges', 'igs', 'brep', 'stl']
         }
         // Debug surface: `window.__cadStudioAutoOpen` answers "why did the pane
         // open / not open" without digging through the bundle.
-        const autoOpenTrace = { mode: '', session: '', owns: null, opened: 0, why: 'boot' }
+        const autoOpenTrace = { mode: '', session: '', opened: 0, why: 'boot' }
         try {
           Object.defineProperty(window, '__cadStudioAutoOpen', {
             configurable: true,
             get: () => ({ ...autoOpenTrace, mode: cadAutoOpen, session: panelSession }),
           })
         } catch (err) { /* a stale definition from a previous apply is fine */ }
-        const maybeOpen = () => {
+
+        // Policy: never open because a session "has used CAD before", and never
+        // on a conversation switch. The single trigger is live work — this
+        // session publishes something while the pane is off screen — and then
+        // it opens on the live (activity) tab. Everything else stays closed.
+        const paneMounted = () => Boolean(document.querySelector('[data-cad-panel-root]'))
+        let watchStamp = ''
+        let watchBusy = false
+        let ranRecently = false
+        const watchOnce = async () => {
           readSession()
-          autoOpenTrace.why = 'probe'
-          sessionOwnsCad().then((owns) => {
-            autoOpenTrace.owns = owns
-            if (owns) { autoOpenTrace.opened += 1; autoOpenTrace.why = 'opened'; openPane(0) } else autoOpenTrace.why = 'gated'
-          }).catch(() => { autoOpenTrace.why = 'probe-failed' })
+          if (cadAutoOpen === 'off') { autoOpenTrace.why = 'off'; return }
+          if (paneMounted()) { watchStamp = ''; autoOpenTrace.why = 'shown'; return }
+          const id = panelSession || ''
+          if (!id || watchBusy) return
+          watchBusy = true
+          try {
+            const res = await fetch(`${ROUTE}/state`, { headers: { accept: 'application/json' } })
+            if (res.ok) {
+              const st = await res.json()
+              // A tool is executing for this session right now: that is the
+              // trigger the policy asks for, so raise the pane on the live tab.
+              const runningNow = Number(st && st.running) > 0
+                && (!st.runningSession || st.runningSession === id)
+              if (runningNow && !ranRecently) {
+                ranRecently = true
+                autoOpenTrace.opened += 1
+                autoOpenTrace.why = 'running'
+                openPane(0)
+                return
+              }
+              if (!runningNow) ranRecently = false
+              const latest = st && st.latest
+              if (latest && latest.session === id) {
+                const stamp = `${latest.id}@${latest.at || ''}`
+                const prev = watchStamp
+                watchStamp = stamp
+                if (prev && prev !== stamp) {
+                  autoOpenTrace.opened += 1
+                  autoOpenTrace.why = 'activity'
+                  openPane(0)
+                } else if (!prev) {
+                  autoOpenTrace.why = 'armed'
+                }
+              } else {
+                watchStamp = ''
+                autoOpenTrace.why = 'idle'
+              }
+            }
+          } catch (err) {
+            autoOpenTrace.why = 'probe-failed'
+          } finally {
+            watchBusy = false
+          }
         }
-        maybeOpen()
-        // Every session carries its OWN rightbar layout, so entering a session
-        // replaces the bar with that session's tabs. Re-place ours whenever the
-        // route or the current session changes; a slow caught-up retry covers
-        // hosts that notify neither way.
-        const kick = () => maybeOpen()
-        const kickSoon = () => setTimeout(kick, 400)
-        try {
-          window.addEventListener('hashchange', kickSoon)
-          window.addEventListener('popstate', kickSoon)
-          ctx.effect?.(() => () => {
-            window.removeEventListener('hashchange', kickSoon)
-            window.removeEventListener('popstate', kickSoon)
-          })
-        } catch (err) { /* no window: nothing to stage against */ }
-        for (const delay of [2000, 5000, 9000, 14000]) setTimeout(kick, delay)
+        watchOnce()
+        const watchTimer = setInterval(watchOnce, 3000)
+        ctx.effect?.(() => () => clearInterval(watchTimer))
+        // The session id still has to be tracked (the watcher only opens for the
+        // session that is on screen), but a change merely re-arms the baseline.
+        const rebase = () => {
+          readSession()
+          watchStamp = ''
+          autoOpenTrace.session = panelSession
+        }
         if (current != null && typeof current.subscribe === 'function' && typeof current.getSnapshot === 'function') {
           try {
-            const unsubscribe = current.subscribe(() => { readSession(); maybeOpen() })
+            const unsubscribe = current.subscribe(() => rebase())
             ctx.effect?.(() => unsubscribe)
-          } catch (err) { /* no session store on this host: boot-time placement is all */ }
+          } catch (err) { /* no session store on this host */ }
           // Switching conversations rewrites that attribute without always
           // firing a store event, so watch it directly; the observer is cheap.
           try {
-            let lastSeen = ''
+            let lastSeen = readDomSession()
             const observer = new MutationObserver(() => {
               const next = readDomSession()
-              if (next && next !== lastSeen) { lastSeen = next; readSession(); maybeOpen() }
+              if (next && next !== lastSeen) { lastSeen = next; rebase() }
             })
             observer.observe(document.documentElement, {
               subtree: true,

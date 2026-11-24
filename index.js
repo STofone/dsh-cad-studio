@@ -1012,8 +1012,18 @@ __out = {
   const tool = (definition) => ctx.effect(() => ctx.tools.register({
     ...definition,
     execute: async (args, exec) => {
-      bridge.currentSession = sessionOf(exec)
-      return definition.execute(args, exec)
+      const session = sessionOf(exec)
+      bridge.currentSession = session
+      // A tool is working right now: the panel watches this to show itself on
+      // the live tab (and only for the session that is actually running).
+      bridge.running = (bridge.running || 0) + 1
+      bridge.runningSession = session
+      try {
+        return await definition.execute(args, exec)
+      } finally {
+        bridge.running = Math.max(0, (bridge.running || 1) - 1)
+        if (!bridge.running) bridge.runningSession = ''
+      }
     },
   }))
 
@@ -2069,10 +2079,10 @@ if _TARGET:
         try {
           const parsed = JSON.parse(await readFile(join(dir, 'state.json'), 'utf8'))
           const setup = setupStatus(bridge, { withVersion: false })
-          return send(200, JSON.stringify({ runtime, setup, config: { autoOpen: resolved.autoOpen }, latest: parsed.latest ?? null, lastSession: parsed.lastSession ?? '', assemblies: parsed.assemblies ?? [] }))
+          return send(200, JSON.stringify({ runtime, setup, config: { autoOpen: resolved.autoOpen }, latest: parsed.latest ?? null, lastSession: parsed.lastSession ?? '', assemblies: parsed.assemblies ?? [], running: bridge.running || 0, runningSession: bridge.runningSession || '' }))
         } catch {
           const setup = setupStatus(bridge, { withVersion: false })
-          return send(200, JSON.stringify({ runtime, setup, config: { autoOpen: resolved.autoOpen }, latest: null, lastSession: '' }))
+          return send(200, JSON.stringify({ runtime, setup, config: { autoOpen: resolved.autoOpen }, latest: null, lastSession: '', running: bridge.running || 0, runningSession: bridge.runningSession || '' }))
         }
       }
       if (url.pathname === `${ROUTE_PREFIX}/scenes`) {
