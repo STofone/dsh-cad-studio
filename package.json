@@ -1,9 +1,8 @@
 {
   "name": "dsh-cad-studio",
-  "version": "0.1.0",
-  "private": true,
+  "version": "0.2.0",
   "type": "module",
-  "description": "CAD Studio — FreeCAD bridge for AI plus a live model panel",
+  "description": "CAD Studio — FreeCAD 桥（给 AI 的 14 个工具）+ Web 右栏 3D 面板：建模/装配/关节运动/出图/多页签查看",
   "exports": {
     ".": "./index.js",
     "./client": "./client.js",
@@ -13,6 +12,7 @@
     "index.js",
     "client.js",
     "cordis.patch.yml",
+    "assets/*",
     "locale/*.json"
   ],
   "dsh": {
@@ -23,5 +23,28 @@
       "platform": "web",
       "immediately": true
     }
-  }
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "cad",
+    "freecad",
+    "step",
+    "3d",
+    "viewer",
+    "assembly"
+  ],
+  "homepage": "https://github.com/STofone/dsh-cad-studio#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/STofone/dsh-cad-studio.git"
+  },
+  "bugs": {
+    "url": "https://github.com/STofone/dsh-cad-studio/issues"
+  },
+  "author": {
+    "name": "stofone"
+  },
+  "license": "MIT"
 }

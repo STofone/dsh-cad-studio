@@ -4,7 +4,7 @@ DeepSeek Harness 的 CAD 插件：**把 FreeCAD 桥接成给 AI 用的工具**�
 
 ![面板](docs/preview.png)
 
-- Host 侧（`index.js`）：13 个工具 + `/cad-studio/*` HTTP 路由 + `freecadcmd` 子进程桥
+- Host 侧（`index.js`）：14 个工具 + `/cad-studio/*` HTTP 路由 + `freecadcmd` 子进程桥
 - 客户端侧（`client.js`）：右栏页签「CAD 工作室」，three.js 视口 + 图标条浮层（零件 / 特征 / 选中项 / 运动 / 视图 / 模型 / 信息）
 - 数据：`<modelsDir>/<名字>.json` 存模型工程（脚本或声明式特征 + 参数 + 20 条历史）；场景网格落 `$TMPDIR/dsh-cad-studio/{state.json,scenes/*.json}`
 
@@ -31,9 +31,15 @@ DeepSeek Harness 的 CAD 插件：**把 FreeCAD 桥接成给 AI 用的工具**�
 2. **自己装**：`apt install freecad`，然后在插件配置里留空 `freecadPath`（自动探测 `/usr/bin/freecadcmd` 等 5 个位置）或显式指定。
 
 ```bash
+# 从 npm 装（推荐）
+dsh plugin --profile web add dsh-cad-studio
+
+# 或从源码目录装
 dsh plugin --profile web add /path/to/dsh-cad-studio
-# 重启 dsh 使 host 侧工具挂载；client 侧刷新页面即可
+# 装完重启 dsh 使 host 侧工具挂载；client 侧刷新页面即可
 ```
+
+npm 包：<https://www.npmjs.com/package/dsh-cad-studio>（`dsh plugin` / DSH 插件市场按包名解析，发布到 npm 即可被装到）。
 
 配置项（cordis 配置）：
 
