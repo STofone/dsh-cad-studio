@@ -575,6 +575,17 @@ endsolid t
   ok('explicit modelsDir beats the session workspace', explicit.dir === '/tmp/cad-studio-explicit', String(explicit.dir))
 }
 
+// ---- 7l. setup: report the binary, and install is a no-op when present --
+{
+  const check = await call('cad_studio_setup', {})
+  ok('setup reports an available binary', check.available === true && /freecadcmd$/.test(check.binary), JSON.stringify(check))
+  ok('setup reports a version string', /^\d+\.\d+/.test(check.version), check.version)
+  ok('setup knows the package manager', typeof check.packageManager === 'string', check.packageManager)
+  const again = await call('cad_studio_setup', { action: 'install' })
+  ok('install short-circuits when already installed', again.alreadyInstalled === true && again.ok === true, JSON.stringify({ ok: again.ok, ai: again.alreadyInstalled }))
+  ok('install does not run the package manager twice', again.installed === false, String(again.installed))
+}
+
 // ---- 8. teardown --------------------------------------------------------
 for (const d of disposed.reverse()) { try { d() } catch (e) { console.log('  [dispose warn]', e.message) } }
 ok('all tools unregistered on dispose', tools.size === 0, [...tools.keys()].join(','))

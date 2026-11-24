@@ -80,6 +80,9 @@ window.__ModuleLoader__.load({
       modelRow: (active) => ({ display: 'flex', flexDirection: 'column', gap: 1, width: '100%', textAlign: 'left', padding: '5px 9px', border: 'none', background: active ? 'rgba(77,107,254,0.14)' : 'transparent', color: 'inherit', cursor: 'pointer', font: 'inherit', borderRadius: 0 }),
       modelName: { fontSize: 11.5, fontWeight: active => (active ? 600 : 400), overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
       modelMeta: { fontSize: 9.5, opacity: 0.55, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' },
+      installBox: { margin: '8px 9px 6px', padding: '8px 9px', borderRadius: 8, border: '1px solid rgba(224,163,58,.45)', background: 'rgba(224,163,58,.10)', fontSize: 11, lineHeight: 1.5 },
+      installBtn: { marginTop: 6, width: '100%', padding: '5px 8px', borderRadius: 6, border: '1px solid rgba(77,107,254,.5)', background: 'rgba(77,107,254,.16)', color: 'inherit', fontSize: 11, cursor: 'pointer' },
+      installHint: { opacity: 0.72, marginTop: 4, wordBreak: 'break-all' },
       infoRow: { display: 'flex', alignItems: 'baseline', justifyContent: 'space-between', gap: 8, padding: '3px 9px', fontSize: 11 },
       infoKey: { opacity: 0.55, fontSize: 10 },
       infoVal: { fontVariantNumeric: 'tabular-nums' },
@@ -1189,6 +1192,7 @@ const FILE_EXTS = ['step', 'stp', 'iges', 'igs', 'brep', 'stl']
       const [payload, setPayload] = useState(null)
       const [visibility, setVisibility] = useState({})
       const [error, setError] = useState('')
+      const [installing, setInstalling] = useState('')
       // The visible scene, and the identity the per-scene view state is keyed
       // on: republishing one assembly (drive / explode) keeps its colours,
       // switching to another scene does not.
@@ -1408,6 +1412,7 @@ const FILE_EXTS = ['step', 'stp', 'iges', 'igs', 'brep', 'stl']
       }, [])
 
       const runtime = (state && state.runtime) || {}
+      const setup = (state && state.setup) || {}
       const stats = useMemo(() => {
         if (!payload) return ''
         const parts = new Map((payload.parts || []).map((p) => [p.id, p]))
@@ -1865,6 +1870,38 @@ const FILE_EXTS = ['step', 'stp', 'iges', 'igs', 'brep', 'stl']
         if (name) setPanel('props')
       }
 
+      // Installing FreeCAD is the one action that changes the machine, so the
+      // panel only offers it when the probe says the binary is missing.
+      const installFreecad = async () => {
+        setInstalling('安装中，可能要几分钟…')
+        try {
+          const res = await fetch(`${ROUTE}/setup`, {
+            method: 'POST',
+            headers: { accept: 'application/json', 'content-type': 'application/json' },
+            body: JSON.stringify({ action: 'install' }),
+          })
+          const out = await res.json()
+          setInstalling(out.available ? '' : (out.reason || '安装失败，看日志'))
+          if (out.log) console.log('[cad-studio] install log', out.log)
+          const st = await fetch(`${ROUTE}/state`, { headers: { accept: 'application/json' } })
+          if (st.ok) setState(await st.json())
+        } catch (e) {
+          setInstalling(`安装失败：${String(e).slice(0, 120)}`)
+        }
+      }
+
+      const installNode = runtime.available
+        ? null
+        : h('div', { key: 'install', style: styles.installBox, 'data-cad-install-box': '1' }, [
+          h('div', { key: 'h' }, '没有找到 freecadcmd，建模工具暂时用不了。'),
+          h('div', { key: 'c', style: styles.installHint }, setup.command ? `可执行：${setup.command}` : (setup.reason || '手动安装 FreeCAD 后设置 freecadPath。')),
+          h('button', {
+            key: 'b', type: 'button', 'data-cad-install': '1', style: styles.installBtn,
+            disabled: installing !== '' || !setup.canInstall,
+            onClick: () => { if (!installing) installFreecad() },
+          }, installing || (setup.canInstall ? '自动安装 FreeCAD' : '需要 root 才能自动安装')),
+        ])
+
       const panelSkin = skin.list
       const activeTab = openTabs.find((t) => t.key === activeKey) || null
       const activeModel = activeTab ? activeTab.id : ''
@@ -2113,10 +2150,13 @@ const FILE_EXTS = ['step', 'stp', 'iges', 'igs', 'brep', 'stl']
               ]))
               : h('div', { key: 'none', style: styles.treeHint }, '还没有别的模型'))
             : panel === 'info'
-              ? infoRows.map(([key, value]) => h('div', { key, style: styles.infoRow }, [
+              ? [
+                ...infoRows.map(([key, value]) => h('div', { key, style: styles.infoRow }, [
                 h('span', { key: 'k', style: styles.infoKey }, key),
                 h('span', { key: 'v', style: { ...styles.infoVal, maxWidth: '65%', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }, title: value }, value),
-              ]))
+              ])),
+                ...(installNode ? [installNode] : []),
+              ]
               : null
 
       const railItems = [

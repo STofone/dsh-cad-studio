@@ -13,7 +13,7 @@
  *   GET /cad-studio/scene/:id    the scene payload itself
  *   GET /cad-studio/client.js    the panel bundle (dev-mode serving)
  */
-import { spawn } from 'node:child_process'
+import { spawn, spawnSync } from 'node:child_process'
 import { existsSync } from 'node:fs'
 import { mkdtemp, mkdir, readdir, readFile, rm, stat, unlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -59,6 +59,67 @@ function isTrusted(req, extra) {
   const bare = host.replace(/:\d+$/, '')
   if (LOOPBACK.has(bare)) return true
   return extra.includes(host) || extra.includes(bare)
+}
+
+/** FreeCAD version string, or '' when the binary cannot be asked. */
+function freecadVersion(bin) {
+  if (!bin) return ''
+  const res = spawnSync(bin, ['-c', "import FreeCAD; print('.'.join(str(v) for v in FreeCAD.Version()[:3]))"], { encoding: 'utf8', timeout: 30000 })
+  const out = (res.stdout || '').split('\n').map((l) => l.trim()).filter(Boolean).pop() || ''
+  return /^\d+\.\d+/.test(out) ? out : ''
+}
+
+/** Package managers we know how to drive; the first present one wins. */
+const PACKAGERS = [
+  { id: 'apt', probe: '/usr/bin/apt-get', cmd: 'apt-get', args: ['install', '-y', '--no-install-recommends', 'freecad'], update: ['update'], hint: 'apt install freecad' },
+  { id: 'dnf', probe: '/usr/bin/dnf', cmd: 'dnf', args: ['install', '-y', 'freecad'], update: null, hint: 'dnf install freecad' },
+  { id: 'pacman', probe: '/usr/bin/pacman', cmd: 'pacman', args: ['-S', '--noconfirm', 'freecad'], update: null, hint: 'pacman -S freecad' },
+  { id: 'brew', probe: '/opt/homebrew/bin/brew', cmd: 'brew', args: ['install', '--cask', 'freecad'], update: null, hint: 'brew install --cask freecad' },
+]
+
+function findPackager() {
+  return PACKAGERS.find((p) => existsSync(p.probe))
+}
+
+/** Everything the panel and the tool need to answer "can I just install it?". */
+function setupStatus(bridge, { withVersion = true } = {}) {
+  // withVersion=false is for the 1.5 s state poll: asking freecadcmd for its
+  // version costs a process spawn, and the answer only changes on install.
+  const bin = bridge.refresh()
+  const packager = findPackager()
+  const canInstall = Boolean(packager) && (packager.id !== 'apt' || (typeof process.getuid === 'function' && process.getuid() === 0))
+  return {
+    available: Boolean(bin),
+    binary: bin ?? '',
+    version: withVersion ? freecadVersion(bin) : '',
+    packageManager: packager ? packager.id : '',
+    command: packager ? packager.hint : '',
+    canInstall,
+    reason: bin ? '' : (packager
+      ? (canInstall ? '' : '当前进程不是 root，无法自动装包；用 root 执行上面的命令或设置 freecadPath')
+      : '没找到包管理器（apt/dnf/pacman/brew 都没有）；手动安装 FreeCAD 后设置 freecadPath'),
+  }
+}
+
+/** Install FreeCAD through the detected packager; returns a plain outcome. */
+function installFreeCad(bridge, { timeoutMs = 900000 } = {}) {
+  const before = setupStatus(bridge)
+  if (before.available) return { ok: true, alreadyInstalled: true, ...before, log: '' }
+  const packager = findPackager()
+  if (!packager) return { ok: false, ...before, log: '' }
+  if (packager.id === 'apt' && typeof process.getuid === 'function' && process.getuid() !== 0) {
+    return { ok: false, ...before, log: '' }
+  }
+  const chunks = []
+  const run = (args) => {
+    const res = spawnSync(packager.cmd, args, { encoding: 'utf8', timeout: timeoutMs })
+    chunks.push(`$ ${packager.cmd} ${args.join(' ')}\n${res.stdout || ''}${res.stderr || ''}`)
+    return res
+  }
+  if (packager.update) run(packager.update)
+  const res = run(packager.args)
+  const after = setupStatus(bridge)
+  return { ok: after.available, ...after, log: chunks.join('\n').slice(-4000) }
 }
 
 const CANDIDATES = [
@@ -923,6 +984,49 @@ __out = {
       render: (_args, value) => [{ type: 'text', text: JSON.stringify(value, null, 2) }],
     },
     execute: async () => bridge.status(),
+  })
+
+  tool({
+    name: 'cad_studio_setup',
+    description: 'Check whether freecadcmd is installed and, when it is missing, install FreeCAD through the system package manager (apt/dnf/pacman/brew). action=check reports binary, version, package manager and the exact command; action=install runs it (needs root on apt) and re-probes afterwards.',
+    parameters: {
+      type: 'object',
+      properties: {
+        action: { type: 'string', enum: ['check', 'install'], description: 'check (default) or install.' },
+      },
+      additionalProperties: false,
+    },
+    output: {
+      schema: {
+        type: 'object',
+        properties: {
+          available: { type: 'boolean' },
+          binary: { type: 'string' },
+          version: { type: 'string' },
+          packageManager: { type: 'string' },
+          command: { type: 'string' },
+          canInstall: { type: 'boolean' },
+          reason: { type: 'string' },
+          installed: { type: 'boolean' },
+          alreadyInstalled: { type: 'boolean' },
+          log: { type: 'string' },
+        },
+      },
+      render: (_args, value) => [{ type: 'text', text: JSON.stringify(value, null, 2) }],
+    },
+    execute: async (args) => {
+      if ((args.action || 'check') === 'install') {
+        const out = installFreeCad(bridge)
+        const clean = { ...out }
+        for (const key of ['log', 'reason']) if (!clean[key]) delete clean[key]
+        clean.installed = Boolean(clean.available) && !clean.alreadyInstalled
+        return clean
+      }
+      const out = setupStatus(bridge)
+      const clean = { ...out }
+      if (!clean.reason) delete clean.reason
+      return clean
+    },
   })
 
   tool({
@@ -1913,9 +2017,11 @@ if _TARGET:
         const runtime = bridge.status()
         try {
           const parsed = JSON.parse(await readFile(join(dir, 'state.json'), 'utf8'))
-          return send(200, JSON.stringify({ runtime, latest: parsed.latest ?? null, assemblies: parsed.assemblies ?? [] }))
+          const setup = setupStatus(bridge, { withVersion: false })
+          return send(200, JSON.stringify({ runtime, setup, latest: parsed.latest ?? null, assemblies: parsed.assemblies ?? [] }))
         } catch {
-          return send(200, JSON.stringify({ runtime, latest: null }))
+          const setup = setupStatus(bridge, { withVersion: false })
+          return send(200, JSON.stringify({ runtime, setup, latest: null }))
         }
       }
       if (url.pathname === `${ROUTE_PREFIX}/scenes`) {
@@ -1936,6 +2042,15 @@ if _TARGET:
           req.on('error', () => resolve(''))
         })
         try { return JSON.parse(raw) } catch { return null }
+      }
+
+      if (url.pathname === `${ROUTE_PREFIX}/setup`) {
+        // The panel's "install FreeCAD" button; same code path as the tool so
+        // both report identical fields.
+        let action = 'check'
+        try { action = (await bodyOf()).action || 'check' } catch {}
+        const out = action === 'install' ? installFreeCad(bridge) : setupStatus(bridge)
+        return send(200, JSON.stringify(out))
       }
 
       if (url.pathname === `${ROUTE_PREFIX}/feature` && req.method === 'POST') {
