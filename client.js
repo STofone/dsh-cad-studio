@@ -1386,23 +1386,24 @@ const FILE_EXTS = ['step', 'stp', 'iges', 'igs', 'brep', 'stl']
               setActivity(act)
             }
             if (!actId) return
-            if (actId !== seenRef.current) {
+            // A model updates in place: same scene id, new timestamp. Watch the
+            // pair so driving a joint refreshes the viewport instead of being
+            // mistaken for "nothing changed".
+            const stamp = `${actId}@${(act && act.at) || ''}`
+            if (stamp !== seenRef.current) {
               const had = Boolean(seenRef.current)
-              seenRef.current = actId
-              if (activeRef.current === 'activity') {
+              seenRef.current = stamp
+              const focused = openTabsRef.current.find((t) => t.key === activeRef.current)
+              const showsIt = activeRef.current === 'activity' || (focused && focused.id === actId)
+              if (showsIt) {
+                const tabKey = activeRef.current
                 const scene = await loadScene(actId)
-                if (scene && alive && activeRef.current === 'activity') {
-                  rememberView('activity', payloadRef.current)
-                  showScene(scene, { tabKey: 'activity' })
+                if (scene && alive && activeRef.current === tabKey) {
+                  rememberView(tabKey, payloadRef.current)
+                  showScene(scene, { tabKey })
                 }
               } else if (had) {
                 setFresh(true) // a model tab is focused: flag that activity moved on
-              }
-            } else if (activeRef.current === 'activity' && visibleIdRef.current !== actId) {
-              const scene = await loadScene(actId)
-              if (scene && alive && activeRef.current === 'activity') {
-                rememberView('activity', payloadRef.current)
-                showScene(scene, { tabKey: 'activity' })
               }
             }
           } catch (err) {
@@ -1512,9 +1513,10 @@ const FILE_EXTS = ['step', 'stp', 'iges', 'igs', 'brep', 'stl']
       // The scene payload carries its own assembly block, so the panel never
       // guesses which joints belong to what it is looking at.
       const assembly = payload && payload.assembly ? payload.assembly : null
-      const applyScene = async (id) => {
+      const applyScene = async (id, at) => {
         const scene = await loadScene(id)
         if (!scene) return
+        if (at) seenRef.current = `${id}@${at}`
         // Driving a joint or the explode slider is an action the user took on
         // the model they are looking at, so that tab follows the republished
         // scene; the live tab keeps following the session instead.
@@ -1538,7 +1540,7 @@ const FILE_EXTS = ['step', 'stp', 'iges', 'igs', 'brep', 'stl']
           })
           if (!res.ok) return null
           const out = await res.json()
-          if (out && out.sceneId) await applyScene(out.sceneId)
+          if (out && out.sceneId) await applyScene(out.sceneId, out.at)
           return out
         } catch { return null }
       }
@@ -1638,7 +1640,7 @@ const FILE_EXTS = ['step', 'stp', 'iges', 'igs', 'brep', 'stl']
             return null
           }
           setFeatError('')
-          if (out.sceneId) await applyScene(out.sceneId)
+          if (out.sceneId) await applyScene(out.sceneId, out.at)
           return out
         } catch (error) {
           setFeatError(String((error && error.message) || error))

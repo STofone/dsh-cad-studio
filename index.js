@@ -451,8 +451,17 @@ class FreeCadBridge {
     } catch {}
   }
 
-  async publishScene(scene, title, session = this.currentSession ?? '') {
+  /**
+   * Publish a scene for the panel to show.
+   *
+   * `opts.docKey` names the *model* the scene belongs to (an assembly, a
+   * feature model). Re-publishing the same docKey updates that model in place —
+   * same scene id, same list row, fresh geometry — instead of stacking a new
+   * entry in the models list every time a joint is dragged.
+   */
+  async publishScene(scene, title, session = this.currentSession ?? '', opts = {}) {
     if (session) this.lastSession = session
+    const docKey = typeof opts.docKey === 'string' ? opts.docKey : ''
     await this.hydrateHistory()
     // Scene ids are the on-disk filenames: after a restart the counter must
     // resume above whatever is already published, or the first new scene would
@@ -467,7 +476,14 @@ class FreeCadBridge {
         }
       } catch {}
     }
-    const id = `scene-${++this.seq}`
+    let id = ''
+    if (docKey) {
+      const prev = this.history.find((h) => h.docKey === docKey)
+      if (prev) id = prev.id
+    }
+    if (!id && typeof opts.id === 'string' && /^scene-\d+$/.test(opts.id)) id = opts.id
+    if (!id) id = `scene-${++this.seq}`
+    else this.seq = Math.max(this.seq, Number(id.slice('scene-'.length)))
     this.scenes.set(id, scene)
     // Count what the viewport shows: per-instance totals and only the parts an
     // instance actually references (a scene may carry unreferenced parts).
@@ -491,6 +507,7 @@ class FreeCadBridge {
       parts: usedParts.size,
       triangles,
       volume,
+      ...(docKey ? { docKey } : {}),
     }
     this.history = [stats, ...this.history.filter((h) => h.id !== id)].slice(0, 30)
     this.latest = { id, title, at: stats.at, scene }
@@ -500,9 +517,16 @@ class FreeCadBridge {
     return { id, stats }
   }
 
+  /** Reserve the id before publishing, so the scene can carry `asm:<id>`. */
+  reserveAssemblyId() {
+    return `asm-${++this.assemblySeq}`
+  }
+
   /** Register the base placements of a published assembly so joints can move it. */
-  registerAssembly({ title, sceneId, scene, joints }) {
-    const id = `asm-${++this.assemblySeq}`
+  registerAssembly({ title, sceneId, scene, joints, id: givenId }) {
+    const id = givenId ?? `asm-${++this.assemblySeq}`
+    const seq = /^asm-(\d+)$/.exec(id)
+    if (seq) this.assemblySeq = Math.max(this.assemblySeq, Number(seq[1]))
     const record = {
       id,
       title,
@@ -551,7 +575,12 @@ class FreeCadBridge {
   /** Recompute instance placements from base + joints + explode, then publish. */
   async republishAssembly(record, titleSuffix) {
     const scene = assembleScene(record)
-    const published = await this.publishScene(scene, titleSuffix ? `${record.title} · ${titleSuffix}` : record.title)
+    const title = titleSuffix ? `${record.title} · ${titleSuffix}` : record.title
+    // In place: the assembly owns one scene id and one row in the models list.
+    const published = await this.publishScene(scene, title, this.currentSession ?? '', {
+      docKey: `asm:${record.id}`,
+      id: record.sceneId,
+    })
     record.sceneId = published.id
     return published
   }
@@ -588,7 +617,7 @@ class FreeCadBridge {
     return null
   }
 
-  async run(code, { title, publishHint = true, meta = null } = {}) {
+  async run(code, { title, publishHint = true, meta = null, docKey = '', sceneId = '' } = {}) {
     const bin = this.refresh()
     if (!bin) {
       return { ok: false, error: 'freecadcmd not found; set freecadPath in the plugin config' }
@@ -660,7 +689,7 @@ print("${BEGIN}" + __json.dumps(_safe(_payload)) + "${END}", flush=True)\n`
         // `meta` rides inside the scene payload: the panel reads the feature list
         // (and the assembly block) from there instead of calling a tool per frame.
         const scene = meta ? { ...value.scene, ...meta } : value.scene
-        const published = await this.publishScene(scene, title ?? value.title ?? 'untitled')
+        const published = await this.publishScene(scene, title ?? value.title ?? 'untitled', this.currentSession ?? '', { docKey, id: sceneId })
         value.sceneId = published.id
         delete value.scene
       }
@@ -1417,12 +1446,15 @@ if _TARGET:
     __out["exported"] = _TARGET
     __out["bytes"] = os.path.getsize(_TARGET)
 `
-      const out = await bridge.run(py, { title: title ?? 'assembly' })
+      // Allocate the assembly id before publishing: the scene carries `asm:<id>`
+      // so later joint moves rewrite this same entry instead of adding one.
+      const asmId = bridge.reserveAssemblyId()
+      const out = await bridge.run(py, { title: title ?? 'assembly', docKey: `asm:${asmId}` })
       if (!out.ok || !out.sceneId) return out
       // Keep the base placements: without them a joint has nothing to move.
       const scene = bridge.scenes.get(out.sceneId)
       if (!scene) return out
-      const record = bridge.registerAssembly({ title: assembly || title || 'assembly', sceneId: out.sceneId, scene, joints: [] })
+      const record = bridge.registerAssembly({ id: asmId, title: assembly || title || 'assembly', sceneId: out.sceneId, scene, joints: [] })
       for (const spec of joints ?? []) {
         try {
           bridge.setJoint(record, spec)
@@ -1697,7 +1729,13 @@ if _TARGET:
     const meta = isFeatures ? { model: doc.name, features: publicFeatures(doc) } : null
     doc.run = (doc.run ?? 0) + 1
     doc.updatedAt = new Date().toISOString()
-    const out = await bridge.run(code, { title: doc.name, meta })
+    // One row per model: a rebuild rewrites the model's existing scene.
+    const out = await bridge.run(code, {
+      title: doc.name,
+      meta,
+      docKey: `model:${doc.name}`,
+      sceneId: doc.stats?.sceneId || '',
+    })
     if (out.ok === false) return { ...out, name: doc.name, params: doc.params }
     doc.stats = {
       volume: out.volume ?? null,
@@ -2089,7 +2127,10 @@ if _TARGET:
           const candidates = resolved.modelsDir ? [resolved.modelsDir, ...bridge.modelsCandidates()] : bridge.modelsCandidates()
           const modelsDir = candidates.find((d) => existsSync(join(d, `${body.model}.json`))) || candidates[0] || modelsDirFor(undefined)
           const result = await runFeatureAction(body, modelsDir)
-          return send(200, JSON.stringify(result))
+          // Tell the panel when the model was republished, so its poller can
+          // recognise the in-place update it triggered itself.
+          const entry = result && result.sceneId ? bridge.history.find((h) => h.id === result.sceneId) : null
+          return send(200, JSON.stringify(entry ? { ...result, at: entry.at } : result))
         } catch (error) {
           return send(400, JSON.stringify({ ok: false, error: String(error?.message ?? error) }))
         }
@@ -2157,12 +2198,12 @@ if _TARGET:
           const moved = live.driveJoint(record, jointId, body?.value)
           if (!moved) return send(400, JSON.stringify({ error: 'bad joint or value' }))
           const published = await live.republishAssembly(record, `${moved.id} ${round6(moved.value)}`)
-          return send(200, JSON.stringify({ ok: true, sceneId: published.id, joint: moved.id, value: round6(moved.value) }))
+          return send(200, JSON.stringify({ ok: true, sceneId: published.id, at: published.stats.at, joint: moved.id, value: round6(moved.value) }))
         }
         const next = live.setExplode(record, body?.factor ?? 1)
         if (next === null) return send(400, JSON.stringify({ error: 'bad factor' }))
         const published = await live.republishAssembly(record, next ? `爆炸 ${round6(next)}` : '合拢')
-        return send(200, JSON.stringify({ ok: true, sceneId: published.id, explode: round6(next) }))
+        return send(200, JSON.stringify({ ok: true, sceneId: published.id, at: published.stats.at, explode: round6(next) }))
       }
       if (url.pathname.startsWith(`${ROUTE_PREFIX}/scene/`)) {
         const id = decodeURIComponent(url.pathname.slice(`${ROUTE_PREFIX}/scene/`.length))

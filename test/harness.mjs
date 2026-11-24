@@ -403,6 +403,10 @@ endsolid t
   const moved = await call('cad_studio_features', { model, action: 'move', id: 'f3', to: 0 })
   ok('feature move reorders', moved.ok === true && moved.features[0].id === 'f3', JSON.stringify(moved.features?.map((f) => f.id)))
 
+  // Every rebuild must reuse one row in the models list, not stack new ones.
+  const modelRows = JSON.parse((await hit('/cad-studio/scenes')).body).scenes.filter((s) => s.title === model)
+  ok('feature rebuilds keep one row in the models list', modelRows.length === 1, `rows=${modelRows.length} ids=${modelRows.map((r) => r.id).join(',')}`)
+
   const listed = await call('cad_studio_features', { model, action: 'list' })
   ok('feature list action', listed.ok === true && listed.features.length === 3 && listed.kind === 'features', String(listed.features?.length))
 
@@ -503,12 +507,14 @@ endsolid t
     joints: [{ id: 'hinge', instance: 'arm', type: 'revolute', axis: [0, 0, 1], origin: [100, 0, 0], min: -90, max: 90, value: 0 }],
   })
   ok('assembly declares joints', asm.ok === true && asm.joints === 1, JSON.stringify({ ok: asm.ok, joints: asm.joints, warn: asm.jointWarning }))
+  const scenesBeforeMotion = JSON.parse((await hit('/cad-studio/scenes')).body).scenes.length
   const listed = await call('cad_studio_joint', { action: 'list', assembly: asm.assembly })
   ok('joint list reports the hinge', listed.ok === true && listed.joints?.[0]?.id === 'hinge', JSON.stringify(listed.joints))
   const before = JSON.parse((await hit(`/cad-studio/scene/${asm.sceneId}`)).body)
   const armBefore = before.instances.find((i) => i.name === 'arm')
   const driven = await call('cad_studio_drive', { assembly: asm.assembly, joint: 'hinge', value: 90 })
-  ok('drive publishes a new scene', driven.ok === true && driven.sceneId !== asm.sceneId, JSON.stringify({ ok: driven.ok, id: driven.sceneId, err: driven.error }))
+  // A parameter change updates the model in place: same scene id, same row.
+  ok('drive updates the assembly scene in place', driven.ok === true && driven.sceneId === asm.sceneId, JSON.stringify({ ok: driven.ok, id: driven.sceneId, first: asm.sceneId, err: driven.error }))
   const after = JSON.parse((await hit(`/cad-studio/scene/${driven.sceneId}`)).body)
   const armAfter = after.instances.find((i) => i.name === 'arm')
   ok('drive rotates the driven instance', JSON.stringify(armAfter.rot) !== JSON.stringify(armBefore.rot), `${JSON.stringify(armBefore.rot)} -> ${JSON.stringify(armAfter.rot)}`)
@@ -526,6 +532,11 @@ endsolid t
   ok('route /drive republishes', routeDrive.status === 200 && JSON.parse(routeDrive.body).value === 30, String(routeDrive.status) + ' ' + routeDrive.body.slice(0, 80))
   const routeEx = await post('/cad-studio/explode', { assembly: asm.assembly, factor: 0 })
   ok('route /explode collapses again', routeEx.status === 200 && JSON.parse(routeEx.body).explode === 0, String(routeEx.status))
+  // The models list must not grow when a joint or the explode slider moves:
+  // every republish rewrote the assembly's own scene instead of adding one.
+  const sceneCount = async () => JSON.parse((await hit('/cad-studio/scenes')).body).scenes.length
+  const afterMotion = await sceneCount()
+  ok('driving and exploding add no new scenes', afterMotion === scenesBeforeMotion, `before=${scenesBeforeMotion} after=${afterMotion}`)
   const noJoint = await call('cad_studio_drive', { assembly: 'motion', joint: 'nope', value: 1 })
   ok('drive rejects an unknown joint', noJoint.ok === false && /没有这个关节/.test(String(noJoint.error)), String(noJoint.error).slice(0, 30))
   const unknownAsm = await call('cad_studio_joint', { action: 'list', assembly: 'asm-999' })
