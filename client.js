@@ -100,7 +100,13 @@ window.__ModuleLoader__.load({
         background: 'transparent', color: skin.color, fontSize: 12, lineHeight: 1,
         cursor: 'pointer',
       }),
-      tabs: { display: 'flex', alignItems: 'center', gap: 3, flex: '1 1 auto', minWidth: 0, overflow: 'hidden', '--cad-tab-basis': 'calc((100% - 50px - 26px - 18px) / 5)' },
+      tabs: { position: 'relative', display: 'flex', alignItems: 'center', gap: 3, flex: '1 1 auto', minWidth: 0, overflow: 'visible', '--cad-tab-basis': 'calc((100% - 50px - 26px - 18px) / 5)' },
+      // Anchor the "+" menu to the strip's right edge: because "+" is the
+      // last thing in the row, this keeps the menu hanging off that button
+      // as tabs open and close.
+      addMenu: { position: 'absolute', top: 'calc(100% + 4px)', zIndex: 40, width: 224, maxHeight: 300, overflowY: 'auto', display: 'flex', flexDirection: 'column', padding: 3, borderRadius: 8, border: '1px solid', boxShadow: '0 10px 26px rgba(0,0,0,.32)' },
+      addRow: (active) => ({ display: 'flex', flexDirection: 'column', gap: 1, minWidth: 0, padding: '5px 7px', borderRadius: 6, border: 'none', background: active ? 'rgba(77,107,254,.16)' : 'transparent', textAlign: 'left', cursor: 'pointer', font: 'inherit' }),
+      addHint: { padding: '6px 8px', fontSize: 10.5, opacity: 0.6 },
       // A model tab is laid out at the width it would have with five tabs open
       // (--cad-tab-basis on the strip), so adding the first one does not stretch
       // it across the whole strip and the row never reflows as tabs come and go.
@@ -1191,6 +1197,14 @@ const FILE_EXTS = ['step', 'stp', 'iges', 'igs', 'brep', 'stl']
       const activityRef = useRef(null)
       const [fresh, setFresh] = useState(false)
       const seenRef = useRef('')
+      // "+" owns its own dropdown (it is anchored to the button); the rail's
+      // folder opens the models panel, where a click switches the model shown
+      // by the current view instead of opening another tab.
+      const [addOpen, setAddOpen] = useState(false)
+      const [addAlign, setAddAlign] = useState('left')
+      const addBtnRef = useRef(null)
+      const [activityPin, setActivityPin] = useState(null)
+      const activityPinRef = useRef(null)
       const [picked, setPicked] = useState('')
       const revealedRef = useRef('')
       const [payload, setPayload] = useState(null)
@@ -1296,6 +1310,35 @@ const FILE_EXTS = ['step', 'stp', 'iges', 'igs', 'brep', 'stl']
         showScene(scene, { tabKey })
       }
 
+      /**
+       * The folder's click: change what the current view shows, in place.
+       * A focused model tab is retargeted to the picked model (same tab, no
+       * new one); on the live tab the pick is pinned there until the session
+       * publishes something new, at which point the live view takes over
+       * again.
+       */
+      const switchModel = async (id) => {
+        if (!id) return
+        const scene = await loadScene(id)
+        if (!scene) return
+        const meta = scenes.find((sc) => sc.id === id) || { id, title: scene.title || id }
+        const title = shortName(meta) || id
+        rememberView(activeRef.current, payloadRef.current)
+        const tab = openTabsRef.current.find((t) => t.key === activeRef.current)
+        if (tab) {
+          const next = openTabsRef.current.map((t) => (t.key === tab.key ? { ...t, id, title } : t))
+          openTabsRef.current = next
+          setOpenTabs(next)
+          showScene(scene, { tabKey: tab.key })
+          return
+        }
+        const pin = { id, title }
+        activityPinRef.current = pin
+        setActivityPin(pin)
+        setFresh(false)
+        showScene(scene, { tabKey: 'activity' })
+      }
+
       const focusTab = async (key) => {
         if (key === activeRef.current) return
         rememberView(activeRef.current, payloadRef.current)
@@ -1352,6 +1395,25 @@ const FILE_EXTS = ['step', 'stp', 'iges', 'igs', 'brep', 'stl']
         }
       }, [payload])
 
+      // The "+" dropdown is a transient popover: Esc or a click anywhere else
+      // dismisses it (the folder panel behind it is the one that stays put).
+      useEffect(() => {
+        if (!addOpen) return undefined
+        const onDown = (event) => {
+          const el = event.target
+          if (!el || typeof el.closest !== 'function') return
+          if (el.closest('[data-cad-addmenu]') || el.closest('[data-cad-tab-add]')) return
+          setAddOpen(false)
+        }
+        const onKey = (event) => { if (event.key === 'Escape') setAddOpen(false) }
+        document.addEventListener('mousedown', onDown, true)
+        document.addEventListener('keydown', onKey, true)
+        return () => {
+          document.removeEventListener('mousedown', onDown, true)
+          document.removeEventListener('keydown', onKey, true)
+        }
+      }, [addOpen])
+
       useEffect(() => {
         let alive = true
         const tick = async () => {
@@ -1390,6 +1452,12 @@ const FILE_EXTS = ['step', 'stp', 'iges', 'igs', 'brep', 'stl']
             // pair so driving a joint refreshes the viewport instead of being
             // mistaken for "nothing changed".
             const stamp = `${actId}@${(act && act.at) || ''}`
+            // Something new was published by this session: the pinned model on
+            // the live tab goes back to following the session.
+            if (activityPinRef.current && activityPinRef.current.id !== actId) {
+              activityPinRef.current = null
+              setActivityPin(null)
+            }
             if (stamp !== seenRef.current) {
               const had = Boolean(seenRef.current)
               seenRef.current = stamp
@@ -2152,8 +2220,8 @@ const FILE_EXTS = ['step', 'stp', 'iges', 'igs', 'brep', 'stl']
                 type: 'button',
                 'data-cad-scene': sc.id,
                 style: styles.modelRow(sc.id === activeModel),
-                title: `${shortName(sc)}（${sc.instances || 0} 实例 · ${sc.parts || 0} 零件）`,
-                onClick: () => { openModel(sc.id) },
+                title: `切换到 ${shortName(sc)}（替换当前视图里的模型，不新开页签）`,
+                onClick: () => { switchModel(sc.id) },
               }, [
                 h('span', { key: 'n', style: { ...styles.modelName, fontWeight: sc.id === activeModel ? 600 : 400 } }, shortName(sc)),
                 h('span', { key: 'm', style: styles.modelMeta }, `${(sc.at ? new Date(sc.at).toLocaleTimeString('zh-CN', { hour12: false }) : '')} · ${sc.instances || 0} 实例 · ${sc.parts || 0} 零件`),
@@ -2228,20 +2296,49 @@ const FILE_EXTS = ['step', 'stp', 'iges', 'igs', 'brep', 'stl']
                 }, '×')
                 : null,
             ])),
-            // "+" adds a tab (it opens the model list; every pick becomes its
-            // own tab). Hidden once the cap is reached — there is nothing left
-            // to add until a tab is closed.
-            openTabs.length < MAX_TABS
-              ? h('button', {
-                key: 'add',
-                type: 'button',
-                'data-cad-tab-add': '1',
-                'aria-label': '新增模型页签',
-                style: { ...styles.barBtn(panelSkin), marginLeft: 2 },
-                title: `新开一个模型页签（每次选一个模型就加一个，最多 ${MAX_TABS} 个）`,
-                onClick: () => setPanel((p) => (p === 'models' ? '' : 'models')),
-              }, '+')
-              : null,
+            // "+" is its own control with its own dropdown, anchored to the
+            // button: the rail's folder switches the current model in place and
+            // stays open, "+" always makes a new tab and closes itself.
+            h('span', { key: 'addwrap', style: { position: 'relative', display: 'inline-flex', flex: '0 0 auto' } }, [
+              openTabs.length < MAX_TABS
+                ? h('button', {
+                  key: 'add',
+                  type: 'button',
+                  'data-cad-tab-add': '1',
+                  'aria-label': '新增模型页签',
+                  'aria-expanded': addOpen ? 'true' : 'false',
+                  style: { ...styles.barBtn(panelSkin), marginLeft: 2 },
+                  title: `新开一个模型页签（每次选一个模型就加一个，最多 ${MAX_TABS} 个）`,
+                  ref: addBtnRef,
+                  onClick: () => {
+                    // Open toward whichever side has room, so the menu never
+                    // lands under the page content beside the pane.
+                    const rect = addBtnRef.current ? addBtnRef.current.getBoundingClientRect() : null
+                    setAddAlign(rect && rect.right + 232 > window.innerWidth ? 'right' : 'left')
+                    setAddOpen((open) => !open)
+                  },
+                }, '+')
+                : null,
+              addOpen
+                ? h('div', {
+                  key: 'addmenu',
+                  'data-cad-addmenu': '1',
+                  style: { ...styles.addMenu, ...(addAlign === 'right' ? { right: 0, left: 'auto' } : { left: 0, right: 'auto' }), background: panelSkin.background, borderColor: panelSkin.borderColor, color: panelSkin.color },
+                }, scenes.length
+                  ? scenes.map((sc) => h('button', {
+                    key: sc.id,
+                    type: 'button',
+                    'data-cad-add-scene': sc.id,
+                    style: styles.addRow(sc.id === activeModel),
+                    title: `${shortName(sc)}（${sc.instances || 0} 实例 · ${sc.parts || 0} 零件）`,
+                    onClick: () => { setAddOpen(false); openModel(sc.id) },
+                  }, [
+                    h('span', { key: 'n', style: { ...styles.modelName, fontWeight: sc.id === activeModel ? 600 : 400 } }, shortName(sc)),
+                    h('span', { key: 'm', style: styles.modelMeta }, `${sc.instances || 0} 实例 · ${sc.parts || 0} 零件`),
+                  ]))
+                  : h('div', { key: 'none', style: styles.addHint }, '还没有别的模型'))
+                : null,
+            ]),
           ]),
         ]),
         error ? h('div', { key: 'err', style: styles.warn }, error) : null,
@@ -2258,7 +2355,7 @@ const FILE_EXTS = ['step', 'stp', 'iges', 'igs', 'brep', 'stl']
             'data-cad-rail': item.id,
             'aria-pressed': panel === item.id ? 'true' : 'false',
             title: item.label,
-            onClick: () => setPanel((p) => (p === item.id ? '' : item.id)),
+            onClick: () => { setAddOpen(false); setPanel((p) => (p === item.id ? '' : item.id)) },
           }, h(RailIcon, { name: item.id })))),
           h('div', { key: 'main', style: { flex: '1 1 auto', minWidth: 0, position: 'relative', display: 'flex', flexDirection: 'column' } }, [
             payload
