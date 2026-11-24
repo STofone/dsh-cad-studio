@@ -353,7 +353,9 @@ class FreeCadBridge {
 
   /** Candidate models dirs, most recently used first (falls back to config). */
   modelsCandidates() {
-    const out = [this.modelsDir, ...this.modelsSeen, this.getConfig().modelsDir, modelsDirFor(undefined)]
+    // A class method cannot see apply()'s `modelsDirFor`; the global dir is the
+    // right tail here because panel routes always carry a real dir first.
+    const out = [this.modelsDir, ...this.modelsSeen, this.getConfig().modelsDir, GLOBAL_MODELS_DIR]
     return [...new Set(out.filter((d) => typeof d === 'string' && d))]
   }
 
@@ -1750,7 +1752,7 @@ if _TARGET:
     const code = isFeatures
       ? featuresScript(featureOps(doc))
       : `${PRELUDE}\nP = ${JSON.stringify(doc.params ?? {})}\n${doc.script}`
-    const meta = isFeatures ? { model: doc.name, features: publicFeatures(doc) } : null
+    const meta = isFeatures ? { model: doc.name, features: publicFeatures(doc) } : { model: doc.name, params: doc.params ?? {} }
     doc.run = (doc.run ?? 0) + 1
     doc.updatedAt = new Date().toISOString()
     // One row per model: a rebuild rewrites the model's existing scene.
@@ -2128,6 +2130,28 @@ if _TARGET:
         return send(200, JSON.stringify(out))
       }
 
+      if (url.pathname === `${ROUTE_PREFIX}/params` && req.method === 'POST') {
+        // Same path as cad_studio_doc update: the panel edits a number, the doc
+        // is rewritten and rebuilt, and a failed rebuild rolls the params back.
+        const body = await bodyOf()
+        if (!body || typeof body.model !== 'string' || !body.model) return send(400, JSON.stringify({ error: 'bad request' }))
+        try {
+          if (!bridge.modelsSeen.length) {
+            try {
+              const pointer = JSON.parse(await readFile(join(dir, 'state.json'), 'utf8'))
+              if (typeof pointer.modelsDir === 'string' && pointer.modelsDir) bridge.noteModelsDir(pointer.modelsDir)
+              if (Array.isArray(pointer.modelsDirs)) pointer.modelsDirs.forEach((d) => bridge.noteModelsDir(d))
+            } catch {}
+          }
+          const candidates = resolved.modelsDir ? [resolved.modelsDir, ...bridge.modelsCandidates()] : bridge.modelsCandidates()
+          const modelsDir = candidates.find((d) => existsSync(join(d, `${body.model}.json`))) || candidates[0] || modelsDirFor(undefined)
+          const out = await runDocAction({ action: 'update', name: body.model, params: body.params ?? {} }, modelsDir)
+          const entry = out && out.sceneId ? bridge.history.find((h) => h.id === out.sceneId) : null
+          return send(200, JSON.stringify(entry ? { ...out, at: entry.at } : out))
+        } catch (error) {
+          return send(200, JSON.stringify({ ok: false, error: String(error?.message ?? error) }))
+        }
+      }
       if (url.pathname === `${ROUTE_PREFIX}/feature` && req.method === 'POST') {
         // The panel edits features directly; the same code path as the tool, so
         // a slider/number edit and an agent edit produce identical documents.

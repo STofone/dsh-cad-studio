@@ -366,56 +366,74 @@ window.__ModuleLoader__.load({
     }
 
     /** Rail glyphs — 15px so the 28px rail stays a strip, not a column. */
+    // Icons are inline SVG on a 20x20 grid rendered at exactly 20 CSS px, so the
+    // scale is 1:1 and the strokes land on whole pixels (a 16-unit viewBox
+    // stretched to 17 px is what made the previous set look soft).
     function RailIcon({ name }) {
-      const common = { width: 17, height: 17, viewBox: '0 0 16 16', fill: 'none', stroke: 'currentColor', strokeWidth: 1.25, strokeLinecap: 'round', strokeLinejoin: 'round', 'aria-hidden': 'true' }
+      const common = {
+        width: 20,
+        height: 20,
+        viewBox: '0 0 20 20',
+        fill: 'none',
+        stroke: 'currentColor',
+        strokeWidth: 1.75,
+        strokeLinecap: 'round',
+        strokeLinejoin: 'round',
+        'aria-hidden': 'true',
+        focusable: 'false',
+      }
       if (name === 'parts') {
+        // A solid body: the isometric cube every CAD app uses for "part".
         return h('svg', common, [
-          h('path', { key: 'a', d: 'M8 1.6 13.7 4.9v6.2L8 14.4 2.3 11.1V4.9L8 1.6Z' }),
-          h('path', { key: 'b', d: 'M2.3 4.9 8 8.1l5.7-3.2M8 8.1v6.3' }),
+          h('path', { key: 'a', d: 'M10 2.5 17 6.4v7.2L10 17.5 3 13.6V6.4L10 2.5Z' }),
+          h('path', { key: 'b', d: 'M3 6.4 10 10.3l7-3.9M10 10.3v7.2' }),
+        ])
+      }
+      if (name === 'features') {
+        // A ziggurat: the part as a stack of machining steps.
+        return h('svg', common, [
+          h('path', { key: 'a', d: 'M3 13.2h14v4H3z' }),
+          h('path', { key: 'b', d: 'M5.2 8.4h9.6v4.8H5.2z' }),
+          h('path', { key: 'c', d: 'M7.6 3.4h4.8v5H7.6z' }),
+        ])
+      }
+      if (name === 'props') {
+        // Sliders: the panel is literally sliders and switches.
+        return h('svg', common, [
+          h('path', { key: 'a', d: 'M2.8 5.6h14.4M2.8 10h14.4M2.8 14.4h14.4' }),
+          h('circle', { key: 'b', cx: 7, cy: 5.6, r: 1.9, fill: 'currentColor', stroke: 'none' }),
+          h('circle', { key: 'c', cx: 13, cy: 10, r: 1.9, fill: 'currentColor', stroke: 'none' }),
+          h('circle', { key: 'd', cx: 8.4, cy: 14.4, r: 1.9, fill: 'currentColor', stroke: 'none' }),
+        ])
+      }
+      if (name === 'motion') {
+        // Articulation: a circular arrow around the pivot. (An axis plus a half
+        // arc read as a “D” at this size.)
+        return h('svg', common, [
+          h('path', { key: 'ring', d: 'M10 3.4a6.6 6.6 0 1 1-6.3 8.5' }),
+          h('path', { key: 'head', d: 'M3.2 12.4 3 8.9l3.3 1.3' }),
+          h('circle', { key: 'pin', cx: 10, cy: 10, r: 1.5, fill: 'currentColor', stroke: 'none' }),
         ])
       }
       if (name === 'view') {
         // A camera: which angle am I looking from, and what gets drawn.
         return h('svg', common, [
-          h('path', { key: 'body', d: 'M2.3 5.9h11.4a1 1 0 0 1 1 1v5.4a1 1 0 0 1-1 1H2.3a1 1 0 0 1-1-1V6.9a1 1 0 0 1 1-1Z' }),
-          h('path', { key: 'bump', d: 'M5.5 5.9 6.5 4.2h3l1 1.7' }),
-          h('circle', { key: 'lens', cx: 8, cy: 9.6, r: 2.2 }),
-        ])
-      }
-      if (name === 'features') {
-        // A ziggurat: the shape as a stack of machining steps.
-        return h('svg', common, [
-          h('path', { key: 'b1', d: 'M2.4 10.2h11.2v3.3H2.4z' }),
-          h('path', { key: 'b2', d: 'M3.9 6.9h8.2v3.3H3.9z' }),
-          h('path', { key: 'b3', d: 'M5.4 3.6h5.2v3.3H5.4z' }),
+          h('path', { key: 'body', d: 'M3.4 6.8h13.2a1.4 1.4 0 0 1 1.4 1.4v6.4a1.4 1.4 0 0 1-1.4 1.4H3.4A1.4 1.4 0 0 1 2 14.6V8.2a1.4 1.4 0 0 1 1.4-1.4Z' }),
+          h('path', { key: 'bump', d: 'M7.4 6.8 8.6 4.4h2.8l1.2 2.4' }),
+          h('circle', { key: 'lens', cx: 10, cy: 11.4, r: 2.7 }),
         ])
       }
       if (name === 'models') {
+        // A folder: the model library.
         return h('svg', common, [
-          h('path', { key: 'a', d: 'M2.1 5.2c0-.6.3-.9.9-.9h3l1.3 1.4h5.7c.6 0 .9.3.9.9v5.1c0 .6-.3.9-.9.9H3c-.6 0-.9-.3-.9-.9V5.2Z' }),
-          h('path', { key: 'b', d: 'M2.1 7.6h11.8' }),
-        ])
-      }
-      if (name === 'props') {
-        return h('svg', common, [
-          h('path', { key: 'a', d: 'M2.6 4.2h10.8M2.6 8h10.8M2.6 11.8h10.8' }),
-          h('circle', { key: 'b', cx: 5.6, cy: 4.2, r: 1.45, fill: 'currentColor', stroke: 'none' }),
-          h('circle', { key: 'c', cx: 10.1, cy: 8, r: 1.45, fill: 'currentColor', stroke: 'none' }),
-          h('circle', { key: 'd', cx: 6.9, cy: 11.8, r: 1.45, fill: 'currentColor', stroke: 'none' }),
-        ])
-      }
-      if (name === 'motion') {
-        // A revolute joint: rotation axis with a circular arrow around it.
-        return h('svg', common, [
-          h('path', { key: 'a', d: 'M8 3.2v9.6' }),
-          h('path', { key: 'b', d: 'M8 5.1a2.9 2.9 0 1 1-2.8 3.6' }),
-          h('path', { key: 'c', d: 'M5.3 8.6 4.2 8l-.2 1.5' }),
+          h('path', { key: 'a', d: 'M2.6 6.4c0-.9.5-1.4 1.4-1.4h3.4l1.6 1.8h7.4c.9 0 1.4.5 1.4 1.4v6.4c0 .9-.5 1.4-1.4 1.4H4c-.9 0-1.4-.5-1.4-1.4V6.4Z' }),
+          h('path', { key: 'b', d: 'M2.6 9.4h14.8' }),
         ])
       }
       return h('svg', common, [
-        h('circle', { key: 'c', cx: 8, cy: 8, r: 6 }),
-        h('path', { key: 'd', d: 'M8 7.2v4.2' }),
-        h('circle', { key: 'e', cx: 8, cy: 4.9, r: 0.75, fill: 'currentColor', stroke: 'none' }),
+        h('circle', { key: 'c', cx: 10, cy: 10, r: 7.4 }),
+        h('path', { key: 'd', d: 'M10 9.2v5' }),
+        h('circle', { key: 'e', cx: 10, cy: 6.4, r: 0.95, fill: 'currentColor', stroke: 'none' }),
       ])
     }
 
@@ -1722,6 +1740,12 @@ const FILE_EXTS = ['step', 'stp', 'iges', 'igs', 'brep', 'stl']
       // the new scene replaces the old one in the tab being looked at.
       const featureList = payload && Array.isArray(payload.features) ? payload.features : []
       const featureModel = (payload && payload.model) || ''
+      // A script model publishes its params (no feature list); they are editable
+      // the same way — one number, one rebuild of the same document.
+      const modelParams = payload && payload.params && typeof payload.params === 'object' ? payload.params : {}
+      const paramKeys = Object.keys(modelParams)
+      const [paramDraft, setParamDraft] = useState({})
+      const paramTimer = useRef(null)
       const featureDefaults = {
         box: { size: [40, 30, 10] },
         cylinder: { r: 6, h: 20 },
@@ -1754,13 +1778,38 @@ const FILE_EXTS = ['step', 'stp', 'iges', 'igs', 'brep', 'stl']
           return null
         }
       }
+      const postParams = async (params) => {
+        try {
+          const res = await fetch(`${ROUTE}/params`, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ model: featureModel, params }),
+          })
+          const out = await res.json()
+          if (!res.ok || !out || out.ok === false) {
+            setFeatError(String((out && out.error) || `HTTP ${res.status}`))
+            return null
+          }
+          setFeatError('')
+          setParamDraft({})
+          if (out.sceneId) await applyScene(out.sceneId, out.at)
+          return out
+        } catch (error) {
+          setFeatError(String((error && error.message) || error))
+          return null
+        }
+      }
+      const queueParams = (merged) => {
+        if (paramTimer.current) clearTimeout(paramTimer.current)
+        paramTimer.current = setTimeout(() => { paramTimer.current = null; postParams(merged) }, 300)
+      }
       // Number edits come from a text input: coalesce a burst of keystrokes into
       // one rebuild (each rebuild is a full FreeCAD run).
       const queueFeature = (body) => {
         if (featTimer.current) clearTimeout(featTimer.current)
         featTimer.current = setTimeout(() => { featTimer.current = null; postFeature(body) }, 260)
       }
-      useEffect(() => () => { if (featTimer.current) clearTimeout(featTimer.current) }, [])
+      useEffect(() => () => { if (featTimer.current) clearTimeout(featTimer.current); if (paramTimer.current) clearTimeout(paramTimer.current) }, [])
       const parseParam = (raw) => {
         const text = String(raw).trim()
         if (!text) return null
@@ -1805,7 +1854,38 @@ const FILE_EXTS = ['step', 'stp', 'iges', 'igs', 'brep', 'stl']
         }
         queueFeature({ action: 'update', feature: { id: feature.id, params } })
       }
-      const featureBody = !featureModel || !featureList.length
+      const paramsBody = paramKeys.map((key) => {
+        const base = modelParams[key]
+        const draft = paramDraft[key]
+        const value = draft === undefined ? base : draft
+        const numeric = typeof base === 'number'
+        return h('label', { key: `p-${key}`, style: styles.propRow }, [
+          h('span', { key: 'l', style: { ...styles.propLabel, flex: '1 1 auto', minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis' } }, key),
+          h('input', {
+            key: 'i',
+            type: numeric ? 'number' : 'text',
+            style: styles.jointNum,
+            'data-cad-param': key,
+            value: String(value),
+            onChange: (event) => {
+              const raw = event.currentTarget.value
+              if (raw === '') return
+              const next = numeric ? Number(raw) : raw
+              if (numeric && !Number.isFinite(next)) return
+              setParamDraft((prev) => ({ ...prev, [key]: next }))
+              queueParams({ ...modelParams, ...paramDraft, [key]: next })
+            },
+          }),
+        ])
+      })
+      const paramsSection = paramKeys.length
+        ? [h('div', { key: 'params-h', style: styles.treeHint }, `${featureModel} · 参数（改完即重建）`), ...paramsBody]
+        : []
+      const featureBody = paramsSection.length
+        ? [...paramsSection, ...(!featureList.length
+          ? [h('div', { key: 'script-hint', style: { ...styles.treeHint, whiteSpace: 'nowrap' }, title: '脚本模型：改参数会重跑脚本；逐条特征只适用于声明式模型' }, '脚本模型 · 改参数即重跑脚本')]
+          : [h('div', { key: 'feat-h', style: { ...styles.treeHint, marginTop: 2 } }, `${featureList.length} 特征`)])]
+        : !featureModel || !featureList.length
         ? [h('div', { key: 'none', style: styles.propEmpty },
           featureModel
             ? `${featureModel} 的特征列表是空的。`
