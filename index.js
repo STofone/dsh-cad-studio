@@ -531,6 +531,54 @@ class FreeCadBridge {
     return { id, stats }
   }
 
+  /** The model list, as the panel sees it (newest first). */
+  listSceneRows() {
+    return this.history.map((h) => ({
+      id: h.id,
+      title: h.title,
+      at: h.at,
+      session: h.session ?? '',
+      instances: h.instances ?? 0,
+      parts: h.parts ?? 0,
+      triangles: h.triangles ?? 0,
+      volume: h.volume ?? null,
+      docKey: h.docKey ?? '',
+    }))
+  }
+
+  /**
+   * Drop one row from the model list. A probe that was published by mistake is
+   * otherwise only removable by editing state.json by hand — which is exactly
+   * how a 28-row list happened in the first place.
+   */
+  async removeScene(id) {
+    const key = String(id ?? '')
+    const row = this.history.find((h) => h.id === key)
+    if (!row) throw new Error(`没有这个场景：${key}（可用 ${this.history.map((h) => h.id).join(', ') || '（无）'}）`)
+    this.history = this.history.filter((h) => h.id !== key)
+    this.scenes.delete(key)
+    for (const [asmId, rec] of [...this.assemblies]) if (rec.sceneId === key) this.assemblies.delete(asmId)
+    try { await rm(join(FreeCadBridge.dataDir, 'scenes', `${key}.json`), { force: true }) } catch {}
+    if (this.latest && this.latest.id === key) {
+      const next = this.history[0]
+      this.latest = next ? { id: next.id, title: next.title, at: next.at, scene: this.scenes.get(next.id) ?? null } : null
+    }
+    await this.persist()
+    return { ok: true, removed: key, scenes: this.history.length, latest: this.latest ? this.latest.id : '' }
+  }
+
+  async renameScene(id, title) {
+    const key = String(id ?? '')
+    const row = this.history.find((h) => h.id === key)
+    if (!row) throw new Error(`没有这个场景：${key}`)
+    const name = String(title ?? '').trim()
+    if (!name) throw new Error('新名字不能为空')
+    row.title = name
+    if (this.latest && this.latest.id === key) this.latest = { ...this.latest, title: name }
+    await this.persist()
+    return { ok: true, id: key, title: name }
+  }
+
   /** Reserve the id before publishing, so the scene can carry `asm:<id>`. */
   reserveAssemblyId() {
     return `asm-${++this.assemblySeq}`
@@ -633,7 +681,7 @@ class FreeCadBridge {
     return null
   }
 
-  async run(code, { title, publishHint = true, meta = null, docKey = '', sceneId = '' } = {}) {
+  async run(code, { title, publishHint = true, publish = true, meta = null, docKey = '', sceneId = '' } = {}) {
     const bin = this.refresh()
     if (!bin) {
       return { ok: false, error: 'freecadcmd not found; set freecadPath in the plugin config' }
@@ -697,7 +745,7 @@ print("${BEGIN}" + __json.dumps(_safe(_payload)) + "${END}", flush=True)\n`
       } catch (error) {
         return { ok: false, error: `helper returned non-JSON: ${String(error?.message ?? error)}`, raw: payload.slice(0, 500) }
       }
-      if (value?.scene) {
+      if (value?.scene && publish !== false) {
         // A shape bound to `scene = box` arrives with the variable name as the
         // instance label; the caller's title is what a human expects in the tree.
         const first = value.scene.instances?.[0]
@@ -709,6 +757,7 @@ print("${BEGIN}" + __json.dumps(_safe(_payload)) + "${END}", flush=True)\n`
         value.sceneId = published.id
         delete value.scene
       }
+      if (publish === false) delete value.scene
       const clean = { ok: true, ...value }
       clean.published = Boolean(clean.sceneId)
       if (!clean.published && publishHint) {
@@ -1055,6 +1104,94 @@ __out = {
   })
 
   tool({
+    name: 'cad_studio_legacy',
+    description: 'Read the old dsh-cad document store (/app/.dsh-cad, op logs) that cad_studio_doc cannot see: action=list reports every document with its op mix and body count, action=show prints one document\'s op summary and body names. This is read-only; to bring an old model into CAD Studio, export it to STEP once (exports/ already holds the migrated ones) and assemble from the file.',
+    parameters: {
+      type: 'object',
+      properties: {
+        action: { type: 'string', enum: ['list', 'show'], description: 'list (default) or show.' },
+        doc: { type: 'string', description: 'Document id or title (show only).' },
+        dir: { type: 'string', description: 'Store directory (default /app/.dsh-cad).' },
+      },
+      additionalProperties: false,
+    },
+    output: {
+      schema: { type: 'object', properties: { ok: { type: 'boolean' }, documents: { type: 'number' } } },
+      render: (_args, value) => [{ type: 'text', text: JSON.stringify(value, null, 2) }],
+    },
+    execute: async ({ action, doc, dir: storeDir }) => {
+      const root = typeof storeDir === 'string' && storeDir ? storeDir : '/app/.dsh-cad'
+      const readJson = async (path) => JSON.parse(await readFile(path, 'utf8'))
+      const summarise = (entry) => {
+        const ops = Array.isArray(entry.ops) ? entry.ops : []
+        const kinds = {}
+        for (const op of ops) kinds[op.kind] = (kinds[op.kind] || 0) + 1
+        return { ops: ops.length, kinds, bodies: Array.isArray(entry.bodyNames) ? entry.bodyNames.length : 0 }
+      }
+      let index = { docs: [] }
+      try { index = await readJson(join(root, 'index.json')) } catch {}
+      const docs = Array.isArray(index.docs) ? index.docs : []
+      const loaded = []
+      for (const meta of docs) {
+        try {
+          const entry = await readJson(join(root, 'docs', `${meta.id}.json`))
+          loaded.push({ id: meta.id, title: meta.title ?? '', updatedAt: meta.updatedAt ?? '', ...summarise(entry), entry })
+        } catch {
+          loaded.push({ id: meta.id, title: meta.title ?? '', updatedAt: meta.updatedAt ?? '', ops: 0, kinds: {}, bodies: 0, missing: true })
+        }
+      }
+      const kind = String(action ?? 'list')
+      if (kind === 'list') {
+        return {
+          ok: true,
+          dir: root,
+          documents: loaded.length,
+          items: loaded.map((d) => ({ id: d.id, title: d.title, updatedAt: d.updatedAt, ops: d.ops, bodies: d.bodies, kinds: d.kinds, ...(d.missing ? { missing: true } : {}) })),
+        }
+      }
+      if (kind === 'show') {
+        const key = String(doc ?? '').trim()
+        const hit = loaded.find((d) => d.id === key || d.title === key)
+        if (!hit) return { ok: false, error: `没有这个文档：${key}（可用 ${loaded.map((d) => d.title || d.id).join(', ') || '（无）'}）` }
+        const ops = Array.isArray(hit.entry?.ops) ? hit.entry.ops : []
+        // Newest bodies first: booleans target them by id, so this is the order
+        // in which a replayer would resolve them.
+        const tail = ops.slice(-12).map((op) => ({ kind: op.kind, bodyId: op.bodyId ?? op.target ?? '', name: op.name ?? '', prim: op.prim ?? '' }))
+        return { ok: true, id: hit.id, title: hit.title, version: hit.entry?.version ?? null, ops: ops.length, kinds: hit.kinds, bodies: hit.entry?.bodyNames ?? [], tail }
+      }
+      return { ok: false, error: `不支持的 action：${kind}（list / show）` }
+    },
+  })
+
+  tool({
+    name: 'cad_studio_scene',
+    description: 'Maintain the model list the panel shows (the persisted scene history): action=list / delete / rename. Use delete to clear probe scenes that a measurement run left behind, and rename when a scene title is a file path or a part id.',
+    parameters: {
+      type: 'object',
+      properties: {
+        action: { type: 'string', enum: ['list', 'delete', 'rename'], description: 'list (default) / delete / rename.' },
+        id: { type: 'string', description: 'Scene id, e.g. scene-12. Required for delete and rename.' },
+        title: { type: 'string', description: 'New title (rename only).' },
+      },
+      additionalProperties: false,
+    },
+    output: {
+      schema: { type: 'object', properties: { ok: { type: 'boolean' }, scenes: { type: 'number' } } },
+      render: (_args, value) => [{ type: 'text', text: JSON.stringify(value, null, 2) }],
+    },
+    execute: async ({ action, id, title }) => {
+      const kind = String(action ?? 'list')
+      if (kind === 'list') {
+        const rows = bridge.listSceneRows()
+        return { ok: true, scenes: rows.length, latest: bridge.latest ? bridge.latest.id : '', items: rows }
+      }
+      if (kind === 'delete') return bridge.removeScene(id)
+      if (kind === 'rename') return bridge.renameScene(id, title)
+      return { ok: false, error: `不支持的 action：${kind}（list / delete / rename）` }
+    },
+  })
+
+  tool({
     name: 'cad_studio_setup',
     description: 'Check whether freecadcmd is installed and, when it is missing, install FreeCAD through the system package manager (apt/dnf/pacman/brew). action=check reports binary, version, package manager and the exact command; action=install runs it (needs root on apt) and re-probes afterwards.',
     parameters: {
@@ -1099,12 +1236,18 @@ __out = {
 
   tool({
     name: 'cad_studio_run',
-    description: 'Run a FreeCAD Python script in freecadcmd headless. Bind the shape to show to a variable named `scene` (e.g. `scene = Part.makeBox(80,40,10)`) — it is tessellated and published to the CAD Studio panel; the result reports sceneId and published. Put extra data in the `__out` dict (or `__out["scene"]` for full control of parts/instances/colors).',
+    description: 'Run a FreeCAD Python script in freecadcmd headless. Bind the shape to show to a variable named `scene` (e.g. `scene = Part.makeBox(80,40,10)`) — it is tessellated and published to the CAD Studio panel; the result reports sceneId and published. Put extra data in the `__out` dict (or `__out["scene"]` for full control of parts/instances/colors). Measurement/verification scripts should pass publish:false — otherwise every probe becomes a row in the model list.',
     parameters: {
       type: 'object',
       properties: {
         code: { type: 'string', description: 'FreeCAD Python source. Import Part/Import yourself; helpers describe(path)/_mesh(shape) are preloaded.' },
         title: { type: 'string', description: 'Panel title for the published scene.' },
+        publish: { type: 'boolean', description: 'Publish the bound shape as a panel scene (default true). Pass false for a probe that only measures.' },
+        check: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Files the script wrote: each is re-read after the run and reported as {path, exists, bytes, solids, volume, valid}. A 1.6 KB STEP shell shows up here as valid:false instead of passing silently.',
+        },
       },
       required: ['code'],
       additionalProperties: false,
@@ -1113,7 +1256,47 @@ __out = {
       schema: { type: 'object', properties: { ok: { type: 'boolean' }, sceneId: { type: 'string' }, stderr: { type: 'string' } } },
       render: (_args, value) => [{ type: 'text', text: JSON.stringify(value, null, 2) }],
     },
-    execute: async (args) => bridge.run(`${PRELUDE}\n${args.code}`, { title: args.title }),
+    execute: async (args) => {
+      const files = Array.isArray(args.check) ? args.check.filter((x) => typeof x === 'string' && x) : []
+      const guard = files.length
+        ? `
+# Re-read what the script wrote: FreeCAD's Part.export on a compound can emit a
+# 1.6 KB STEP that parses back as a null shape, and the call still returns ok.
+import os as _os
+_checks = []
+for _p in ${JSON.stringify(files)}:
+    _e = {"path": _p, "exists": _os.path.isfile(_p)}
+    if _e["exists"]:
+        _e["bytes"] = _os.path.getsize(_p)
+        try:
+            if _p.lower().rsplit(".", 1)[-1] in ("step", "stp", "brep", "iges", "igs"):
+                _s = Part.Shape()
+                _s.read(_p)
+                _e["solids"] = len(_s.Solids)
+                _e["volume"] = round(float(_s.Volume), 3)
+                _e["valid"] = bool(_s.Solids) and float(_s.Volume) > 0.0
+            else:
+                _e["valid"] = _e["bytes"] > 200
+        except Exception as _err:
+            _e["valid"] = False
+            _e["error"] = str(_err)
+    else:
+        _e["valid"] = False
+    _checks.append(_e)
+__out = dict(globals().get("__out") or {})
+__out["files"] = _checks
+`
+        : ''
+      const out = await bridge.run(`${PRELUDE}\n${args.code}\n${guard}`, {
+        title: args.title,
+        publish: args.publish !== false,
+      })
+      if (args.publish === false && out && typeof out === 'object') {
+        // The script may still have bound `scene`; make the contract explicit.
+        out.published = false
+      }
+      return out
+    },
   })
 
   tool({
@@ -1166,7 +1349,9 @@ if not _shapes:
 `
   }
 
-  const writeShapeFile = (target, src) => {
+  const writeShapeFile = (target, src, opts = {}) => {
+    const minVolume = Number.isFinite(opts.minVolume) && opts.minVolume > 0 ? Number(opts.minVolume) : 0
+    const alsoStl = Boolean(opts.alsoStl)
     const py = `${PRELUDE}
 ${src}
 if not _shapes:
@@ -1176,6 +1361,16 @@ else:
     _target = ${JSON.stringify(target)}
     _fmt = _target.rsplit(".", 1)[-1].lower()
     os.makedirs(os.path.dirname(_target) or ".", exist_ok=True)
+    # Flatten to solids so a volume threshold can drop dust (round wires, tiny
+    # fillets) that would otherwise dominate the file size.
+    _solids = []
+    for _s in _shapes:
+        _solids.extend(list(_s.Solids) or [_s])
+    _minv = ${minVolume}
+    _kept = [x for x in _solids if x.Volume >= _minv] if _minv > 0 else _solids
+    if not _kept:
+        raise RuntimeError("no solids left after minVolume=%.3f (smallest %.3f)" % (_minv, min((x.Volume for x in _solids), default=0.0)))
+    _shapes = _kept
     if _fmt in ("step", "stp"):
         # Part.export([shape]) writes a 1.6 KB STEP that reads back as a NULL shape;
         # Shape.exportStep / compound exportStep is the API that produces a valid file.
@@ -1200,7 +1395,25 @@ else:
         open(_target, "w").write("\\n".join(_lines) + "\\n")
     else:
         raise RuntimeError("unsupported export format: ." + _fmt + " (use .step/.stp/.brep/.iges/.igs/.stl)")
-    __out = {"ok": True, "path": _target, "format": _fmt, "bytes": os.path.getsize(_target)}
+    _stl = None
+    if ${alsoStl ? 'True' : 'False'}:
+        _stl = os.path.splitext(_target)[0] + ".stl"
+        _lines = []
+        for _s in _shapes:
+            _verts, _facets = _s.tessellate(0.2)
+            for _f in _facets:
+                _a, _b, _c = (_verts[i] for i in _f)
+                _lines.append("facet normal 0 0 0\\n outer loop")
+                for _p in (_a, _b, _c):
+                    _lines.append("  vertex %r %r %r" % (_p.x, _p.y, _p.z))
+                _lines.append(" endloop\\nendfacet")
+        open(_stl, "w").write("solid cad_studio\\n" + "\\n".join(_lines) + "\\nendsolid cad_studio\\n")
+    __out = {"ok": True, "path": _target, "format": _fmt, "bytes": os.path.getsize(_target),
+             "solids": len(_shapes), "volume": round(sum(float(x.Volume) for x in _shapes), 3),
+             "sourceSolids": len(_solids), "sourceVolume": round(sum(float(x.Volume) for x in _solids), 3),
+             "filtered": len(_solids) - len(_shapes)}
+    if _stl:
+        __out["stl"] = {"path": _stl, "bytes": os.path.getsize(_stl)}
 `
     return bridge.run(py, { title: `export → ${target}`, publishHint: false })
   }
@@ -1214,6 +1427,8 @@ else:
         target: { type: 'string', description: 'Absolute output path; the extension picks the format (.step/.stp/.brep/.iges/.igs/.stl).' },
         source: { type: 'string', description: 'Existing model file to export (STEP/IGES/BREP/STL).' },
         code: { type: 'string', description: 'FreeCAD Python that produces the geometry; bind `scene` or `export_shapes`.' },
+        minVolume: { type: 'number', description: 'Drop solids smaller than this (mm³). Use it to keep round wires and dust out of a print file; the return says how many were filtered.' },
+        alsoStl: { type: 'boolean', description: 'Also write an STL next to the target (a light file for viewers that do not read STEP).' },
       },
       required: ['target'],
       additionalProperties: false,
@@ -1222,11 +1437,15 @@ else:
       schema: { type: 'object', properties: { ok: { type: 'boolean' }, path: { type: 'string' }, bytes: { type: 'number' } } },
       render: (_a, v) => [{ type: 'text', text: JSON.stringify(v, null, 2) }],
     },
-    execute: async ({ target, source, code }) => {
+    execute: async ({ target, source, code, minVolume, alsoStl }) => {
       if (!target || extOf(target) === '') return { ok: false, error: 'target must be an absolute path with an extension' }
       const src = shapesFrom({ source, code })
       if (!src) return { ok: false, error: 'pass either source (a model file) or code (FreeCAD Python)' }
-      return writeShapeFile(target, src)
+      const out = await writeShapeFile(target, src, { minVolume, alsoStl })
+      // Keep the two numbers apart on purpose: `volume` is what was written,
+      // `sourceVolume` is what the input held. Mixing them is how a batch export
+      // gets mistaken for the part it produced.
+      return { ...out, source: typeof source === 'string' ? source : '' }
     },
   })
 
@@ -1391,6 +1610,8 @@ ${pair ? `    __out["distance"] = round((FreeCAD.Vector(${JSON.stringify(from)})
         },
         target: { type: 'string', description: 'Optional .step/.stp output path for the whole assembly.' },
         title: { type: 'string', description: 'Panel title.' },
+        measure: { type: 'boolean', description: 'Return per-instance bbox / volume / solid count, and the total volume.' },
+        interference: { type: 'boolean', description: 'Return the instance pairs that actually overlap (bbox prefilter, then a boolean common).' },
         assembly: { type: 'string', description: 'Assembly label for cad_studio_joint / cad_studio_drive / cad_studio_explode (defaults to the title).' },
         joints: {
           type: 'array',
@@ -1418,7 +1639,7 @@ ${pair ? `    __out["distance"] = round((FreeCAD.Vector(${JSON.stringify(from)})
       schema: { type: 'object', properties: { ok: { type: 'boolean' }, sceneId: { type: 'string' }, instances: { type: 'number' }, assembly: { type: 'string' } } },
       render: (_a, v) => [{ type: 'text', text: JSON.stringify(v, null, 2) }],
     },
-    execute: async ({ parts, instances, target, title, assembly, joints }) => {
+    execute: async ({ parts, instances, target, title, assembly, joints, measure, interference }) => {
       if (!Array.isArray(parts) || !parts.length) return { ok: false, error: 'parts must be a non-empty array' }
       if (!Array.isArray(instances) || !instances.length) return { ok: false, error: 'instances must be a non-empty array' }
       // Only referenced parts are read and tessellated: an export set often
@@ -1464,8 +1685,50 @@ for _i in _INSTS:
     _copy.Placement = FreeCAD.Placement(FreeCAD.Vector(*_i["at"]), _R)
     _placed.append(_copy)
 
+_MEASURE = ${measure ? 'True' : 'False'}
+_INTERF = ${interference ? 'True' : 'False'}
+
 __out = {"ok": True, "instances": len(_instances), "parts": len(_parts),
          "scene": {"parts": _parts, "instances": _instances}}
+
+if _MEASURE:
+    # Per-instance numbers, so "how big is this part, and does it fit" is one
+    # call instead of an export plus a re-import.
+    _rows = []
+    for _k, _inst in enumerate(_INSTS):
+        _s = _placed[_k]
+        _bb = _s.BoundBox
+        _rows.append({
+            "name": _inst["name"], "part": _inst["part"],
+            "volume": round(float(_s.Volume), 3), "solids": len(_s.Solids),
+            "bounds": {"min": [round(_bb.XMin, 3), round(_bb.YMin, 3), round(_bb.ZMin, 3)],
+                       "max": [round(_bb.XMax, 3), round(_bb.YMax, 3), round(_bb.ZMax, 3)]},
+        })
+    _box = Part.makeCompound(_placed).BoundBox
+    __out["measure"] = {
+        "instances": _rows,
+        "totalVolume": round(sum(r["volume"] for r in _rows), 3),
+        "bounds": {"min": [round(_box.XMin, 3), round(_box.YMin, 3), round(_box.ZMin, 3)],
+                   "max": [round(_box.XMax, 3), round(_box.YMax, 3), round(_box.ZMax, 3)]},
+    }
+
+if _INTERF:
+    # Bounding boxes first: a boolean common on every pair of a 30-solid
+    # assembly is minutes of work for answers that are mostly zero.
+    _pairs = []
+    for _i in range(len(_placed)):
+        for _j in range(_i + 1, len(_placed)):
+            _a, _b = _placed[_i], _placed[_j]
+            if not _a.BoundBox.intersect(_b.BoundBox):
+                continue
+            try:
+                _c = _a.common(_b)
+                _v = float(_c.Volume) if (_c is not None and not _c.isNull()) else 0.0
+            except Exception:
+                _v = 0.0
+            if _v > 1e-3:
+                _pairs.append({"a": _INSTS[_i]["name"], "b": _INSTS[_j]["name"], "volume": round(_v, 3)})
+    __out["interference"] = _pairs
 if _TARGET:
     os.makedirs(os.path.dirname(_TARGET) or ".", exist_ok=True)
     Part.makeCompound(_placed).exportStep(_TARGET)
@@ -2106,7 +2369,9 @@ if _TARGET:
         // route closure left by a hot reload still lists what is on disk.
         try {
           const parsed = JSON.parse(await readFile(join(dir, 'state.json'), 'utf8'))
-          return send(200, JSON.stringify({ latest: parsed.latest ?? null, scenes: parsed.history ?? [] }))
+          // `scenes` is the model list (kept for older panels); `history` is the
+          // same array under the name the file uses. Counts live in `runtime`.
+          return send(200, JSON.stringify({ latest: parsed.latest ?? null, scenes: parsed.history ?? [], history: parsed.history ?? [] }))
         } catch {
           return send(200, JSON.stringify({ latest: null, scenes: [] }))
         }

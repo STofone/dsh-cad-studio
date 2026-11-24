@@ -597,6 +597,75 @@ endsolid t
   ok('install does not run the package manager twice', again.installed === false, String(again.installed))
 }
 
+// ---- 7m. field feedback: export accounting, run checks, scene upkeep -----
+// Every case here comes from the fish-tank session: a 1.6 KB STEP that
+// "exported fine", probe runs filling the model list, no way to measure an
+// assembly, and no way to see the old dsh-cad documents at all.
+{
+  const dir = mkdtempSync(join(tmpdir(), 'cad-harness-fb-'))
+  const two = `${dir}/two.step`
+  const exported = await call('cad_studio_export', {
+    target: two,
+    code: 'import Part\nexport_shapes = [Part.makeBox(10,10,10), Part.makeBox(5,5,5, FreeCAD.Vector(100,0,0))]',
+  })
+  ok('export counts the solids it wrote', exported.ok === true && exported.solids === 2, JSON.stringify({ solids: exported.solids, filtered: exported.filtered }))
+  ok('export volume is the written set', near(exported.volume, 1125, 1), String(exported.volume))
+  ok('export keeps source volume separate', near(exported.sourceVolume, 1125, 1) && exported.sourceSolids === 2, JSON.stringify({ s: exported.sourceVolume }))
+
+  const kept = await call('cad_studio_export', { target: `${dir}/kept.step`, source: two, minVolume: 200, alsoStl: true })
+  ok('minVolume drops the dust', kept.ok === true && kept.solids === 1 && kept.filtered === 1, JSON.stringify({ solids: kept.solids, filtered: kept.filtered }))
+  ok('minVolume keeps the big solid', near(kept.volume, 1000, 1), String(kept.volume))
+  ok('alsoStl writes a companion file', Boolean(kept.stl?.path) && kept.stl.bytes > 100, JSON.stringify(kept.stl))
+
+  // run: a probe must not become a model row, and a check must catch a shell.
+  const scenesBefore = (await call('cad_studio_scene', { action: 'list' })).scenes
+  const probe = await call('cad_studio_run', {
+    code: 'import Part\nscene = Part.makeBox(30,30,30)',
+    title: 'probe must not publish',
+    publish: false,
+  })
+  const scenesAfter = (await call('cad_studio_scene', { action: 'list' })).scenes
+  ok('run publish:false leaves the list alone', probe.published === false && scenesAfter === scenesBefore, JSON.stringify({ before: scenesBefore, after: scenesAfter }))
+
+  const shell = `${dir}/shell.step`
+  await writeFile(shell, 'ISO-10303-21;\nHEADER;\n', 'utf8')
+  const checked = await call('cad_studio_run', {
+    code: 'import Part\nprint("noop")',
+    check: [two, shell],
+    publish: false,
+  })
+  const files = checked.files ?? []
+  ok('run check reports every file', files.length === 2, JSON.stringify(files.map((f) => f.path)))
+  ok('run check accepts a real STEP', files[0]?.valid === true && files[0].solids === 2, JSON.stringify(files[0]))
+  ok('run check flags a 33-byte shell', files[1]?.valid === false, JSON.stringify(files[1]))
+
+  // scene maintenance
+  const published = await call('cad_studio_run', { code: 'import Part\nscene = Part.makeBox(12,12,12)', title: 'upkeep_probe' })
+  const renamed = await call('cad_studio_scene', { action: 'rename', id: published.sceneId, title: 'renamed probe' })
+  ok('scene rename works', renamed.ok === true && renamed.title === 'renamed probe', JSON.stringify(renamed))
+  const dropped = await call('cad_studio_scene', { action: 'delete', id: published.sceneId })
+  ok('scene delete works', dropped.ok === true && dropped.removed === published.sceneId, JSON.stringify(dropped))
+  const gone = (await call('cad_studio_scene', { action: 'list' })).items.some((r) => r.id === published.sceneId)
+  ok('deleted scene leaves the list', gone === false, '')
+
+  // assembly measurements: two 20mm cubes, the second offset by 10mm in X
+  const cubeA = await call('cad_studio_export', { target: `${dir}/cube.step`, code: 'import Part\nscene = Part.makeBox(20,20,20)' })
+  const asm = await call('cad_studio_assembly', {
+    parts: [{ name: 'cube', path: cubeA.path }],
+    instances: [{ name: 'a', part: 'cube', at: [0, 0, 0] }, { name: 'b', part: 'cube', at: [10, 0, 0] }],
+    title: 'measure demo',
+    measure: true,
+    interference: true,
+  })
+  ok('assembly measures each instance', asm.measure?.instances?.length === 2 && near(asm.measure.instances[0].volume, 8000, 1), JSON.stringify(asm.measure?.instances?.[0]))
+  ok('assembly reports the total volume', near(asm.measure?.totalVolume, 16000, 1), String(asm.measure?.totalVolume))
+  ok('assembly finds the overlapping pair', Array.isArray(asm.interference) && asm.interference.length === 1 && near(asm.interference[0].volume, 4000, 5), JSON.stringify(asm.interference))
+
+  // legacy store: read-only, and it must not throw when the store is absent
+  const legacy = await call('cad_studio_legacy', { action: 'list' })
+  ok('legacy list answers', legacy.ok === true && typeof legacy.documents === 'number', JSON.stringify({ docs: legacy.documents, dir: legacy.dir }))
+}
+
 // ---- 8. teardown --------------------------------------------------------
 for (const d of disposed.reverse()) { try { d() } catch (e) { console.log('  [dispose warn]', e.message) } }
 ok('all tools unregistered on dispose', tools.size === 0, [...tools.keys()].join(','))
