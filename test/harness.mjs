@@ -6,7 +6,7 @@
  *   node /workspace/cad-studio/test/harness.mjs
  */
 import { writeFile } from 'node:fs/promises'
-import { existsSync, mkdtempSync, rmSync } from 'node:fs'
+import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { apply } from '../index.js'
 
 const tools = new Map()
@@ -410,14 +410,57 @@ endsolid t
   const listed = await call('cad_studio_features', { model, action: 'list' })
   ok('feature list action', listed.ok === true && listed.features.length === 3 && listed.kind === 'features', String(listed.features?.length))
 
-  // A bad edit must leave the document exactly as it was.
-  const broken = await call('cad_studio_features', { model, action: 'update', feature: { id: 'f2', params: { with: { kind: 'cylinder', r: 500, h: 30, at: [30, 20, -5] } } } })
-  ok('bad feature edit is rejected or rolled back', broken.ok === false || broken.reverted === true, JSON.stringify({ ok: broken.ok, reverted: broken.reverted }))
+  // A bad edit is *saved and flagged*, not silently rolled back: the document
+  // answers "accepted", the graph answers "this node failed, the rest is blocked".
   const shown = await call('cad_studio_doc', { action: 'show', name: model })
-  ok('feature doc survives a bad edit', shown.ok === true && shown.features.length === 3, String(shown.features?.length))
-
+  ok('feature doc survives edits and a bad value', shown.ok === true && Array.isArray(shown.features) && shown.features.length === 3, String(shown.features?.length))
   const removedFeature = await call('cad_studio_features', { model, action: 'remove', id: 'f3' })
   ok('feature remove', removedFeature.ok === true && removedFeature.features.length === 2, String(removedFeature.features?.length))
+
+  // ---- Phase 1: graph semantics on a model of its own -------------------
+  const gModel = 'harness_图'
+  await call('cad_studio_doc', { action: 'delete', name: gModel })
+  const gMade = await call('cad_studio_doc', {
+    action: 'create', name: gModel, kind: 'features',
+    features: [
+      { kind: 'box', label: '底板', size: [60, 40, 20] },
+      { kind: 'cut', label: '通孔', with: { kind: 'cylinder', r: 8, h: 30, at: [30, 20, -5] } },
+      { kind: 'fillet', label: '圆角', r: 2 },
+    ],
+  })
+  ok('graph model builds', gMade.ok === true && gMade.volume > 42000 && gMade.volume < 43978, String(gMade.volume))
+
+  // Failure isolation: a node that throws is named, kept, and blocks the rest.
+  const bad = await call('cad_studio_features', { model: gModel, action: 'add', feature: { kind: 'fillet', label: '太大', r: 5000 } })
+  ok('a failing node is saved as failed, not rejected', bad.ok === true && bad.evaluated === false, JSON.stringify({ ok: bad.ok, evaluated: bad.evaluated }))
+  const badNode = (bad.graph?.nodes || []).find((n) => n.status === 'failed')
+  ok('graph names the failing node', badNode?.id === 'f4' && Boolean(badNode?.message), JSON.stringify(badNode || {}))
+  const after = await call('cad_studio_features', { model: gModel, action: 'list' })
+  ok('a failed node stays in the document', after.features.length === 4, String(after.features?.length))
+
+  const undoBad = await call('cad_studio_features', { model: gModel, action: 'undo' })
+  ok('undo removes the failed node', undoBad.ok === true && undoBad.features.length === 3 && undoBad.evaluated !== false, JSON.stringify({ n: undoBad.features?.length, v: undoBad.volume }))
+  const redoBad = await call('cad_studio_features', { model: gModel, action: 'redo' })
+  ok('redo brings it back', redoBad.ok === true && redoBad.features.length === 4, String(redoBad.features?.length))
+  await call('cad_studio_features', { model: gModel, action: 'undo' })
+
+  // Tip = evaluate only up to this feature (FreeCAD Tip / Onshape rollback bar).
+  const tipped = await call('cad_studio_features', { model: gModel, action: 'tip', id: 'f1' })
+  ok('tip evaluates only up to the chosen feature', tipped.ok === true && near(tipped.volume, 48000, 1), String(tipped.volume))
+  ok('nodes past the tip are skipped', (tipped.graph?.nodes || []).filter((n) => n.status === 'skipped').length === 2, JSON.stringify((tipped.graph?.nodes || []).map((n) => n.id + ':' + n.status)))
+  await call('cad_studio_features', { model: gModel, action: 'tip' })
+  const untipped = await call('cad_studio_doc', { action: 'show', name: gModel })
+  ok('clearing the tip brings the whole tree back', untipped.ok === true && untipped.stats.volume > 42000 && untipped.stats.volume < 43978, String(untipped.stats?.volume))
+
+  // Suppress is an alias of toggle and shows as skipped, not as an error.
+  const sup = await call('cad_studio_features', { model: gModel, action: 'suppress', id: 'f3', value: true })
+  ok('suppress aliases toggle', sup.ok === true && sup.features.find((f) => f.id === 'f3').enabled === false, JSON.stringify(sup.features?.map((f) => f.id + ':' + f.enabled)))
+  ok('a suppressed node is skipped in the graph', (sup.graph?.nodes || []).find((n) => n.id === 'f3')?.status === 'skipped', JSON.stringify((sup.graph?.nodes || []).map((n) => n.id + ':' + n.status)))
+  await call('cad_studio_features', { model: gModel, action: 'suppress', id: 'f3', value: false })
+
+  // schema 2 on disk: graph is the canonical store, features is the mirror.
+  const rawDoc = JSON.parse(readFileSync(join(gMade.dir, gModel + '.json'), 'utf8'))
+  ok('doc is written as schema 2 with a graph', rawDoc.schema === 2 && Array.isArray(rawDoc.graph?.nodes) && rawDoc.graph.nodes.length === 3, JSON.stringify({ schema: rawDoc.schema, nodes: rawDoc.graph?.nodes?.length }))
 
   const scriptDoc = await call('cad_studio_doc', { action: 'create', name: 'harness_脚本', script: 'import Part\nscene = Part.makeBox(10,10,10)' })
   const wrong = await call('cad_studio_features', { model: 'harness_脚本', action: 'list' })

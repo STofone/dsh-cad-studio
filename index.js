@@ -857,7 +857,7 @@ def describe(path):
  */
 const featuresScript = (ops, exportPath) => `${PRELUDE}
 import os
-_OPS = ${JSON.stringify(ops)}
+_OPS = json.loads(${JSON.stringify(JSON.stringify(Array.isArray(ops) ? ops : []))})
 _EXPORT = ${exportPath ? JSON.stringify(exportPath) : 'None'}
 
 def _v3(x, d=(0.0, 0.0, 0.0)):
@@ -901,8 +901,13 @@ def _prim(op):
     raise RuntimeError("未知图元：" + str(k))
 
 _shape = None
+_errors = []
+_executed = 0
 for _idx, _op in enumerate(_OPS):
     _k = _op.get("kind")
+    if _k == "__skip__":
+        continue
+    _snap = _shape
     try:
         if _k in ("box", "cylinder", "sphere", "cone", "torus", "extrude", "revolve"):
             _s = _prim(_op)
@@ -957,13 +962,22 @@ for _idx, _op in enumerate(_OPS):
         else:
             raise RuntimeError("未知特征：" + str(_k))
     except Exception as _e:
-        # Name the feature, not just its position: "step 10 (cut) failed: 'with'"
-        # told the caller nothing about which row to fix.
-        raise RuntimeError("第 %d 步 · 特征 %s（%s，%s）失败：%s" % (
-            _idx + 1, _op.get("_id", "?"), _op.get("_label") or "-", _k, _e))
+        # A failing node must not roll the document back: record it, keep the
+        # last good shape, and stop — every later node is blocked by it, which
+        # is what a parametric CAD does (the bad feature is the one to fix).
+        _shape = _snap
+        _errors.append({
+            "id": _op.get("_id", "?"),
+            "step": _idx + 1,
+            "kind": _k,
+            "label": _op.get("_label") or "",
+            "message": str(_e),
+        })
+        break
+    _executed = _idx + 1
 
 if _shape is None:
-    raise RuntimeError("ops 为空：至少给一个图元")
+    raise RuntimeError(_errors[0]["message"] if _errors else "ops 为空：至少给一个图元")
 _shape = _shape.removeSplitter()
 scene = _shape
 __out = {
@@ -973,6 +987,8 @@ __out = {
     "area": round(_shape.Area, 3),
     "faces": len(_shape.Faces),
     "bounds": _bounds(_shape),
+    "errors": _errors,
+    "executed": _executed,
 }
 if _EXPORT:
     os.makedirs(os.path.dirname(_EXPORT) or ".", exist_ok=True)
@@ -1998,11 +2014,25 @@ if _TARGET:
     // a declarative feature list. Older files predate the field and are scripts.
     doc.kind = doc.kind === 'features' ? 'features' : 'script'
     doc.features = Array.isArray(doc.features) ? doc.features : []
+    // Schema 2 keeps the list under `graph.nodes`; `features` stays the in-memory
+    // name so every caller keeps working. Reading an old file migrates it.
+    if (doc.graph && Array.isArray(doc.graph.nodes)) doc.features = doc.graph.nodes
+    doc.schema = 2
+    doc.tip = typeof doc.tip === 'string' && doc.tip ? doc.tip : null
+    doc.undo = Array.isArray(doc.undo) ? doc.undo : []
+    doc.redo = Array.isArray(doc.redo) ? doc.redo : []
+    for (const f of doc.features) if (f && typeof f === 'object' && typeof f.suppressed === 'boolean') f.enabled = f.suppressed !== true
     return doc
   }
 
   const writeModel = async (doc, dir) => {
     await mkdir(dir, { recursive: true })
+    doc.schema = 2
+    // Only feature documents have a graph; a script document is code-not-data.
+    if (Array.isArray(doc.features)) {
+      doc.graph = { tip: doc.tip ?? null, nodes: doc.features }
+      for (const f of doc.features) f.suppressed = f.enabled === false
+    }
     const body = JSON.stringify(doc, null, 2)
     await writeFile(modelFile(doc.name, dir), body, 'utf8')
     return doc
@@ -2015,12 +2045,40 @@ if _TARGET:
     label: f.label ?? '',
     params: f.params ?? {},
     enabled: f.enabled !== false,
+    suppressed: f.enabled === false,
   }))
 
   /** Feature objects to flat ops (`{kind, ...params}`) for the Python emitter. */
-  const featureOps = (doc) => doc.features
-    .filter((f) => f.enabled !== false)
-    .map((f) => ({ kind: f.kind, ...(f.params ?? {}), _id: f.id, _label: f.label || '' }))
+  /**
+   * Nodes to evaluate, in order, honouring `tip` (rollback bar) and suppression.
+   *
+   * A suppressed node is not "skip and keep going": everything after it was
+   * built on a shape that no longer exists, so evaluation stops there and the
+   * rest is reported as blocked. This mirrors FreeCAD/Onshape rather than
+   * silently computing against the wrong shape.
+   */
+  const featureOps = (doc, { stopAtSuppressed = true } = {}) => {
+    const list = Array.isArray(doc.features) ? doc.features : []
+    const tipAt = doc.tip ? list.findIndex((f) => String(f.id) === String(doc.tip)) : -1
+    const end = tipAt >= 0 ? tipAt + 1 : list.length
+    const ops = []
+    for (let i = 0; i < end; i += 1) {
+      const f = list[i]
+      if (!f) continue
+      // Suppression skips the node. Until typed selectors land (Phase 2) we
+      // cannot tell whether a later node depended on its outputs, so skipping
+      // is the honest default: the graph shows it as skipped, and a node that
+      // really needed it will fail loudly instead of silently reading something
+      // else. (Stopping the whole chain would break the common "mute one fillet
+      // and keep working" case.)
+      if (f.enabled === false) {
+        if (stopAtSuppressed) ops.push({ kind: '__skip__', _id: f.id, _label: f.label || '' })
+        continue
+      }
+      ops.push({ kind: f.kind, ...(f.params ?? {}), _id: f.id, _label: f.label || '' })
+    }
+    return ops
+  }
 
   const FEATURE_FIELDS = ['id', 'kind', 'label', 'params', 'enabled']
 
@@ -2092,12 +2150,39 @@ if _TARGET:
    * documents re-emit the whole feature list — which is why editing one feature
    * is cheap and cannot leave the model half-updated.
    */
+  /**
+   * Per-node status for the panel and for the caller: ok / failed / blocked /
+   * skipped. Derived from what the kernel actually executed, not guessed.
+   */
+  const graphView = (doc, out) => {
+    const list = Array.isArray(doc.features) ? doc.features : []
+    const errors = Array.isArray(out?.errors) ? out.errors : []
+    const failedAt = new Map(errors.map((e) => [String(e.id), e]))
+    const executed = Number.isFinite(out?.executed) ? Number(out.executed) : null
+    const tipAt = doc.tip ? list.findIndex((f) => String(f.id) === String(doc.tip)) : -1
+    const end = tipAt >= 0 ? tipAt + 1 : list.length
+    let why = ''
+    const nodes = list.map((f, i) => {
+      const base = { id: f.id, kind: f.kind, label: f.label ?? '', suppressed: f.enabled === false }
+      if (i >= end) return { ...base, status: 'skipped', message: '在回滚点之后' }
+      if (why) return { ...base, status: 'blocked', message: why }
+      // Skipping is not a failure: the node is not evaluated, the tree keeps
+      // building (see featureOps).
+      if (base.suppressed) return { ...base, status: 'skipped', message: '被抑制（跳过）' }
+      const err = failedAt.get(String(f.id))
+      if (err) { why = `因为 ${f.id} 失败`; return { ...base, status: 'failed', message: err.message } }
+      if (executed !== null && i >= executed) { why = `因为 ${f.id} 没有执行`; return { ...base, status: 'blocked', message: why } }
+      return { ...base, status: 'ok', message: '' }
+    })
+    return { tip: doc.tip ?? null, nodes }
+  }
+
   const rebuild = async (doc, dir, { note } = {}) => {
     const isFeatures = doc.kind === 'features'
     const code = isFeatures
       ? featuresScript(featureOps(doc))
       : `${PRELUDE}\nP = ${JSON.stringify(doc.params ?? {})}\n${doc.script}`
-    const meta = isFeatures ? { model: doc.name, features: publicFeatures(doc) } : { model: doc.name, params: doc.params ?? {} }
+    const meta = isFeatures ? { model: doc.name, features: publicFeatures(doc), tip: doc.tip ?? null } : { model: doc.name, params: doc.params ?? {} }
     doc.run = (doc.run ?? 0) + 1
     doc.updatedAt = new Date().toISOString()
     // One row per model: a rebuild rewrites the model's existing scene.
@@ -2107,7 +2192,7 @@ if _TARGET:
       docKey: `model:${doc.name}`,
       sceneId: doc.stats?.sceneId || '',
     })
-    if (out.ok === false) return { ...out, name: doc.name, params: doc.params }
+    if (out.ok === false) return { ...out, name: doc.name, params: doc.params, graph: graphView(doc, out) }
     // run() returns volume/bounds but not triangle count, so read it back from
     // the row that was just published (a null here forced the panel to guess).
     const sceneId = out.sceneId ?? ''
@@ -2120,11 +2205,21 @@ if _TARGET:
       at: doc.updatedAt,
     }
     if (note) doc.note = note
+    // The scene was published before the kernel reported which nodes failed, so
+    // attach the statuses now: the panel paints dots from payload.graph.
+    const graph = graphView(doc, out)
+    const scene = sceneId ? bridge.scenes?.get(sceneId) : null
+    if (scene) {
+      scene.graph = graph
+      try { await bridge.persist() } catch {}
+    }
     await writeModel(doc, dir)
     return {
       ok: true,
       name: doc.name,
       dir,
+      graph,
+      errors: Array.isArray(out.errors) ? out.errors : [],
       run: doc.run,
       params: doc.params,
       volume: doc.stats.volume,
@@ -2193,9 +2288,15 @@ if _TARGET:
       throw new Error(`${doc.name} 是脚本模型，没有特征列表（用 cad_studio_doc update 改 params，或新建 kind="features" 的模型）`)
     }
     if (action === 'list') {
-      return { ok: true, model: doc.name, kind: doc.kind, features: publicFeatures(doc), stats: doc.stats ?? null }
+      return { ok: true, model: doc.name, kind: doc.kind, features: publicFeatures(doc), graph: graphView(doc, { errors: [], executed: null }), stats: doc.stats ?? null }
+    }
+    const snapshot = () => JSON.parse(JSON.stringify({ features: doc.features, tip: doc.tip ?? null }))
+    const restore = (snap) => {
+      doc.features = JSON.parse(JSON.stringify(snap.features))
+      doc.tip = snap.tip ?? null
     }
     const before = JSON.parse(JSON.stringify(doc.features))
+    const undoSnap = snapshot()
     const feature = args.feature && typeof args.feature === 'object' ? args.feature : {}
     const wanted = String(args.id ?? feature.id ?? '')
     const findAt = () => doc.features.findIndex((f) => String(f.id) === wanted)
@@ -2224,21 +2325,53 @@ if _TARGET:
       const [item] = doc.features.splice(at, 1)
       const to = Number.isFinite(Number(args.to)) ? Math.max(0, Math.min(doc.features.length, Math.round(Number(args.to)))) : doc.features.length
       doc.features.splice(to, 0, item)
-    } else if (action === 'toggle') {
+    } else if (action === 'toggle' || action === 'suppress') {
       const at = findAt()
       if (at < 0) throw new Error(`没有这个特征：${wanted || '(空)'}`)
+      // Suppression is document state, not a delete: the feature keeps its
+      // params and its place, and everything downstream reports as blocked.
       const want = feature.enabled !== undefined ? feature.enabled !== false : doc.features[at].enabled === false
       doc.features[at].enabled = want
+    } else if (action === 'tip') {
+      if (!wanted) doc.tip = null
+      else if (findAt() < 0) throw new Error(`没有这个特征：${wanted}`)
+      else doc.tip = wanted
+    } else if (action === 'undo' || action === 'redo') {
+      const from = action === 'undo' ? doc.undo : doc.redo
+      const to = action === 'undo' ? doc.redo : doc.undo
+      if (!from.length) throw new Error(action === 'undo' ? '没有可撤销的操作' : '没有可重做的操作')
+      const entry = from.pop()
+      to.push(entry)
+      restore(action === 'undo' ? entry.before : entry.after)
     } else {
       throw new Error(`未知 action：${action}（可用 list / add / update / remove / move / toggle）`)
     }
     if (!doc.features.length) throw new Error('特征列表不能为空：至少留一个图元')
 
-    const result = await rebuild(doc, dir, { note: `${action} ${wanted || feature.kind || ''}`.trim() })
+    const label = `${action} ${wanted || feature.kind || ''}`.trim()
+    const result = await rebuild(doc, dir, { note: label })
     if (result.ok === false) {
-      doc.features = before
+      // Keep the edit. A document that describes an unbuildable shape is more
+      // useful than a silent rollback: the panel shows which node failed, and
+      // undo is one keystroke away.
       await writeModel(doc, dir)
-      return { ...result, reverted: true, hint: '这次修改没跑通，特征列表已回退到上一版；改完再试。' }
+      // "ok" answers "did the document accept the edit"; the geometry answer
+      // lives in evaluated/errors/graph. A reorder can legitimately leave the
+      // tree unevaluable (a fillet moved above its body) and that must stay
+      // visible rather than being rejected — you fix it by reading the graph.
+      return {
+        ...result,
+        ok: true,
+        saved: true,
+        evaluated: false,
+        features: publicFeatures(doc),
+        hint: '这条改动已存进文档，但求值失败——看 graph 里哪条是 failed，改好或撤销。',
+      }
+    }
+    if (!['undo', 'redo'].includes(action)) {
+      doc.undo.push({ at: new Date().toISOString(), action, target: wanted || feature.kind || '', before: undoSnap, after: snapshot() })
+      doc.undo = doc.undo.slice(-50)
+      doc.redo = []
     }
     doc.history.push({
       at: doc.updatedAt,
@@ -2252,10 +2385,15 @@ if _TARGET:
     await writeModel(doc, dir)
     return {
       ok: true,
+      evaluated: result.ok !== false && (result.errors ?? []).length === 0,
       model: doc.name,
       kind: doc.kind,
       action,
       features: publicFeatures(doc),
+      graph: result.graph,
+      errors: result.errors ?? [],
+      undo: doc.undo.length,
+      redo: doc.redo.length,
       volume: doc.stats?.volume ?? null,
       triangles: doc.stats?.triangles ?? null,
       sceneId: doc.stats?.sceneId ?? '',
@@ -2265,12 +2403,12 @@ if _TARGET:
 
   tool({
     name: 'cad_studio_features',
-    description: `Edit a feature-list model one feature at a time (the "边画边改" path): change one feature's parameters and the whole list is re-derived in ~0.2–0.6 s. Actions: list / add / update / remove / move / toggle. Feature kinds: ${FEATURE_KINDS.join(', ')}. A feature is {kind, label?, params} — params hold that kind's fields (box: size:[dx,dy,dz], at?; cylinder: r,h,at?,axis?; cut/fuse/common: with:<primitive>; fillet: r; chamfer: d; shell: t,open?; pattern_linear: delta,count; rotate: axis?,at?,deg; mirror: normal?,at?). Flat form ({kind:'box', size:[…]}) is accepted too.`,
+    description: `Edit a feature-list model one feature at a time (the "边画边改" path): change one feature's parameters and the whole list is re-derived in ~0.2–0.6 s. Actions: list / add / update / remove / move / toggle (alias suppress) / tip / undo / redo. Feature kinds: ${FEATURE_KINDS.join(', ')}. A feature is {kind, label?, params} — params hold that kind's fields (box: size:[dx,dy,dz], at?; cylinder: r,h,at?,axis?; cut/fuse/common: with:<primitive>; fillet: r; chamfer: d; shell: t,open?; pattern_linear: delta,count; rotate: axis?,at?,deg; mirror: normal?,at?). Flat form ({kind:'box', size:[…]}) is accepted too.`,
     parameters: {
       type: 'object',
       properties: {
         model: { type: 'string', description: 'Feature-list model name (created with cad_studio_doc kind="features").' },
-        action: { type: 'string', enum: ['list', 'add', 'update', 'remove', 'move', 'toggle'] },
+        action: { type: 'string', enum: ['list', 'add', 'update', 'remove', 'move', 'toggle', 'suppress', 'tip', 'undo', 'redo'] },
         feature: { type: 'object', description: 'add: the feature to append. update/toggle: {id, ...fields to change}. remove/move: {id}.' },
         id: { type: 'string', description: 'Feature id (f1, f2 …); alternative to feature.id.' },
         to: { type: 'integer', description: 'move: target index (0-based). Default: to the end.' },

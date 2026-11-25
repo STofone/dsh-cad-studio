@@ -154,6 +154,15 @@ window.__ModuleLoader__.load({
       // Feature list: dense rows, each step a small block with its own numbers.
       featBlock: { padding: '3px 0 5px', borderBottom: '1px solid rgba(120,130,145,.16)' },
       featHead: { display: 'flex', alignItems: 'center', gap: 4, minWidth: 0 },
+      featDot: (tone) => ({
+        width: 6,
+        height: 6,
+        borderRadius: '50%',
+        flex: '0 0 auto',
+        background: tone,
+        boxShadow: '0 0 0 2px rgba(0,0,0,0.18)',
+      }),
+      featTip: { flex: '0 0 auto', fontSize: 10, opacity: 0.8, marginLeft: 2 },
       featId: { width: 18, flex: 'none', textAlign: 'center', fontSize: 9.5, lineHeight: '14px', borderRadius: 3, background: 'rgba(120,130,145,.14)', opacity: 0.8, fontVariantNumeric: 'tabular-nums' },
       featLabel: { fontSize: 11, fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: '1 1 auto', minWidth: 0 },
       microBtn: { font: 'inherit', fontSize: 10, lineHeight: 1, padding: '2px 3px', border: 0, borderRadius: 4, background: 'transparent', color: 'inherit', opacity: 0.55, cursor: 'pointer', flex: 'none' },
@@ -1770,7 +1779,14 @@ const FILE_EXTS = ['step', 'stp', 'iges', 'igs', 'brep', 'stl']
             setFeatError(String((out && out.error) || `HTTP ${res.status}`))
             return null
           }
-          setFeatError('')
+          // A saved-but-unevaluable edit is not an HTTP failure: say which node
+          // broke instead of pretending the click did nothing.
+          if (out.evaluated === false) {
+            const first = (out.errors && out.errors[0]) || null
+            setFeatError(`${first ? `${first.id} 求值失败：${first.message}` : '求值失败'}`)
+          } else {
+            setFeatError('')
+          }
           if (out.sceneId) await applyScene(out.sceneId, out.at)
           return out
         } catch (error) {
@@ -1881,6 +1897,25 @@ const FILE_EXTS = ['step', 'stp', 'iges', 'igs', 'brep', 'stl']
       const paramsSection = paramKeys.length
         ? [h('div', { key: 'params-h', style: styles.treeHint }, `${featureModel} · 参数（改完即重建）`), ...paramsBody]
         : []
+      useEffect(() => {
+        const onKey = (event) => {
+          const tag = (event.target && event.target.tagName) || ''
+          if (/^(INPUT|TEXTAREA|SELECT)$/.test(tag)) return
+          if (!(event.metaKey || event.ctrlKey) || !featureModel) return
+          const key = String(event.key || '').toLowerCase()
+          if (key === 'z') {
+            event.preventDefault()
+            postFeature({ action: event.shiftKey ? 'redo' : 'undo' })
+          } else if (key === 'y') {
+            event.preventDefault()
+            postFeature({ action: 'redo' })
+          }
+        }
+        window.addEventListener('keydown', onKey)
+        return () => window.removeEventListener('keydown', onKey)
+      }, [featureModel])
+      const graphNodes = (payload && payload.graph && payload.graph.nodes) || []
+      const graphTip = (payload && payload.graph && payload.graph.tip) || null
       const featureBody = paramsSection.length
         ? [...paramsSection, ...(!featureList.length
           ? [h('div', { key: 'script-hint', style: { ...styles.treeHint, whiteSpace: 'nowrap' }, title: '脚本模型：改参数会重跑脚本；逐条特征只适用于声明式模型' }, '脚本模型 · 改参数即重跑脚本')]
@@ -1918,6 +1953,10 @@ const FILE_EXTS = ['step', 'stp', 'iges', 'igs', 'brep', 'stl']
           featError ? h('div', { key: 'e', style: styles.featError, 'data-cad-feat-error': '1' }, featError) : null,
           ...featureList.map((feature, index) => {
             const off = feature.enabled === false
+            const node = graphNodes.find((n) => n.id === feature.id)
+            const tone = node
+              ? { ok: '#2ea043', failed: '#e5534b', blocked: '#e0a33a', skipped: '#8b949e' }[node.status] || '#8b949e'
+              : '#8b949e'
             const fields = paramFields(feature.params || {}, [])
             return h('div', {
               key: feature.id,
@@ -1926,6 +1965,12 @@ const FILE_EXTS = ['step', 'stp', 'iges', 'igs', 'brep', 'stl']
             }, [
               h('div', { key: 'r', style: styles.featHead }, [
                 h('span', { key: 'i', style: styles.featId }, feature.id),
+                h('span', {
+                  key: 's',
+                  style: styles.featDot(tone),
+                  'data-cad-feat-status': node ? node.status : '',
+                  title: node && node.message ? node.message : (node ? `status: ${node.status}` : ''),
+                }),
                 h('span', { key: 'l', style: styles.featLabel, title: `${feature.id} · ${feature.kind}` }, `${feature.label || feature.kind}`),
                 h('button', {
                   key: 'e',
@@ -1953,6 +1998,17 @@ const FILE_EXTS = ['step', 'stp', 'iges', 'igs', 'brep', 'stl']
                   'data-cad-feat-down': feature.id,
                   onClick: (event) => { event.stopPropagation(); postFeature({ action: 'move', id: feature.id, to: index + 1 }) },
                 }, '↓'),
+                h('button', {
+                  key: 't',
+                  type: 'button',
+                  style: { ...styles.microBtn, opacity: graphTip === feature.id ? 1 : 0.55 },
+                  title: graphTip === feature.id ? '清除回滚点（恢复算全部）' : '只算到这一步（回滚点）',
+                  'data-cad-feat-tip': feature.id,
+                  onClick: (event) => {
+                    event.stopPropagation()
+                    postFeature({ action: 'tip', id: graphTip === feature.id ? null : feature.id })
+                  },
+                }, graphTip === feature.id ? '◉' : '◌'),
                 h('button', {
                   key: 'x',
                   type: 'button',

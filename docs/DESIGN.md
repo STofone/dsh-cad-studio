@@ -443,3 +443,40 @@ publish(sceneFrom(tip 的有效节点))
 4. Fusion 360 *Timeline*（时间线 + 回滚；第三方教学页，仅作索引级旁证）  
    https://gstarcademy.com/kb/concepts/timeline-fusion
 5. 本仓库实测数字：`docs/` 截图与 `test/harness.mjs` 输出；单特征重建 0.25–0.6 s（`体验_特征` 5 条）。
+
+---
+
+## 11. Phase 1 落地记录（2026-11-25）
+
+本节记录文档写完之后**实际落进代码**的部分，以及实现中发现、文档原先没写对的地方。
+
+### 11.1 已完成（host + panel）
+
+| 文档条目 | 落地形式 | 代码位置 |
+|---|---|---|
+| §5.2 schema 2 | `doc.schema = 2`；`graph.nodes` 为权威存储、`features` 为兼容镜像；读旧文件自动迁移 | `readModel()` / `writeModel()` |
+| §5.6 tip / 回滚 | `doc.tip`；`featureOps()` 按 tip 截断，其后节点标 `skipped`；`action: 'tip'` | `featureOps()` / `runFeatureAction()` |
+| §5.6 抑制 | `enabled === false` → 发射器收到 `__skip__` 标记并跳过；graph 标 `skipped`；`suppress` 为 `toggle` 别名 | `featureOps()` / `featuresScript()` |
+| §5.7 错误模型 | 发射器逐步 `try/except`：失败节点记 `{id, step, kind, label, message}`、回到上一步形状、后续节点不执行；`__out.errors` / `__out.executed` | `featuresScript()` |
+| §5.7 失败可见 | 图状态 `ok / failed / blocked / skipped`，面板每行一个状态点 + hover 文案；`evaluated:false` 不再当 HTTP 失败 | `graphView()`、`postFeature()` |
+| §5.5 undo | `doc.undo` / `doc.redo` 两个栈（各 50）；`action: 'undo' / 'redo'`；面板 `Ctrl+Z` / `⇧Ctrl+Z`（输入框内不劫持） | `runFeatureAction()`、Panel keydown |
+| §5.7 不静默回滚 | 求值失败时**保留文档**并返回 `ok:true, saved:true, evaluated:false` + graph；只有参数校验失败（不可能产生文档）才拒 | `runFeatureAction()` |
+
+### 11.2 实现中被证伪/修正的设计假设
+
+1. **`JSON.stringify` 进 Python 不是合法字面量**。`{"enabled":false}` 里的 `false` 不是 Python —— 历史代码碰巧没往 op 里放布尔值，加了 `suppressed` 之后整条特征链开始报 `name 'false' is not defined`。现在统一 `_OPS = json.loads(...)`，JSON 由 Python 自己解析。
+2. **"抑制 = 阻断下游"不成立**。最初按 CAD 语义让抑制节点 break，结果"静音一个圆角继续干活"这种最常见操作被整棵树锁死。在拿到类型化选择器（Phase 2）之前无法判断下游是否真的依赖它，因此改为**跳过 + 标 skipped**，并在文档里写明这条限制。
+3. **`ok` 的语义必须区分"文档接受"与"几何成立"**。重排一个 fillet 到 body 之前，文档完全合法而几何不成立；此时返回 `ok:false` 会让 UI 假装操作没发生。现在 `ok` = 文档接受，`evaluated` = 几何成立。
+4. **`runFeatureAction` 的 `list` 不重算**。它只读 stats，所以任何"改完看体积"的断言都必须走 `doc show` 或发布行，不能读 `list`。
+
+### 11.3 回归
+
+- `test/harness.mjs`：165 → **176 条**（新增 11 条覆盖 schema 2 落盘、失败节点命名与滞留、undo/redo、tip 截断、suppress 别名与 skipped 状态、`evaluated` 语义）。
+- 测试基座须 `TMPDIR=/tmp/h-xxx` 隔离（否则会清掉 `state.json` 与 `scenes/`）。
+
+### 11.4 仍是 Phase 2+
+
+- 类型化选择器（`face:<ref>` / `edge:` / `vertex:`，含容忍度与"失效可见"）——当前 `with` 只认整个图元，任何面级引用都还在"按索引猜"的死路上。
+- 输入哈希缓存与增量重算——现在一次改动 = 一次全量 freecadcmd 进程（0.3–0.6 s）。
+- 装配的 `ref = model@version`（当前是 `asm:N` 指针 + 快照）。
+- 草图/约束求解。
