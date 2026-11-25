@@ -353,6 +353,21 @@ function instanceCenter(parts, inst) {
   return scaleVec(addVec(mn, mx), 0.5)
 }
 
+/** World AABB of one placement ({rot, translate}) of an instance. */
+function worldBox(parts, placement) {
+  if (!placement) return null
+  const bx = partLocalBox(parts, placement.part)
+  if (!bx) return null
+  const mn = [Infinity, Infinity, Infinity]
+  const mx = [-Infinity, -Infinity, -Infinity]
+  for (let i = 0; i < 8; i += 1) {
+    const p = [i & 1 ? bx.mx[0] : bx.mn[0], i & 2 ? bx.mx[1] : bx.mn[1], i & 4 ? bx.mx[2] : bx.mn[2]]
+    const w = addVec(mulVec(placement.rot, p), placement.translate)
+    for (let k = 0; k < 3; k += 1) { if (w[k] < mn[k]) mn[k] = w[k]; if (w[k] > mx[k]) mx[k] = w[k] }
+  }
+  return { mn, mx }
+}
+
 function bboxCenterOfInstances(parts, instances) {
   const centers = instances.map((inst) => instanceCenter(parts, inst))
   if (!centers.length) return [0, 0, 0]
@@ -361,6 +376,33 @@ function bboxCenterOfInstances(parts, instances) {
 }
 
 /** Normalise one joint spec against the assembly it belongs to. */
+/**
+ * One mate, normalised. A mate PLACES the moving instance against a fixed one
+ * and then stops being dynamic — it is solved once per republish, not stepped
+ * like a joint. Three kinds cover the assembly idioms we can verify:
+ *   concentric  two axes become collinear, axial distance = offset
+ *   flush       two faces touch, gap = 0 (offset must be 0)
+ *   distance    two faces stay `offset` apart along the axis
+ */
+function normalizeMate(record, spec) {
+  const names = new Set(record.base.map((b) => b.name))
+  const a = String(spec.a ?? '')
+  const b = String(spec.b ?? '')
+  if (!names.has(a)) throw new Error(`装配里没有这个实例（移动件 a）：${a}`)
+  if (!names.has(b)) throw new Error(`装配里没有这个实例（固定件 b）：${b}`)
+  if (a === b) throw new Error('a 与 b 不能是同一个实例')
+  const TYPES = ['concentric', 'flush', 'distance']
+  const type = TYPES.includes(spec.type) ? spec.type : 'concentric'
+  const axis = normVec(Array.isArray(spec.axis) && spec.axis.length === 3 ? spec.axis.map(Number) : [0, 0, 1])
+  const offset = Number.isFinite(Number(spec.offset)) ? Number(spec.offset) : 0
+  if (type === 'flush' && Math.abs(offset) > 1e-9) {
+    throw new Error('flush 是「贴住」，offset 必须为 0（要留缝用 distance）')
+  }
+  const side = Number(spec.side) === -1 ? -1 : 1
+  const id = typeof spec.id === 'string' && spec.id.trim() ? spec.id.trim() : `mate-${(record.mates?.length ?? 0) + 1}`
+  return { id, type, a, b, axis, offset, side }
+}
+
 function normalizeJoint(record, spec) {
   const inst = record.base.find((b) => b.name === spec.instance)
   if (!inst) throw new Error(`装配里没有这个实例：${spec.instance}`)
@@ -488,12 +530,59 @@ function resolveParams(value, vars, where) {
   return value
 }
 
+/** Projection range of an AABB along a unit axis (handles negative components). */
+function projRange(box, axis) {
+  let lo = 0
+  let hi = 0
+  for (let k = 0; k < 3; k += 1) {
+    const a = axis[k]
+    lo += a > 0 ? box.mn[k] * a : box.mx[k] * a
+    hi += a > 0 ? box.mx[k] * a : box.mn[k] * a
+  }
+  return [lo, hi]
+}
+
+/** Per-instance placements after the mates, before joints and explode. */
+function solveMates(record) {
+  const out = new Map()
+  for (const base of record.base) out.set(base.name, { name: base.name, part: base.part, rot: base.rot.slice(), translate: base.translate.slice() })
+  for (const mate of record.mates ?? []) {
+    const moving = out.get(mate.a)
+    const fixed = out.get(mate.b)
+    if (!moving || !fixed) continue
+    const axis = normVec(mate.axis ?? [0, 0, 1])
+    const offset = Number.isFinite(Number(mate.offset)) ? Number(mate.offset) : 0
+    const boxB = worldBox(record.parts, out.get(mate.b))
+    const boxA = worldBox(record.parts, moving)
+    if (!boxA || !boxB) continue
+    if (mate.type === 'concentric') {
+      // Perpendicular drift to zero, axial distance to `offset`: the two axes
+      // end up collinear. Keep the moving part's own orientation — a mate moves
+      // it, it does not re-aim it.
+      const ca = scaleVec(addVec(boxA.mn, boxA.mx), 0.5)
+      const cb = scaleVec(addVec(boxB.mn, boxB.mx), 0.5)
+      const want = addVec(cb, scaleVec(axis, offset))
+      moving.translate = addVec(moving.translate, subVec(want, ca))
+    } else {
+      // flush / distance: face-to-face gap along the axis equals `offset`.
+      const ra = projRange(boxA, axis)
+      const rb = projRange(boxB, axis)
+      const side = mate.side === -1 ? -1 : 1
+      const shift = side > 0 ? (rb[1] + offset) - ra[0] : (rb[0] - offset) - ra[1]
+      moving.translate = addVec(moving.translate, scaleVec(axis, shift))
+    }
+  }
+  return out
+}
+
 /** Base placements + joints + explode → a scene payload ready to publish. */
 function assembleScene(record) {
   const explode = record.explode ?? 0
+  const placed = solveMates(record)
   const instances = record.base.map((base) => {
-    let rot = base.rot.slice()
-    let translate = base.translate.slice()
+    const start = placed.get(base.name) ?? base
+    let rot = start.rot.slice()
+    let translate = start.translate.slice()
     for (const joint of record.joints) {
       if (joint.instance !== base.name) continue
       const axis = normVec(joint.axis)
@@ -657,6 +746,7 @@ class FreeCadBridge {
         base: a.base,
         center: a.center,
         joints: a.joints.map((j) => ({ id: j.id, instance: j.instance, type: j.type, value: j.value, min: j.min, max: j.max, axis: j.axis, origin: j.origin })),
+        mates: a.mates ?? [],
         explode: a.explode,
       })),
     }
@@ -862,6 +952,7 @@ class FreeCadBridge {
       })),
       center: bboxCenterOfInstances(scene.parts, scene.instances),
       joints: joints ?? [],
+      mates: [],
       explode: 0,
     }
     this.assemblies.set(id, record)
@@ -874,6 +965,24 @@ class FreeCadBridge {
     if (existing) Object.assign(existing, value)
     else record.joints.push(value)
     return value
+  }
+
+  /** Add or replace one mate; returns the stored spec. */
+  setMate(record, spec) {
+    const value = normalizeMate(record, spec)
+    record.mates = Array.isArray(record.mates) ? record.mates : []
+    const existing = record.mates.find((m) => m.id === value.id)
+    if (existing) Object.assign(existing, value)
+    else record.mates.push(value)
+    return value
+  }
+
+  removeMate(record, id) {
+    const list = record.mates ?? []
+    const at = list.findIndex((m) => m.id === id)
+    if (at < 0) return null
+    const [gone] = list.splice(at, 1)
+    return gone
   }
 
   driveJoint(record, jointId, rawValue) {
@@ -895,7 +1004,12 @@ class FreeCadBridge {
 
   // ---- 装配层撤销：关节值 / 关节增删 / 爆炸系数 ----
   snapshotAssembly(record) {
-    return { id: record.id, joints: JSON.parse(JSON.stringify(record.joints ?? [])), explode: record.explode ?? 0 }
+    return {
+      id: record.id,
+      joints: JSON.parse(JSON.stringify(record.joints ?? [])),
+      mates: JSON.parse(JSON.stringify(record.mates ?? [])),
+      explode: record.explode ?? 0,
+    }
   }
 
   beginAssemblyEdit(record, label) {
@@ -3329,6 +3443,74 @@ if _TARGET:
         joint: moved.id,
         instance: moved.instance,
         value: round6(moved.value),
+        instances: published.stats.instances,
+        volume: round6(published.stats.volume),
+      }
+    },
+  })
+
+  tool({
+    name: 'cad_studio_mate',
+    description: 'Place an assembly instance against another with a mate: concentric (axes collinear, axial distance = offset), flush (faces touch), or distance (faces `offset` apart along the axis). A mate is solved once per republish and then holds — it is not a driven joint. Use cad_studio_drive for the moving degrees of freedom.',
+    parameters: {
+      type: 'object',
+      properties: {
+        assembly: { type: 'string' },
+        action: { type: 'string', enum: ['set', 'list', 'remove'], description: 'Default: set.' },
+        id: { type: 'string', description: 'Mate id (remove / replace). Default: mate-<n>.' },
+        type: { type: 'string', enum: ['concentric', 'flush', 'distance'] },
+        a: { type: 'string', description: 'Instance name that moves.' },
+        b: { type: 'string', description: 'Instance name that stays put.' },
+        axis: { type: 'array', items: { type: 'number' }, description: 'Mate axis. Default [0,0,1].' },
+        offset: { type: 'number', description: 'mm: axial distance (concentric) or face gap (distance). flush requires 0.' },
+        side: { type: 'number', description: '+1 puts `a` on the positive side of `b` (default), -1 the negative side.' },
+      },
+      additionalProperties: false,
+    },
+    output: {
+      schema: { type: 'object', properties: { ok: { type: 'boolean' }, sceneId: { type: 'string' } } },
+      render: (_a, v) => [{ type: 'text', text: JSON.stringify(v, null, 2) }],
+    },
+    execute: async ({ assembly, action, id, type, a, b, axis, offset, side }) => {
+      let record
+      try {
+        record = findAssembly(assembly)
+      } catch (error) {
+        return { ok: false, error: String(error?.message ?? error) }
+      }
+      const list = () => (record.mates ?? []).map((m) => ({ ...m, axis: m.axis.map(round6) }))
+      const want = action ?? 'set'
+      if (want === 'list') {
+        return { ok: true, assembly: record.id, sceneId: record.sceneId, mates: list(), instances: record.base.map((x) => x.name) }
+      }
+      if (want === 'remove') {
+        const target = String(id ?? '')
+        const edit = bridge.beginAssemblyEdit(record, `mate remove ${target}`)
+        const gone = bridge.removeMate(record, target)
+        if (!gone) {
+          const have = (record.mates ?? []).map((m) => m.id).join(', ') || '（没有）'
+          return { ok: false, error: `没有这个约束：${target}（现有 ${have}）` }
+        }
+        const published = await bridge.republishAssembly(record)
+        bridge.endAssemblyEdit(edit, record)
+        return { ok: true, assembly: record.id, sceneId: published.id, removed: gone.id, mates: list(), instances: published.stats.instances }
+      }
+      let value
+      try {
+        value = normalizeMate(record, { id, type, a, b, axis, offset, side })
+      } catch (error) {
+        return { ok: false, error: String(error?.message ?? error) }
+      }
+      const edit = bridge.beginAssemblyEdit(record, `mate ${value.type} ${value.a}→${value.b}`)
+      bridge.setMate(record, value)
+      const published = await bridge.republishAssembly(record)
+      bridge.endAssemblyEdit(edit, record)
+      return {
+        ok: true,
+        assembly: record.id,
+        sceneId: published.id,
+        mate: { ...value, axis: value.axis.map(round6) },
+        mates: list(),
         instances: published.stats.instances,
         volume: round6(published.stats.volume),
       }

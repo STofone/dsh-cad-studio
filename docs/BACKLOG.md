@@ -21,7 +21,7 @@
 - [ ] 11. 展开图 DXF（钣金式平铺）
 
 ## P3 装配
-- [ ] 12. mate 约束求解（同心 / 贴合 / 距离），不只有关节
+- [x] 12. mate 约束求解 `cad_studio_mate`（concentric 轴心+轴向距离 / flush 贴合 / distance 面距；按顺序解算，一次求解后固定，与关节驱动分开）
 - [ ] 13. 依赖 UI（Show dependencies 面板）与 relink
 
 ## P4 系统

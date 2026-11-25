@@ -1264,6 +1264,70 @@ endsolid t
   ok('journal: undoing the restored create removed the model file', !existsSync(`/workspace/cad-models/${name}.json`), 'dir=/workspace/cad-models')
 }
 
+// ---- 7k. mates: 装配约束求解 -------------------------------------------
+{
+  const dir = tmpdir()
+  const part = `${dir}/mate_box.step`
+  const madePart = await call('cad_studio_export', { target: part, code: 'scene = Part.makeBox(20, 20, 20)' })
+  ok('mate: 20 mm cube exported', madePart.ok === true, JSON.stringify({ bytes: madePart.bytes }))
+  const asm = await call('cad_studio_assembly', {
+    parts: [{ name: 'cube', path: part }],
+    instances: [
+      { name: 'base', part: 'cube', at: [0, 0, 0] },
+      { name: 'a', part: 'cube', at: [50, 7, 3] },
+      { name: 'b', part: 'cube', at: [0, 0, 40] },
+    ],
+    title: 'harness_mates',
+  })
+  ok('mate: three instances published', asm.ok === true && asm.instances === 3, JSON.stringify({ ok: asm.ok }))
+  const box = (centre) => centre.map((c) => Math.round(c * 1000) / 1000)
+
+  // concentric: `a` must end up on the base cube's axis (centre x=y=10), axial
+  // distance 30 above it (base centre z=10 → a centre z=40).
+  const con = await call('cad_studio_mate', {
+    assembly: asm.assembly, a: 'a', b: 'base', type: 'concentric', axis: [0, 0, 1], offset: 30,
+  })
+  ok('mate: concentric accepted', con.ok === true, JSON.stringify(con).slice(0, 200))
+  let scene = JSON.parse((await hit(`/cad-studio/scene/${con.sceneId}`)).body)
+  const centreOf = (name) => {
+    const inst = scene.instances.find((i) => i.name === name)
+    const part = scene.parts.find((p) => p.id === inst.part)
+    const v = part.verts
+    const mn = [Infinity, Infinity, Infinity]; const mx = [-Infinity, -Infinity, -Infinity]
+    for (let i = 0; i + 2 < v.length; i += 3) {
+      for (let k = 0; k < 3; k += 1) { if (v[i + k] < mn[k]) mn[k] = v[i + k]; if (v[i + k] > mx[k]) mx[k] = v[i + k] }
+    }
+    const m = inst.rot // row-major
+    const t = inst.translate
+    // AABB of the rotated box: transform the 8 corners.
+    const bmn = [Infinity, Infinity, Infinity]; const bmx = [-Infinity, -Infinity, -Infinity]
+    for (let i = 0; i < 8; i += 1) {
+      const p = [i & 1 ? mx[0] : mn[0], i & 2 ? mx[1] : mn[1], i & 4 ? mx[2] : mn[2]]
+      const w = [m[0] * p[0] + m[1] * p[1] + m[2] * p[2] + t[0], m[3] * p[0] + m[4] * p[1] + m[5] * p[2] + t[1], m[6] * p[0] + m[7] * p[1] + m[8] * p[2] + t[2]]
+      for (let k = 0; k < 3; k += 1) { if (w[k] < bmn[k]) bmn[k] = w[k]; if (w[k] > bmx[k]) bmx[k] = w[k] }
+    }
+    return { mn: bmn, mx: bmx, c: bmn.map((v2, k) => (v2 + bmx[k]) / 2) }
+  }
+  const ca = centreOf('a'); const cbase = centreOf('base')
+  ok('mate: 同心后 a 与 base 轴心对齐（x=y=10）', near(ca.c[0], 10, 1e-6) && near(ca.c[1], 10, 1e-6), JSON.stringify(ca.c))
+  ok('mate: 同心 offset=30 让 a 的中心落在 base 中心上方 30', near(ca.c[2] - cbase.c[2], 30, 1e-6), JSON.stringify([ca.c[2], cbase.c[2]]))
+
+  // distance: put `b` beside the base, 5 mm gap along +X.
+  const dst = await call('cad_studio_mate', { assembly: asm.assembly, a: 'b', b: 'base', type: 'distance', axis: [1, 0, 0], offset: 5 })
+  ok('mate: distance accepted', dst.ok === true, JSON.stringify(dst).slice(0, 200))
+  scene = JSON.parse((await hit(`/cad-studio/scene/${dst.sceneId}`)).body)
+  const cb = centreOf('b')
+  ok('mate: distance 5 后 b 与 base 沿 X 的间隙是 5', near(cb.mn[0] - cbase.mx[0], 5, 1e-6), JSON.stringify([cb.mn[0], cbase.mx[0]]))
+
+  ok('mate: list 返回两条约束', Array.isArray(dst.mates) && dst.mates.length === 2, JSON.stringify(dst.mates))
+  const rm = await call('cad_studio_mate', { assembly: asm.assembly, action: 'remove', id: 'mate-1' })
+  ok('mate: remove 后只剩一条', rm.ok === true && rm.mates.length === 1, JSON.stringify(rm.mates))
+  const bad = await call('cad_studio_mate', { assembly: asm.assembly, a: 'a', b: 'nope', type: 'concentric' })
+  ok('mate: 未知实例被拒绝', bad.ok === false && /没有这个实例/.test(String(bad.error)), String(bad.error))
+  const badFlush = await call('cad_studio_mate', { assembly: asm.assembly, a: 'a', b: 'base', type: 'flush', offset: 3 })
+  ok('mate: flush 带 offset 被拒绝（要留缝用 distance）', badFlush.ok === false && /flush/.test(String(badFlush.error)), String(badFlush.error))
+}
+
 // ---- 7c. sheet: 正式图纸（图框 + 三视图 + 尺寸） ----------------------
 {
   const target = join(tmpdir(), 'sheet_box.svg')
