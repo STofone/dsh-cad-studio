@@ -1212,6 +1212,10 @@ def _v3(x, d=(0.0, 0.0, 0.0)):
     return Vector(float(x[0]), float(x[1]), float(x[2]))
 
 def _dir(x, d=(0.0, 0.0, 1.0)):
+    # "X"/"Y"/"Z" are accepted everywhere a direction is expected, not just
+    # [x,y,z]: writing axis:'Y' is what a human means when revolving a sketch.
+    if isinstance(x, str) and x.strip().upper() in ("X", "Y", "Z"):
+        x = {"X": (1.0, 0.0, 0.0), "Y": (0.0, 1.0, 0.0), "Z": (0.0, 0.0, 1.0)}[x.strip().upper()]
     v = _v3(x, d)
     return v if v.Length > 1e-9 else _v3(d, (0.0, 0.0, 1.0))
 
@@ -1377,18 +1381,17 @@ def _prim(op, _cur=None):
         return body
     if k == "revolve":
         if op.get("sketch"):
+            # Measured on 0.20.2: a face revolved about an axis that LIES IN its
+            # plane gives a valid solid (ring: area x 2*pi*r_centroid); about an
+            # axis PERPENDICULAR to its plane it gives a zero-thickness annulus
+            # (Volume 0, isValid() still True). So the axis has to be explicit:
+            # guessing it silently would produce 0 mm3 instead of an error.
+            if op.get("axis") is None:
+                raise RuntimeError("草图旋转要显式给 axis：草图平面内的轴（如 'Y' 或 [0,1,0]）会扫出实体；垂直于草图平面的轴（XY 草图的 Z）扫出的是零厚度圆环")
             face = Part.Face(_sketch(str(op["sketch"])))
             rev = face.revolve(_v3(op.get("origin")), _dir(op.get("axis"), (0.0, 0.0, 1.0)), float(op.get("angle", 360.0)))
-            # A revolve of a face yields a shell; a full turn closes it, but only
-            # becomes a solid after we say so. Volume 0 means "still a shell".
-            if abs(rev.Volume) < 1e-9 and rev.Shells:
-                try:
-                    rev = Part.makeSolid(rev.Shells[0])
-                except Exception:
-                    pass
             if abs(rev.Volume) < 1e-9:
-                # Do not hand a zero-volume shell downstream: say it out loud.
-                raise RuntimeError("草图旋转得到的是壳体、没有闭合（需要 sewShape 缝合）；先用挤出，或把草图轮廓贴住旋转轴")
+                raise RuntimeError("草图旋转得到零体积：旋转轴垂直于草图平面（XY 草图 + Z 轴只会扫出零厚度圆环）。把 axis 换成草图平面内的轴，例如 axis:'Y'")
             return rev
         ps = [Vector(float(p[0]), 0.0, float(p[1])) for p in op["points"]]
         ang = float(op.get("angle", 360.0))
@@ -2371,6 +2374,79 @@ else:
 ${pair ? `    __out["distance"] = round((FreeCAD.Vector(${JSON.stringify(from)}) - FreeCAD.Vector(${JSON.stringify(to)})).Length, 3)` : ''}
 `
       return bridge.run(py, { title: 'measure', publishHint: false })
+    },
+  })
+
+  tool({
+    name: 'cad_studio_check',
+    description: 'Check a model before you export or print it: is it a valid solid, is every shell closed, how many solids/shells/faces, volume per solid, and a plain-language list of problems (零体积 / 外壳未闭合 / 几何无效 / 没有实体). Run this instead of trusting a file size.',
+    parameters: {
+      type: 'object',
+      properties: {
+        source: { type: 'string', description: 'Existing model file (STEP/IGES/BREP/STL).' },
+        code: { type: 'string', description: 'FreeCAD Python that binds `scene` or `export_shapes`.' },
+        minVolume: { type: 'number', description: 'Flag solids below this volume in mm3 as suspicious (default 0.001).' },
+      },
+      additionalProperties: false,
+    },
+    output: {
+      schema: { type: 'object', properties: { ok: { type: 'boolean' }, problems: { type: 'array', items: { type: 'string' } } } },
+      render: (_a, v) => [{ type: 'text', text: JSON.stringify(v, null, 2) }],
+    },
+    execute: async ({ source, code, minVolume }) => {
+      if (!source && !code) return { ok: false, error: 'pass either source (a model file) or code (FreeCAD Python)' }
+      const floor = Number.isFinite(minVolume) ? Number(minVolume) : 0.001
+      const src = shapesFrom({ source, code })
+      // Volume 0 with ShapeType "Solid" is a real failure mode on this kernel
+      // (lofting two faces, revolving about an axis perpendicular to the profile),
+      // so a file that opens and has faces can still be unprintable. Say it here.
+      const py = `${PRELUDE}
+${src}
+_problems = []
+_items = []
+if not _shapes:
+    _problems.append("没有实体：文件里读不出任何 shape")
+for _i, _s in enumerate(_shapes):
+    _vol = float(_s.Volume or 0.0)
+    _shells = list(_s.Shells)
+    _open = []
+    for _k, _sh in enumerate(_shells):
+        try:
+            if not _sh.isClosed():
+                _open.append(_k)
+        except Exception:
+            pass
+    _item = {
+        "index": _i,
+        "type": str(_s.ShapeType),
+        "volume": round(_vol, 3),
+        "area": round(float(_s.Area or 0.0), 3),
+        "solids": len(_s.Solids),
+        "shells": len(_shells),
+        "faces": len(_s.Faces),
+        "edges": len(_s.Edges),
+        "valid": bool(_s.isValid()),
+        "closed": not _open,
+    }
+    _items.append(_item)
+    _tag = "shape #%d" % _i
+    if abs(_vol) <= ${JSON.stringify(floor)}:
+        _problems.append("%s 体积为零（%.6f mm3）：面在，实体不在" % (_tag, _vol))
+    if not _item["valid"]:
+        _problems.append("%s 几何无效（OCC isValid=false），后续布尔/导出可能失败" % _tag)
+    if len(_s.Solids) == 0:
+        _problems.append("%s 没有实体（只有面/壳）" % _tag)
+    if _open:
+        _problems.append("%s 有 %d 个外壳未闭合：不是水密体，打印/布尔会漏" % (_tag, len(_open)))
+__out = {
+    "ok": len(_problems) == 0,
+    "checked": len(_items),
+    "volume": round(sum(float(x.Volume or 0.0) for x in _shapes), 3),
+    "problems": _problems,
+    "solids": _items,
+}
+`
+      return bridge.run(py, { title: 'check', publishHint: false })
     },
   })
 

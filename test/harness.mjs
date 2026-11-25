@@ -997,10 +997,16 @@ endsolid t
       { id: 'c7', type: 'horizontal', a: 'g3' }, { id: 'c8', type: 'vertical', a: 'g4' },
     ],
   }
-  const made = await call('cad_studio_feature', { ops: [{ kind: 'revolve', sketch: 'R1', origin: [0, 0, 0], axis: [0, 0, 1], angle: 360 }], sketches: { R1: ring } })
-  // annulus r=20..30, height 10 -> pi*(30^2-20^2)*10 = 15707.96
-  // 0.20 returns an open shell for this profile; we refuse to pass it on.
-  ok('sketch: revolved shell is rejected loudly instead of volume 0', made.ok === false && /shell|闭合|sew/i.test(String(made.error ?? '')), `ok=${made.ok} err=${String(made.error ?? '').slice(0, 100)}`)
+  // Profile 10x10 centred at x=25, revolved about the in-plane Y axis:
+  // area 100 x 2*pi*r(25) = 15707.96 mm3 (measured on 0.20.2).
+  const made = await call('cad_studio_feature', { ops: [{ kind: 'revolve', sketch: 'R1', origin: [0, 0, 0], axis: 'Y', angle: 360 }], sketches: { R1: ring } })
+  ok('sketch: revolve about an in-plane axis yields a solid', made.ok === true && near(made.volume ?? 0, 15707.96, 1), `ok=${made.ok} vol=${made.volume} err=${String(made.error ?? '').slice(0, 80)}`)
+
+  const perp = await call('cad_studio_feature', { ops: [{ kind: 'revolve', sketch: 'R1', origin: [0, 0, 0], axis: 'Z', angle: 360 }], sketches: { R1: ring } })
+  ok('sketch: perpendicular axis is refused instead of silently giving 0 mm3', perp.ok === false && /零体积|零厚度|平面内/.test(String(perp.error ?? '')), `ok=${perp.ok} err=${String(perp.error ?? '').slice(0, 100)}`)
+
+  const noAxis = await call('cad_studio_feature', { ops: [{ kind: 'revolve', sketch: 'R1', angle: 360 }], sketches: { R1: ring } })
+  ok('sketch: revolve demands an explicit axis', noAxis.ok === false && /显式给 axis/.test(String(noAxis.error ?? '')), `ok=${noAxis.ok} err=${String(noAxis.error ?? '').slice(0, 90)}`)
 }
 
 // ---- 7t. standard holes -------------------------------------------------
@@ -1078,6 +1084,52 @@ endsolid t
   ok('doc rename: undo brings the old name back', back.ok === true && afterUndo.includes(base) && !afterUndo.includes(next), JSON.stringify(back).slice(0, 120))
 
   for (const n of [base, copy, next]) { try { await call('cad_studio_doc', { action: 'delete', name: n }) } catch {} }
+}
+
+// ---- 7w2. groove by composition (cut + revolved profile) ----------------
+{
+  // A groove is not a separate op: cut a revolved profile out of a body. This
+  // pins the composition so a revolve regression cannot hide behind it.
+  const ring = {
+    geometry: [
+      { id: 'g1', type: 'line', p1: [20, 0, 0], p2: [32, 0, 0] },
+      { id: 'g2', type: 'line', p1: [32, 0, 0], p2: [32, 12, 0] },
+      { id: 'g3', type: 'line', p1: [32, 12, 0], p2: [20, 12, 0] },
+      { id: 'g4', type: 'line', p1: [20, 12, 0], p2: [20, 0, 0] },
+    ],
+    constraints: [
+      { id: 'c1', type: 'coincident', a: 'g1', pa: 2, b: 'g2', pb: 1 },
+      { id: 'c2', type: 'coincident', a: 'g2', pa: 2, b: 'g3', pb: 1 },
+      { id: 'c3', type: 'coincident', a: 'g3', pa: 2, b: 'g4', pb: 1 },
+      { id: 'c4', type: 'coincident', a: 'g4', pa: 2, b: 'g1', pb: 1 },
+      { id: 'c5', type: 'horizontal', a: 'g1' }, { id: 'c6', type: 'vertical', a: 'g2' },
+      { id: 'c7', type: 'horizontal', a: 'g3' }, { id: 'c8', type: 'vertical', a: 'g4' },
+    ],
+  }
+  const g = await call('cad_studio_feature', {
+    ops: [
+      { kind: 'cylinder', r: 30, h: 40 },
+      { kind: 'cut', with: { kind: 'revolve', sketch: 'G1', axis: 'Y', origin: [0, 0, 20], angle: 360 } },
+    ],
+    sketches: { G1: ring },
+  })
+  ok('groove: cutting a revolved profile removes material and stays valid', g.ok === true && (g.volume ?? 0) > 0 && (g.volume ?? 0) < Math.PI * 900 * 40, `ok=${g.ok} vol=${g.volume} err=${String(g.error ?? '').slice(0, 80)}`)
+}
+
+// ---- 7x. geometry self-check --------------------------------------------
+{
+  const chkDir = mkdtempSync(join(tmpdir(), 'cad-harness-chk-'))
+  const boxPath = join(chkDir, 'box.step')
+  await call('cad_studio_feature', { ops: [{ kind: 'box', size: [60, 40, 20] }], export: boxPath })
+  const good = await call('cad_studio_check', { source: boxPath })
+  ok('check: a clean box reports no problems', good.ok === true && (good.problems ?? []).length === 0 && near(good.volume ?? 0, 48000, 1), `ok=${good.ok} vol=${good.volume} p=${JSON.stringify(good.problems ?? []).slice(0, 120)}`)
+
+  // A lone face is a shape that opens fine but is not a solid: the check has to
+  // say so instead of letting it go to the printer.
+  const faceCode = "export_shapes = [Part.Face(Part.makePolygon([Vector(0,0,0), Vector(10,0,0), Vector(10,10,0), Vector(0,10,0), Vector(0,0,0)]))]"
+  const face = await call('cad_studio_check', { code: faceCode })
+  const faceText = (face.problems ?? []).join(' | ')
+  ok('check: a lone face is flagged as not a solid', face.ok === false && /没有实体/.test(faceText), `ok=${face.ok} p=${faceText.slice(0, 140)}`)
 }
 
 // ---- 8. teardown --------------------------------------------------------
