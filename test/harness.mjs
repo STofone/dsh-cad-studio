@@ -1054,6 +1054,32 @@ endsolid t
   ok('section: a plane outside the solid yields zero loops', miss.ok === true && miss.loops === 0 && miss.area === 0, `loops=${miss.loops} area=${miss.area}`)
 }
 
+// ---- 7w. rename / duplicate ---------------------------------------------
+{
+  const base = `harness_改名_${process.pid}`
+  const copy = `${base}_副本`
+  const next = `${base}_新`
+  for (const n of [base, copy, next]) { try { await call('cad_studio_doc', { action: 'delete', name: n }) } catch {} }
+  const made = await call('cad_studio_doc', { action: 'create', name: base, kind: 'features', features: [{ kind: 'box', size: [40, 30, 20] }] })
+  ok('doc rename: baseline model builds', made.ok === true && near(made.volume ?? 0, 24000, 1), `vol=${made.volume}`)
+
+  const dup = await call('cad_studio_doc', { action: 'duplicate', name: base, to: copy })
+  ok('doc duplicate: copy builds its own scene with the same volume', dup.ok === true && dup.copiedFrom === base && near(dup.volume ?? 0, 24000, 1), JSON.stringify(dup).slice(0, 160))
+
+  const ren = await call('cad_studio_doc', { action: 'rename', name: base, to: next })
+  ok('doc rename: renames in place', ren.ok === true && ren.renamed === true && ren.to === next, JSON.stringify(ren).slice(0, 140))
+
+  const list = await call('cad_studio_doc', { action: 'list' })
+  const names = (list.items ?? []).map((i) => i.name)
+  ok('doc rename: list shows the new name only', names.includes(next) && !names.includes(base), names.join(','))
+
+  const back = await call('cad_studio_undo', { scope: 'auto' })
+  const afterUndo = (await call('cad_studio_doc', { action: 'list' })).items.map((i) => i.name)
+  ok('doc rename: undo brings the old name back', back.ok === true && afterUndo.includes(base) && !afterUndo.includes(next), JSON.stringify(back).slice(0, 120))
+
+  for (const n of [base, copy, next]) { try { await call('cad_studio_doc', { action: 'delete', name: n }) } catch {} }
+}
+
 // ---- 8. teardown --------------------------------------------------------
 for (const d of disposed.reverse()) { try { d() } catch (e) { console.log('  [dispose warn]', e.message) } }
 ok('all tools unregistered on dispose', tools.size === 0, [...tools.keys()].join(','))

@@ -3176,13 +3176,14 @@ if _TARGET:
     parameters: {
       type: 'object',
       properties: {
-        action: { type: 'string', enum: ['list', 'show', 'create', 'update', 'revert', 'delete'], description: 'list / show / create / update / revert / delete' },
+        action: { type: 'string', enum: ['list', 'show', 'create', 'update', 'revert', 'delete', 'rename', 'duplicate'], description: 'list / show / create / update / revert / delete / rename / duplicate' },
         name: { type: 'string', description: 'Model name (中英文/数字/下划线/连字符).' },
         script: { type: 'string', description: 'FreeCAD Python source; reads params from `P`, binds the result to `scene`. Required for create unless kind is "features".' },
         kind: { type: 'string', enum: ['script', 'features'], description: 'script (default): a Python script + params. features: a declarative feature list you can edit one feature at a time (see cad_studio_features).' },
         features: { type: 'array', items: { type: 'object' }, description: 'For kind="features": the initial feature list, each {kind, label?, params?} (flat params such as {kind:"box", size:[60,40,20]} also work).' },
         params: { type: 'object', description: 'Parameter dict. On update these are merged into the existing params (set a key to null to delete it).' },
         note: { type: 'string', description: 'What this revision changed (kept in history).' },
+        to: { type: 'string', description: 'For action=rename / duplicate: the new model name.' },
         export: { type: 'string', description: 'Also write the model out as STEP at this path (create / update / show). Saves the caller from re-implementing the feature emitter.' },
       },
       required: ['action'],
@@ -3587,6 +3588,78 @@ __out = {"ok": True, "exported": ${JSON.stringify(target)}, "volume": round(scen
         })
         await unlink(file).catch(() => { throw new Error(`没有这个模型：${key}`) })
         return { ok: true, name: key, deleted: true, dir }
+      }
+
+      if (action === 'rename') {
+        const key = checkName(args.name)
+        const to = checkName(args.to ?? args.newName)
+        if (to === key) return { ok: true, name: key, renamed: false, dir }
+        const from = modelFile(key, dir)
+        const dest = modelFile(to, dir)
+        const existing = await readModel(key, dir).catch(() => { throw new Error(`没有这个模型：${key}`) })
+        try { await readModel(to, dir); throw new Error(`目标名字已被占用：${to}`) } catch (err) { if (/已被占用/.test(String(err.message))) throw err }
+        // The name lives inside the JSON too, so rewrite the document under the
+        // new name instead of copying bytes: a byte copy would keep `name: old`
+        // inside the file and the model list would keep showing the old name.
+        const bytes = await readFile(from)
+        existing.name = to
+        await writeModel(existing, dir)
+        await unlink(from).catch(() => {})
+        const doc = await readModel(to, dir)
+        const row = bridge.history.find((h) => h.docKey === `model:${key}` || h.title === key)
+        if (row) {
+          row.title = to
+          if (row.docKey) row.docKey = `model:${to}`
+          await bridge.persist()
+        }
+        const restore = async (target, other) => {
+          const r = bridge.history.find((h) => h.docKey === `model:${other}` || h.title === other)
+          if (r) { r.title = target; if (r.docKey) r.docKey = `model:${target}`; await bridge.persist() }
+        }
+        bridge.journal({
+          kind: 'doc',
+          label: `rename ${key} → ${to}`,
+          undo: async () => {
+            const back = await readModel(to, dir)
+            back.name = key
+            await writeModel(back, dir)
+            await unlink(dest).catch(() => {})
+            await restore(key, to)
+            return { model: key }
+          },
+          redo: async () => {
+            const fwd = await readModel(key, dir)
+            fwd.name = to
+            await writeModel(fwd, dir)
+            await unlink(from).catch(() => {})
+            await restore(to, key)
+            return { model: to }
+          },
+        })
+        return { ok: true, name: key, to, renamed: true, kind: doc.kind, dir }
+      }
+
+      if (action === 'duplicate') {
+        const key = checkName(args.name)
+        const to = checkName(args.to ?? args.newName)
+        if (to === key) throw new Error('复制到自己：to 必须与 name 不同')
+        const bytes = await readFile(modelFile(key, dir)).catch(() => { throw new Error(`没有这个模型：${key}`) })
+        try { await readModel(to, dir); throw new Error(`目标名字已被占用：${to}`) } catch (err) { if (/已被占用/.test(String(err.message))) throw err }
+        await writeFile(modelFile(to, dir), bytes)
+        const doc = await readModel(to, dir)
+        // A copy starts its own line: no run history, no scene pointer, and no
+        // undo stack borrowed from the original.
+        doc.name = to
+        doc.run = 0
+        doc.history = []
+        doc.createdAt = new Date().toISOString()
+        doc.stats = {}
+        delete doc.undo
+        delete doc.redo
+        const result = await rebuild(doc, dir, { note: `duplicate of ${key}` })
+        if (result.ok === false) return result
+        await journalDocCreate(to, dir, result)
+        return { ...result, name: to, kind: doc.kind, copiedFrom: key, ...(doc.kind === 'features' ? { features: publicFeatures(doc) } : {}) }
       }
 
       throw new Error(`未知 action：${action}`)
