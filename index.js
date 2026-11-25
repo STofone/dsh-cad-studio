@@ -3621,6 +3621,40 @@ else:
   })
 
   tool({
+    name: 'cad_studio_changes',
+    description: 'The change ledger of one model: who changed what, when (会话 / 面板 / 外部). Every write — through a tool or through the panel — bumps a revision and appends one readable row. Tool results already carry a digest of what you missed ("自你上次之后，面板改了 N 处"); call this when you want the whole history, e.g. before rewriting a feature a human may have just edited.',
+    parameters: {
+      type: 'object',
+      properties: {
+        model: { type: 'string', description: '模型名' },
+        limit: { type: 'number', description: '最近几条（默认 20，最多 60）' },
+      },
+      required: ['model'],
+      additionalProperties: false,
+    },
+    output: {
+      schema: { type: 'object', properties: { ok: { type: 'boolean' }, model: { type: 'string' }, rev: { type: 'number' }, total: { type: 'number' } } },
+      render: (_args, value) => [{ type: 'text', text: JSON.stringify(value, null, 2) }],
+    },
+    execute: async (args, exec) => {
+      try {
+        const dir = modelsDirFor(exec)
+        const doc = await readModel(args.model, dir)
+        const limit = Number.isFinite(args.limit) ? Math.max(1, Math.min(60, Math.round(args.limit))) : 20
+        return {
+          ok: true,
+          model: doc.name,
+          rev: Number(doc.rev) || 0,
+          total: doc.changes.length,
+          rows: changeRows(doc.changes.slice(-limit)),
+        }
+      } catch (error) {
+        return { ok: false, error: String(error?.message ?? error) }
+      }
+    },
+  })
+
+  tool({
     name: 'cad_studio_assembly',
     description: 'Assemble parts by file reference (STEP/IGES/BREP), publish the assembly to the panel, and optionally export it as one STEP. Each part file is read once; instances share the same geometry.',
     parameters: {
@@ -4113,6 +4147,12 @@ else:
     doc.tip = typeof doc.tip === 'string' && doc.tip ? doc.tip : null
     doc.undo = Array.isArray(doc.undo) ? doc.undo : []
     doc.redo = Array.isArray(doc.redo) ? doc.redo : []
+    // Change ledger: every write bumps `rev` and appends one readable row, and
+    // `seen` records how far each side (tool vs panel) has caught up. A human's
+    // edit is therefore visible to the agent on its very next tool result.
+    doc.rev = Number.isFinite(doc.rev) ? doc.rev : 0
+    doc.changes = Array.isArray(doc.changes) ? doc.changes : []
+    doc.seen = doc.seen && typeof doc.seen === 'object' && !Array.isArray(doc.seen) ? doc.seen : {}
     for (const f of doc.features) {
       if (!f || typeof f !== 'object') continue
       if (typeof f.suppressed === 'boolean') f.enabled = f.suppressed !== true
@@ -4134,6 +4174,67 @@ else:
     const body = JSON.stringify(doc, null, 2)
     await writeFile(modelFile(doc.name, dir), body, 'utf8')
     return doc
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* Change ledger — who changed what, so the other side finds out.      */
+  /* ------------------------------------------------------------------ */
+
+  /** Spoken in the reader's language: a person reads 面板, the agent 会话. */
+  const CHANGE_BY = { agent: '会话', panel: '面板', external: '外部' }
+
+  /** Append one row and bump the revision; callers write the file after this. */
+  const recordChange = (doc, { by, kind, detail }) => {
+    const who = CHANGE_BY[by] ? by : 'agent'
+    // A freshly built document object never went through readModel, so the
+    // ledger fields may not exist yet.
+    if (!Array.isArray(doc.changes)) doc.changes = []
+    if (!doc.seen || typeof doc.seen !== 'object') doc.seen = {}
+    doc.rev = (Number(doc.rev) || 0) + 1
+    doc.changes.push({
+      rev: doc.rev,
+      at: new Date().toISOString(),
+      by: who,
+      kind: String(kind),
+      detail: String(detail || kind).slice(0, 240),
+    })
+    if (doc.changes.length > 60) doc.changes.splice(0, doc.changes.length - 60)
+    return doc.changes[doc.changes.length - 1]
+  }
+
+  /** Rows the given side has not caught up with — never its own. */
+  const pendingChanges = (doc, by) => {
+    const seen = Number((doc.seen || {})[by] ?? 0)
+    return (doc.changes || []).filter((c) => c.rev > seen && c.by !== by)
+  }
+
+  /** One line a human can read, so the digest means something without a lookup. */
+  const changeRows = (rows) => rows.map((c) => ({
+    rev: c.rev,
+    at: c.at,
+    by: CHANGE_BY[c.by] ?? c.by,
+    kind: c.kind,
+    detail: c.detail,
+  }))
+
+  /**
+   * Attach "what you missed" to a tool result and mark the caller caught up.
+   * This rides on the result the agent was going to read anyway, so a human
+   * edit reaches it before its next write — no extra round trip and no
+   * message injection into the session.
+   */
+  const withChanges = async (doc, by, out, dir) => {
+    const pending = pendingChanges(doc, by)
+    const rows = changeRows(pending)
+    const digest = { rev: Number(doc.rev) || 0, pending: rows.length, rows }
+    if (rows.length) {
+      const first = rows[0]
+      digest.hint = `自你上次看到这个模型后，${first.by}改了 ${rows.length} 处：${first.detail}${rows.length > 1 ? ' 等' : ''}。先看清楚再动，别把人的改动覆盖掉。`
+      doc.seen = doc.seen && typeof doc.seen === 'object' ? doc.seen : {}
+      doc.seen[by] = doc.rev
+      try { await writeModel(doc, dir) } catch {}
+    }
+    return { ...out, changes: digest }
   }
 
   /** Public view of a feature list: what the panel renders as editable rows. */
@@ -4599,6 +4700,8 @@ else:
 
   const runFeatureAction = async (args, dir) => {
     bridge.noteModelsDir(dir)
+    // Same contract as runDocAction: the entry point states who is writing.
+    const by = args.by === 'panel' ? 'panel' : 'agent'
     const action = String(args.action ?? 'list')
     const doc = await readModel(args.model, dir)
     if (doc.kind !== 'features') {
@@ -4629,8 +4732,9 @@ else:
       doc.history = Array.isArray(doc.history) ? doc.history : []
       doc.history.push({ at: new Date().toISOString(), note: `sketch ${name}`, params: null, run: result.ok !== false })
       doc.history = doc.history.slice(-20)
+      recordChange(doc, { by, kind: 'feature.sketch', detail: `${raw.remove ? '删除' : '改'}草图 ${name}` })
       await writeModel(doc, dir)
-      return {
+      return await withChanges(doc, by, {
         ok: true,
         evaluated: result.ok !== false && (result.errors ?? []).length === 0,
         model: doc.name,
@@ -4651,7 +4755,7 @@ else:
         cached: result.cached ?? 0,
         computed: result.computed ?? null,
         revalidated: result.revalidated === true,
-      }
+      }, dir)
     }
 
     const snapshot = () => JSON.parse(JSON.stringify({ features: doc.features, tip: doc.tip ?? null }))
@@ -4723,14 +4827,16 @@ else:
       // lives in evaluated/errors/graph. A reorder can legitimately leave the
       // tree unevaluable (a fillet moved above its body) and that must stay
       // visible rather than being rejected — you fix it by reading the graph.
-      return {
+      recordChange(doc, { by, kind: `feature.${action}`, detail: `${label}（求值失败）` })
+      await writeModel(doc, dir)
+      return await withChanges(doc, by, {
         ...result,
         ok: true,
         saved: true,
         evaluated: false,
         features: publicFeatures(doc),
         hint: '这条改动已存进文档，但求值失败——看 graph 里哪条是 failed，改好或撤销。',
-      }
+      }, dir)
     }
     if (!['undo', 'redo'].includes(action)) {
       doc.undo.push({ at: new Date().toISOString(), action, target: wanted || feature.kind || '', before: undoSnap, after: snapshot() })
@@ -4746,8 +4852,9 @@ else:
       prev: { script: doc.script, params: JSON.parse(JSON.stringify(doc.params)), features: before },
     })
     doc.history = doc.history.slice(-20)
+    recordChange(doc, { by, kind: `feature.${action}`, detail: label })
     await writeModel(doc, dir)
-    return {
+    return await withChanges(doc, by, {
       ok: true,
       evaluated: result.ok !== false && (result.errors ?? []).length === 0,
       model: doc.name,
@@ -4767,7 +4874,7 @@ else:
       cached: result.cached ?? doc.stats?.cached ?? 0,
       computed: result.computed ?? null,
       revalidated: result.revalidated === true,
-    }
+    }, dir)
   }
 
   tool({
@@ -4842,8 +4949,26 @@ __out = {"ok": True, "exported": ${JSON.stringify(target)}, "volume": round(scen
     return { ok: true, model: doc.name, path: target, bytes, valid: bytes > 200, volume: out.volume ?? null }
   }
 
+  /** One readable sentence per doc write, e.g. "改参数 高 从 20 到 30". */
+  const describeDocUpdate = (args, doc) => {
+    const parts = []
+    if (args.params && typeof args.params === 'object') {
+      const keys = Object.keys(args.params)
+      if (keys.length) parts.push(`改参数 ${keys.slice(0, 4).join('、')}${keys.length > 4 ? ` 等 ${keys.length} 个` : ''}`)
+    }
+    if (Array.isArray(args.features)) parts.push(`整体重写特征列表（${args.features.length} 条）`)
+    if (args.sketches) parts.push(`改草图 ${Object.keys(args.sketches).slice(0, 3).join('、')}`)
+    if (args.vars) parts.push('改变量')
+    if (typeof args.script === 'string' && args.script.trim()) parts.push('改脚本')
+    if (!parts.length) parts.push('更新模型')
+    return parts.join('；')
+  }
+
   async function runDocAction(args, dir) {
       bridge.noteModelsDir(dir)
+      // Who is writing. The panel's HTTP routes say so; a tool call is the agent.
+      // Never inferred from the payload shape — the same function serves both.
+      const by = args.by === 'panel' ? 'panel' : 'agent'
       const action = String(args.action ?? '')
       if (action === 'list') {
         await mkdir(dir, { recursive: true })
@@ -4861,7 +4986,7 @@ __out = {"ok": True, "exported": ${JSON.stringify(target)}, "volume": round(scen
 
       if (action === 'show') {
         const doc = await readModel(args.name, dir)
-        return {
+        return await withChanges(doc, by, {
           ok: true,
           name: doc.name,
           kind: doc.kind,
@@ -4872,7 +4997,7 @@ __out = {"ok": True, "exported": ${JSON.stringify(target)}, "volume": round(scen
           updatedAt: doc.updatedAt ?? '',
           stats: doc.stats ?? null,
           history: doc.history.slice(-10).map((h) => ({ at: h.at, note: h.note ?? '', params: h.params })),
-        }
+        }, dir)
       }
 
       if (action === 'create') {
@@ -4908,9 +5033,10 @@ __out = {"ok": True, "exported": ${JSON.stringify(target)}, "volume": round(scen
           const result = await rebuild(doc, dir, { note: args.note ?? 'create' })
           if (result.ok === false) return result
           doc.history.push({ at: doc.updatedAt, note: args.note ?? 'create', params: JSON.parse(JSON.stringify(doc.params)), features: JSON.parse(JSON.stringify(doc.features)), run: doc.run })
+          recordChange(doc, { by, kind: 'doc.create', detail: `新建特征模型，${doc.features.length} 个特征` })
           await writeModel(doc, dir)
           await journalDocCreate(key, dir, result)
-          return { ...result, kind: 'features', features: publicFeatures(doc) }
+          return await withChanges(doc, by, { ...result, kind: 'features', features: publicFeatures(doc) }, dir)
         }
         const doc = {
           name: key,
@@ -4924,6 +5050,7 @@ __out = {"ok": True, "exported": ${JSON.stringify(target)}, "volume": round(scen
         const result = await rebuild(doc, dir, { note: args.note ?? 'create' })
         if (result.ok === false) return result
         doc.history.push({ at: doc.updatedAt, note: args.note ?? 'create', params: JSON.parse(JSON.stringify(doc.params)), run: doc.run })
+        recordChange(doc, { by, kind: 'doc.create', detail: `新建${doc.kind === 'features' ? '特征模型' : '脚本模型'}，${doc.features?.length ?? 0} 个特征` })
         await writeModel(doc, dir)
         await journalDocCreate(key, dir, result)
         return result
@@ -4962,8 +5089,9 @@ __out = {"ok": True, "exported": ${JSON.stringify(target)}, "volume": round(scen
         }
         doc.history.push({ at: doc.updatedAt, note: args.note ?? 'update', params: JSON.parse(JSON.stringify(doc.params)), features: JSON.parse(JSON.stringify(doc.features)), run: doc.run, prev: before })
         doc.history = doc.history.slice(-20)
+        recordChange(doc, { by, kind: 'doc.update', detail: describeDocUpdate(args, doc) })
         await writeModel(doc, dir)
-        return { ...result, kind: doc.kind, ...(doc.kind === 'features' ? { features: publicFeatures(doc) } : {}) }
+        return await withChanges(doc, by, { ...result, kind: doc.kind, ...(doc.kind === 'features' ? { features: publicFeatures(doc) } : {}) }, dir)
       }
 
       if (action === 'revert') {
@@ -4978,8 +5106,9 @@ __out = {"ok": True, "exported": ${JSON.stringify(target)}, "volume": round(scen
           doc.params = last.params
         }
         const result = await rebuild(doc, dir, { note: `revert to ${last.at}` })
+        recordChange(doc, { by, kind: 'doc.revert', detail: `回退到 ${last.note ?? '上一版'}（${String(last.at).slice(11, 19)}）` })
         await writeModel(doc, dir)
-        return result
+        return await withChanges(doc, by, result, dir)
       }
 
       if (action === 'delete') {
@@ -5121,6 +5250,35 @@ __out = {"ok": True, "exported": ${JSON.stringify(target)}, "volume": round(scen
           return send(200, JSON.stringify({ runtime, setup, diag, config: { autoOpen: resolved.autoOpen }, latest: null, lastSession: '', running: bridge.running || 0, runningSession: bridge.runningSession || '' }))
         }
       }
+      if (url.pathname === `${ROUTE_PREFIX}/changes`) {
+        // The panel's own copy of the ledger, so a person can see what the agent
+        // did in their absence — the mirror image of the digest the agent gets.
+        try {
+          const u = new URL(url, 'http://127.0.0.1')
+          const model = String(u.searchParams.get('model') || '').trim()
+          if (!model) return send(400, JSON.stringify({ ok: false, error: 'model required' }))
+          if (!bridge.modelsSeen.length) {
+            try {
+              const pointer = JSON.parse(await readFile(join(dir, 'state.json'), 'utf8'))
+              if (typeof pointer.modelsDir === 'string' && pointer.modelsDir) bridge.noteModelsDir(pointer.modelsDir)
+              if (Array.isArray(pointer.modelsDirs)) pointer.modelsDirs.forEach((d) => bridge.noteModelsDir(d))
+            } catch {}
+          }
+          const candidates = resolved.modelsDir ? [resolved.modelsDir, ...bridge.modelsCandidates()] : bridge.modelsCandidates()
+          const modelsDir = candidates.find((d) => existsSync(join(d, `${model}.json`))) || candidates[0]
+          if (!modelsDir) return send(404, JSON.stringify({ ok: false, error: 'no models dir' }))
+          const doc = await readModel(model, modelsDir)
+          return send(200, JSON.stringify({
+            ok: true,
+            model: doc.name,
+            rev: Number(doc.rev) || 0,
+            rows: changeRows(doc.changes.slice(-20)),
+          }))
+        } catch (error) {
+          return send(200, JSON.stringify({ ok: false, error: String(error?.message ?? error) }))
+        }
+      }
+
       if (url.pathname === `${ROUTE_PREFIX}/scenes`) {
         // Model switcher feed: the persisted history is the truth, so a stale
         // route closure left by a hot reload still lists what is on disk.
@@ -5214,7 +5372,7 @@ __out = {"ok": True, "exported": ${JSON.stringify(target)}, "volume": round(scen
           }
           const candidates = resolved.modelsDir ? [resolved.modelsDir, ...bridge.modelsCandidates()] : bridge.modelsCandidates()
           const modelsDir = candidates.find((d) => existsSync(join(d, `${body.model}.json`))) || candidates[0] || modelsDirFor(undefined)
-          const out = await runDocAction({ action: 'update', name: body.model, params: body.params ?? {} }, modelsDir)
+          const out = await runDocAction({ action: 'update', name: body.model, params: body.params ?? {}, by: 'panel' }, modelsDir)
           const entry = out && out.sceneId ? bridge.history.find((h) => h.id === out.sceneId) : null
           return send(200, JSON.stringify(entry ? { ...out, at: entry.at } : out))
         } catch (error) {
@@ -5243,7 +5401,7 @@ __out = {"ok": True, "exported": ${JSON.stringify(target)}, "volume": round(scen
           // actually holds this model (several workspaces may each have one).
           const candidates = resolved.modelsDir ? [resolved.modelsDir, ...bridge.modelsCandidates()] : bridge.modelsCandidates()
           const modelsDir = candidates.find((d) => existsSync(join(d, `${body.model}.json`))) || candidates[0] || modelsDirFor(undefined)
-          const result = await runFeatureAction(body, modelsDir)
+          const result = await runFeatureAction({ ...body, by: 'panel' }, modelsDir)
           // Tell the panel when the model was republished, so its poller can
           // recognise the in-place update it triggered itself.
           const entry = result && result.sceneId ? bridge.history.find((h) => h.id === result.sceneId) : null

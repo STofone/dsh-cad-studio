@@ -1850,6 +1850,7 @@ const FILE_EXTS = ['step', 'stp', 'iges', 'igs', 'brep', 'stl']
       const [deps, setDeps] = useState(null)
       const [relinkFor, setRelinkFor] = useState({})
       const [relinkNote, setRelinkNote] = useState('')
+      const [ledger, setLedger] = useState(null)
       // Which document sketch is expanded in the 草图 section.
       const [openSketch, setOpenSketch] = useState('')
       const featTimer = useRef(null)
@@ -1908,11 +1909,22 @@ const FILE_EXTS = ['step', 'stp', 'iges', 'igs', 'brep', 'stl']
         rememberView(tabKey, payloadRef.current)
         showScene(scene, { keepView: true, tabKey })
       }
+      // Change ledger: what the agent (and the person themselves) changed, so
+      // neither side edits blind. Fetched with the deps when the drawer opens.
+      const modelName = payload && String(payload.docKey || '').startsWith('model:') ? String(payload.docKey).slice(6) : ''
+      const loadChanges = async () => {
+        if (!modelName) return setLedger(null)
+        try {
+          const res = await fetch(`${ROUTE}/changes?model=${encodeURIComponent(modelName)}`, { headers: { accept: 'application/json' } })
+          if (res.ok) setLedger(await res.json())
+        } catch {}
+      }
       const loadDeps = async () => {
         try {
           const res = await fetch(`${ROUTE}/deps`, { headers: { accept: 'application/json' } })
           if (res.ok) setDeps(await res.json())
         } catch {}
+        loadChanges()
       }
       const doRelink = async (assembly, part) => {
         const path = (relinkFor[part] ?? '').trim()
@@ -2966,6 +2978,26 @@ const FILE_EXTS = ['step', 'stp', 'iges', 'igs', 'brep', 'stl']
                 ] : payload && payload.docKey && String(payload.docKey).startsWith('model:')
                   ? [h('div', { key: 'deps-na', style: { ...styles.treeHint, whiteSpace: 'normal', paddingTop: 6 } }, '这个模型是特征建的，没有外部文件依赖')]
                   : []),
+                ...(ledger && Array.isArray(ledger.rows) && ledger.rows.length ? [
+                  h('div', { key: 'ledger-head', style: { ...styles.infoRow, marginTop: 6 } }, [
+                    h('span', { key: 'k', style: styles.infoKey }, '改动记录'),
+                    h('span', { key: 'v', style: { ...styles.infoVal, opacity: 0.75 } }, `第 ${ledger.rev} 版`),
+                  ]),
+                  ...ledger.rows.slice().reverse().map((row) => h('div', {
+                    key: `chg-${row.rev}`,
+                    style: { display: 'flex', flexDirection: 'column', gap: 1, padding: '4px 0', borderTop: '1px solid rgba(127,127,127,.16)' },
+                    'data-cad-change': row.rev,
+                    'data-cad-change-by': row.by,
+                    title: `${row.at} · ${row.kind}`,
+                  }, [
+                    h('div', { key: 'head', style: { display: 'flex', gap: 6, alignItems: 'baseline', fontSize: 10.5 } }, [
+                      h('span', { key: 'who', style: { ...styles.infoKey, flex: '0 0 auto', color: row.by === '会话' ? '#4d6bfe' : undefined } }, row.by),
+                      h('span', { key: 'gap', style: { flex: 1 } }, ''),
+                      h('span', { key: 'at', style: { ...styles.infoVal, flex: '0 0 auto', opacity: 0.5 } }, String(row.at || '').slice(11, 16)),
+                    ]),
+                    h('div', { key: 'what', style: { fontSize: 10.5, opacity: 0.85, whiteSpace: 'normal', wordBreak: 'break-word' } }, row.detail),
+                  ])),
+                ] : []),
               ]
               : null
 

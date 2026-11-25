@@ -4,7 +4,7 @@ DeepSeek Harness 的 CAD 插件：**把 FreeCAD 桥接成给 AI 用的工具**�
 
 ![CAD 工作室面板](https://raw.githubusercontent.com/STofone/dsh-cad-studio/main/docs/preview.png)
 
-- Host 侧（`index.js`）：18 个工具 + `/cad-studio/*` HTTP 路由 + `freecadcmd` 子进程桥
+- Host 侧（`index.js`）：19 个工具 + `/cad-studio/*` HTTP 路由 + `freecadcmd` 子进程桥
 - 客户端侧（`client.js`）：右栏页签「CAD 工作室」，three.js 视口 + 图标条浮层（零件 / 特征 / 选中项 / 运动 / 视图 / 模型 / 信息）
 - 数据：`<modelsDir>/<名字>.json` 存模型工程（脚本或声明式特征 + 参数 + 20 条历史）；场景网格落 `$TMPDIR/dsh-cad-studio/{state.json,scenes/*.json}`
 
@@ -26,6 +26,7 @@ DeepSeek Harness 的 CAD 插件：**把 FreeCAD 桥接成给 AI 用的工具**�
 | 几何自检 | `cad_studio_check {source}` 在导出/打印前问一次：是否有效实体、外壳是否闭合、每个实体体积多少，返回中文问题清单（零体积 / 外壳未闭合 / 几何无效 / 没有实体） |
 | 拔模挤出 | `{kind:"extrude", sketch:"S1", h:20, draft:3}` 按 3° 拔模：截面按 `h*tan(3°)` 偏移后 loft 成体，正角度内收、负角度外放 |
 | 展开图 | `cad_studio_unfold {source, target:"…/net.dxf"}` 把板类零件按共享边摊平成下料图（面片等距铺开，面积与模型一致；孔各自成环；圆柱/圆角等曲面报 `curvedSkipped` 而不是瞎编），可写 DXF 或 SVG |
+| 改动记录 | `cad_studio_changes {model}` 看谁改了什么（会话 / 面板 / 外部）；每次写都会涨 `rev` 并留一行，面板「信息」里也能看到。别的工具的结果里会顺带一句「自你上次之后，面板改了 N 处」，所以人手动改完，会话下一次动手之前就知道 |
 | 打印网格 | `cad_studio_mesh {source, target:"…/x.stl"}` 三角化 + 去重合并点/面、修形变、统一法向，可选 `fillHoles`、`targetSize`（减面）；回报修复前后的 facets/points，避免「导出成功但网格是碎的」 |
 | 旋转体与凹槽 | `revolve` 的 `axis` 取草图平面内的轴（`"Y"` 或 `[0,1,0]`）才是实体；垂直轴（XY 草图的 Z）只会扫出零厚度圆环，插件会直接报错。凹槽＝`{kind:"cut", with:{kind:"revolve", …}}`，不需要单独 op |
 | 面板改草图 | 特征抽屉里点「草图 N」展开：数值约束是可编辑输入框（`distance*`/`radius`/`angle` 按度），改完立刻重解并重建；解不出来就回滚并报错 |

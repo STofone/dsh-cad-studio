@@ -1522,6 +1522,47 @@ endsolid t
   ok('sheet: 换 A4 就换图幅', (await call('cad_studio_sheet', { target: join(tmpdir(), 'sheet_a4.svg'), code: 'scene = Part.makeBox(30, 20, 10)\n__out = {}', size: 'A4' })).sheet_mm[0] === 297, 'A4=297 wide')
 }
 
+// ---- 8. change ledger: the panel's edits reach the agent ----------------
+{
+  const name = 'harness-ledger'
+  await call('cad_studio_doc', {
+    action: 'create',
+    kind: 'features',
+    name,
+    features: [{ kind: 'box', label: '底座', size: [60, 40, 20] }],
+  })
+  const rows0 = await call('cad_studio_changes', { model: name })
+  ok('ledger: create is recorded as 会话', rows0.ok === true && rows0.rows.length === 1 && rows0.rows[0].by === '会话',
+    JSON.stringify(rows0.rows))
+  ok('ledger: revision starts at 1', rows0.rev === 1, String(rows0.rev))
+
+  // A human edits through the panel route — same function, different door.
+  const base = await call('cad_studio_features', { model: name, action: 'list' })
+  const baseId = base.features[0].id
+  const panel = await post('/cad-studio/feature', {
+    model: name,
+    action: 'update',
+    id: baseId,
+    feature: { kind: 'box', params: { size: [80, 40, 20] } },
+  })
+  const panelBody = JSON.parse(panel.body)
+  ok('ledger: panel route edits the model', panelBody.ok === true && near(panelBody.volume, 64000, 1), JSON.stringify({ ok: panelBody.ok, v: panelBody.volume }))
+
+  const rows1 = await call('cad_studio_changes', { model: name })
+  ok('ledger: panel edit is recorded as 面板', rows1.rows.length === 2 && rows1.rows[1].by === '面板' && /update/.test(rows1.rows[1].detail),
+    JSON.stringify(rows1.rows))
+
+  // The agent's next read carries the digest, then the cursor moves: one
+  // delivery, not a permanent nag.
+  const shown = await call('cad_studio_doc', { action: 'show', name })
+  ok('ledger: next agent read is told what the human changed',
+    shown.changes && shown.changes.pending === 1 && shown.changes.rows[0].by === '面板' && /先看清楚再动/.test(shown.changes.hint ?? ''),
+    JSON.stringify(shown.changes))
+  const again = await call('cad_studio_doc', { action: 'show', name })
+  ok('ledger: the digest is delivered once, not every call', again.changes && again.changes.pending === 0,
+    JSON.stringify(again.changes))
+}
+
 // ---- 8. teardown --------------------------------------------------------
 for (const d of disposed.reverse()) { try { d() } catch (e) { console.log('  [dispose warn]', e.message) } }
 ok('all tools unregistered on dispose', tools.size === 0, [...tools.keys()].join(','))
