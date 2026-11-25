@@ -1046,6 +1046,10 @@ endsolid t
   ok('section: area and perimeter of a 60x40 box', mid.ok === true && near(mid.area ?? 0, 2400, 0.5) && near(mid.perimeter ?? 0, 200, 0.5), `area=${mid.area} per=${mid.perimeter}`)
   ok('section: writes an SVG outline', mid.ok === true && existsSync(svg) && readFileSync(svg, 'utf8').includes('<svg'), `svg=${mid.svg}`)
 
+  const dxf = join(secDir, 'cut.dxf')
+  const asDxf = await call('cad_studio_section', { source: blk, axis: 'Z', at: 10, target: dxf })
+  ok('section: writes DXF when the target ends with .dxf', asDxf.ok === true && existsSync(dxf) && readFileSync(dxf, 'utf8').includes('SECTION'), `dxf=${asDxf.dxf} bytes=${existsSync(dxf) ? readFileSync(dxf).length : 0}`)
+
   const miss = await call('cad_studio_section', { source: blk, axis: 'Z', at: 500 })
   ok('section: a plane outside the solid yields zero loops', miss.ok === true && miss.loops === 0 && miss.area === 0, `loops=${miss.loops} area=${miss.area}`)
 }

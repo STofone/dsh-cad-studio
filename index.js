@@ -2406,6 +2406,7 @@ if not _shapes:
     __out = {"ok": False, "error": "nothing to section"}
 else:
     _loops = []
+    _wl = []
     _area = 0.0
     _per = 0.0
     for _s in _shapes:
@@ -2414,6 +2415,7 @@ else:
         except Exception as _e:
             _ws = []
         for _w in _ws:
+            _wl.append(_w)
             _pts = _w.discretize(Deflection=0.15)
             if len(_pts) < 3:
                 continue
@@ -2428,7 +2430,8 @@ else:
                 pass
     __out = {"ok": True, "axis": _AX, "at": _AT, "loops": len(_loops),
              "area": round(_area, 3), "perimeter": round(_per, 3)}
-    _svg = ${target ? JSON.stringify(String(target)) : 'None'}
+    _svg = ${target && !/\.dxf$/i.test(String(target)) ? JSON.stringify(String(target)) : 'None'}
+    _dxf = ${target && /\.dxf$/i.test(String(target)) ? JSON.stringify(String(target)) : 'None'}
     if _svg and _loops:
         # Project the 3D loop points to the plane's 2D coordinates.
         def _uv(_p, _ax):
@@ -2457,6 +2460,10 @@ else:
             _f.write("\\n".join(_parts))
         __out["svg"] = _svg
         __out["svg_size"] = [round(_w, 2), round(_h, 2)]
+    if _wl and _svg is None and _dxf:
+        import importDXF
+        importDXF.export([Part.makeCompound(_wl)], _dxf)
+        __out["dxf"] = _dxf
 `
       return bridge.run(py, { title: 'section', publishHint: false })
     },
