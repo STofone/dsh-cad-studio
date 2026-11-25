@@ -18,7 +18,7 @@ import { existsSync } from 'node:fs'
 import { mkdtemp, mkdir, readdir, readFile, rm, stat, unlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { fileURLToPath } from 'node:url'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 
 export const name = 'dsh-cad-studio'
 
@@ -331,6 +331,9 @@ class FreeCadBridge {
     this.latest = undefined
     this.seq = 0
     this.history = []
+    // Ids this process published since boot: a row that is neither here nor on
+    // disk was deleted on purpose and must not be resurrected by the next write.
+    this.touched = new Set()
     /** Assemblies keep their base placements so joints can re-place instances. */
     this.assemblies = new Map()
     this.assemblySeq = 0
@@ -398,6 +401,21 @@ class FreeCadBridge {
     for (const rec of this.assembleRecords(prevAssemblies).values()) {
       const n = Number(String(rec.id).replace(/\D+/g, ''))
       if (Number.isFinite(n)) this.assemblySeq = Math.max(this.assemblySeq, n)
+    }
+    // A row deleted from state.json (by hand or by another process) must stay
+    // deleted: without this, the next publish wrote the whole in-memory history
+    // back and undid the prune — which is exactly what the reviewer hit twice.
+    let diskIds = null
+    try {
+      const prev = JSON.parse(await readFile(join(dir, 'state.json'), 'utf8'))
+      diskIds = new Set((Array.isArray(prev.history) ? prev.history : []).map((h) => h.id))
+    } catch {}
+    if (diskIds) {
+      this.history = this.history.filter((h) => diskIds.has(h.id) || this.touched.has(h.id))
+      if (this.latest && !this.history.some((h) => h.id === this.latest.id)) {
+        const next = this.history[0]
+        this.latest = next ? { id: next.id, title: next.title, at: next.at, scene: this.scenes.get(next.id) ?? null } : null
+      }
     }
     const latest = this.latest
     if (latest) await writeFile(join(dir, 'scenes', `${latest.id}.json`), JSON.stringify(latest.scene), 'utf8')
@@ -523,6 +541,7 @@ class FreeCadBridge {
       volume,
       ...(docKey ? { docKey } : {}),
     }
+    this.touched.add(id)
     this.history = [stats, ...this.history.filter((h) => h.id !== id)].slice(0, 30)
     this.latest = { id, title, at: stats.at, scene }
     // Persist so a restarted process (and any stale route closure left by a
@@ -866,9 +885,15 @@ def _prim(op):
         return Part.makeTorus(float(op["r1"]), float(op["r2"]), at, _dir(op.get("axis")))
     if k == "extrude":
         base = float(op.get("base", 0.0))
-        h = float(op["h"])
-        ps = [Vector(float(p[0]), float(p[1]), base) for p in op["points"]]
-        return Part.Face(Part.makePolygon(ps + [ps[0]])).extrude(Vector(0.0, 0.0, h))
+        h = float(op.get("h", 0.0))
+# Points may be 2D (z = base) or 3D; dir replaces the +Z extrusion,
+        # which is what a chamfer prism or a slanted rib actually needs.
+        pts = [tuple(p) for p in op["points"]]
+        ps = [Vector(float(q[0]), float(q[1]), float(q[2]) if len(q) > 2 else base) for q in pts]
+        vec = _v3(op.get("dir"), (0.0, 0.0, h)) if op.get("dir") else Vector(0.0, 0.0, h)
+        if abs(vec.Length) < 1e-9:
+            raise RuntimeError("extrude 需要 h 或 dir（当前的挤出向量长度为 0）")
+        return Part.Face(Part.makePolygon(ps + [ps[0]])).extrude(vec)
     if k == "revolve":
         ps = [Vector(float(p[0]), 0.0, float(p[1])) for p in op["points"]]
         ang = float(op.get("angle", 360.0))
@@ -883,8 +908,14 @@ for _idx, _op in enumerate(_OPS):
             _s = _prim(_op)
             _shape = _s if _shape is None else _shape.fuse(_s)
         elif _k in ("fuse", "cut", "common"):
-            _s = _prim(_op["with"])
-            _shape = _shape.fuse(_s) if _k == "fuse" else (_shape.cut(_s) if _k == "cut" else _shape.common(_s))
+# A U-shaped wall is one feature, not two: with takes a list, and
+            # the tools are combined in order against the running shape.
+            _ws = _op["with"]
+            if not isinstance(_ws, (list, tuple)):
+                _ws = [_ws]
+            for _w in _ws:
+                _s = _prim(_w)
+                _shape = _shape.fuse(_s) if _k == "fuse" else (_shape.cut(_s) if _k == "cut" else _shape.common(_s))
         elif _k == "fillet":
             _shape = _shape.makeFillet(float(_op["r"]), _shape.Edges)
         elif _k == "chamfer":
@@ -926,7 +957,10 @@ for _idx, _op in enumerate(_OPS):
         else:
             raise RuntimeError("未知特征：" + str(_k))
     except Exception as _e:
-        raise RuntimeError("第 %d 步（%s）失败：%s" % (_idx + 1, _k, _e))
+        # Name the feature, not just its position: "step 10 (cut) failed: 'with'"
+        # told the caller nothing about which row to fix.
+        raise RuntimeError("第 %d 步 · 特征 %s（%s，%s）失败：%s" % (
+            _idx + 1, _op.get("_id", "?"), _op.get("_label") or "-", _k, _e))
 
 if _shape is None:
     raise RuntimeError("ops 为空：至少给一个图元")
@@ -1427,6 +1461,7 @@ else:
         target: { type: 'string', description: 'Absolute output path; the extension picks the format (.step/.stp/.brep/.iges/.igs/.stl).' },
         source: { type: 'string', description: 'Existing model file to export (STEP/IGES/BREP/STL).' },
         code: { type: 'string', description: 'FreeCAD Python that produces the geometry; bind `scene` or `export_shapes`.' },
+        model: { type: 'string', description: 'Export a saved model document by name (feature or script model) instead of a file or a script.' },
         minVolume: { type: 'number', description: 'Drop solids smaller than this (mm³). Use it to keep round wires and dust out of a print file; the return says how many were filtered.' },
         alsoStl: { type: 'boolean', description: 'Also write an STL next to the target (a light file for viewers that do not read STEP).' },
       },
@@ -1437,8 +1472,16 @@ else:
       schema: { type: 'object', properties: { ok: { type: 'boolean' }, path: { type: 'string' }, bytes: { type: 'number' } } },
       render: (_a, v) => [{ type: 'text', text: JSON.stringify(v, null, 2) }],
     },
-    execute: async ({ target, source, code, minVolume, alsoStl }) => {
+    execute: async ({ target, source, code, model, minVolume, alsoStl }) => {
       if (!target || extOf(target) === '') return { ok: false, error: 'target must be an absolute path with an extension' }
+      if (typeof model === 'string' && model) {
+        const dirs = bridge.modelsCandidates()
+        const dir = dirs.find((d) => existsSync(join(d, `${model}.json`))) || dirs[0]
+        const doc = await readModel(model, dir)
+        bridge.noteModelsDir(dir)
+        const exported = await exportModelStep(doc, target)
+        return { ...exported, source: `model:${model}` }
+      }
       const src = shapesFrom({ source, code })
       if (!src) return { ok: false, error: 'pass either source (a model file) or code (FreeCAD Python)' }
       const out = await writeShapeFile(target, src, { minVolume, alsoStl })
@@ -1974,7 +2017,7 @@ if _TARGET:
   /** Feature objects to flat ops (`{kind, ...params}`) for the Python emitter. */
   const featureOps = (doc) => doc.features
     .filter((f) => f.enabled !== false)
-    .map((f) => ({ kind: f.kind, ...(f.params ?? {}) }))
+    .map((f) => ({ kind: f.kind, ...(f.params ?? {}), _id: f.id, _label: f.label || '' }))
 
   const FEATURE_FIELDS = ['id', 'kind', 'label', 'params', 'enabled']
 
@@ -1996,10 +2039,46 @@ if _TARGET:
       if (hit) maxId = Math.max(maxId, Number(hit[1]))
     }
     const id = /^f\d+$/.test(String(raw.id ?? '')) ? String(raw.id) : `f${maxId + 1}`
+    const label = String(raw.label ?? '').slice(0, 40)
+    // Validate here, not in FreeCAD: a missing `with` used to surface as
+    // "第 10 步（cut）失败：'with'" — a KeyError with no idea which row to fix.
+    const num = (v) => typeof v === 'number' && Number.isFinite(v)
+    const pos = (v) => num(v) && v > 0
+    const triple = (v) => Array.isArray(v) && v.length === 3 && v.every(num)
+    const where = `特征 ${id}${label ? `（${label}）` : ''} ${kind}`
+    const need = (cond, hint) => {
+      if (!cond) throw new Error(`${where}：${hint}`)
+    }
+    const tool = (v) => v && typeof v === 'object' && ['box', 'cylinder', 'sphere', 'cone', 'torus', 'extrude', 'revolve'].includes(String(v.kind))
+    const withs = params.with
+    if (kind === 'box') need(triple(params.size) && params.size.every(pos), '需要 size:[dx,dy,dz]（三个正数）')
+    else if (kind === 'cylinder') need(pos(params.r) && pos(params.h), '需要 r>0 与 h>0')
+    else if (kind === 'sphere') need(pos(params.r), '需要 r>0')
+    else if (kind === 'cone') need(num(params.r1) && num(params.r2) && pos(params.h), '需要 r1 / r2 / h>0')
+    else if (kind === 'torus') need(pos(params.r1) && pos(params.r2), '需要 r1>0（主半径）与 r2>0（管半径）')
+    else if (kind === 'extrude') {
+      const points = Array.isArray(params.points) ? params.points : []
+      need(points.length >= 3, '需要 points（至少 3 个 [x,y] 或 [x,y,z] 剖面点）')
+      need(points.every((q) => Array.isArray(q) && q.length >= 2 && q.slice(0, 3).every(num)), 'points 的每个点都要是数字数组')
+      need(pos(params.h) || triple(params.dir), '需要 h>0（沿 +Z 挤出）或 dir:[dx,dy,dz]（任意方向）')
+    } else if (kind === 'revolve') {
+      const points = Array.isArray(params.points) ? params.points : []
+      need(points.length >= 2, '需要 points（至少 2 个 [x,z] 剖面点）')
+    } else if (kind === 'fuse' || kind === 'cut' || kind === 'common') {
+      const list = Array.isArray(withs) ? withs : withs ? [withs] : []
+      need(list.length > 0, `需要 with 子图元（{kind:"box",size:[…]}，或用数组一次减/并多个）`)
+      need(list.every(tool), 'with 里的每一项都要是图元（box/cylinder/sphere/cone/torus/extrude/revolve），且带 kind')
+    } else if (kind === 'fillet') need(pos(params.r), '需要 r>0')
+    else if (kind === 'chamfer') need(pos(params.d), '需要 d>0')
+    else if (kind === 'shell') need(pos(params.t), '需要 t>0（壁厚）')
+    else if (kind === 'pattern_linear') need(triple(params.delta) && num(params.count) && params.count >= 2, '需要 delta:[dx,dy,dz] 与 count>=2')
+    else if (kind === 'pattern_circular') need(num(params.count) && params.count >= 2, '需要 count>=2')
+    else if (kind === 'translate') need(triple(params.v), '需要 v:[dx,dy,dz]')
+    else if (kind === 'rotate') need(num(params.deg), '需要 deg（角度）')
     return {
       id,
       kind,
-      label: String(raw.label ?? '').slice(0, 40),
+      label,
       params: JSON.parse(JSON.stringify(params)),
       enabled: raw.enabled !== false,
     }
@@ -2026,11 +2105,15 @@ if _TARGET:
       sceneId: doc.stats?.sceneId || '',
     })
     if (out.ok === false) return { ...out, name: doc.name, params: doc.params }
+    // run() returns volume/bounds but not triangle count, so read it back from
+    // the row that was just published (a null here forced the panel to guess).
+    const sceneId = out.sceneId ?? ''
+    const row = sceneId ? bridge.history.find((h) => h.id === sceneId) : null
     doc.stats = {
       volume: out.volume ?? null,
-      triangles: out.triangles ?? null,
+      triangles: row?.triangles ?? null,
       bounds: out.bounds ?? null,
-      sceneId: out.sceneId ?? '',
+      sceneId,
       at: doc.updatedAt,
     }
     if (note) doc.note = note
@@ -2062,6 +2145,7 @@ if _TARGET:
         features: { type: 'array', items: { type: 'object' }, description: 'For kind="features": the initial feature list, each {kind, label?, params?} (flat params such as {kind:"box", size:[60,40,20]} also work).' },
         params: { type: 'object', description: 'Parameter dict. On update these are merged into the existing params (set a key to null to delete it).' },
         note: { type: 'string', description: 'What this revision changed (kept in history).' },
+        export: { type: 'string', description: 'Also write the model out as STEP at this path (create / update / show). Saves the caller from re-implementing the feature emitter.' },
       },
       required: ['action'],
       additionalProperties: false,
@@ -2072,7 +2156,19 @@ if _TARGET:
     },
     execute: async (args, exec) => {
       try {
-        return await runDocAction(args, modelsDirFor(exec))
+        const dir = modelsDirFor(exec)
+        const out = await runDocAction(args, dir)
+        if (args && typeof args.export === 'string' && args.export && args.name) {
+          // A feature model is the source of truth; the STEP is a product. Do it
+          // here so the caller never has to copy the emitter to their side.
+          try {
+            const doc = await readModel(args.name, dir)
+            out.exported = await exportModelStep(doc, args.export)
+          } catch (error) {
+            out.exportError = String(error?.message ?? error)
+          }
+        }
+        return out
       } catch (err) {
         // Tool errors are data, not exceptions: the agent needs to read the
         // message and try something else, and a throw would also skip cleanup.
@@ -2191,6 +2287,32 @@ if _TARGET:
       }
     },
   })
+
+  /**
+   * Turn a model document into a STEP file without the caller re-implementing
+   * the emitter. A feature model runs its own `featuresScript` (which already
+   * knows how to export); a script model gets three extra lines appended.
+   */
+  async function exportModelStep(doc, target) {
+    if (typeof target !== 'string' || !target) throw new Error('export 需要目标路径，例如 /path/model.step')
+    await mkdir(dirname(target), { recursive: true })
+    const head = doc.kind === 'features'
+      ? featuresScript(featureOps(doc), target)
+      : `${PRELUDE}\nP = ${JSON.stringify(doc.params ?? {})}\n${doc.script}\n`
+    const code = doc.kind === 'features'
+      ? head
+      : `${head}import os as _os
+_os.makedirs(_os.path.dirname(${JSON.stringify(target)}) or ".", exist_ok=True)
+Part.makeCompound([scene]).exportStep(${JSON.stringify(target)})
+__out = {"ok": True, "exported": ${JSON.stringify(target)}, "volume": round(scene.Volume, 3),
+         "bytes": _os.path.getsize(${JSON.stringify(target)})}`
+    // publish:false — an export is a product, not a new row in the model list.
+    const out = await bridge.run(code, { title: `${doc.name} → STEP`, publish: false })
+    if (out.ok === false) return { ...out, model: doc.name, path: target }
+    let bytes = Number(out.bytes ?? 0)
+    try { bytes = (await stat(target)).size } catch {}
+    return { ok: true, model: doc.name, path: target, bytes, valid: bytes > 200, volume: out.volume ?? null }
+  }
 
   async function runDocAction(args, dir) {
       bridge.noteModelsDir(dir)

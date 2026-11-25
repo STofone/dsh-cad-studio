@@ -666,6 +666,68 @@ endsolid t
   ok('legacy list answers', legacy.ok === true && typeof legacy.documents === 'number', JSON.stringify({ docs: legacy.documents, dir: legacy.dir }))
 }
 
+// ---- 7n. second round of reviewer feedback ------------------------------
+// A feature model could only reach STEP by re-implementing the emitter; the
+// validation lived in FreeCAD and named a step number instead of the row; a
+// boolean took one tool; extrude only knew +Z; and a pruned row came back on
+// the next publish.
+{
+  const dir = mkdtempSync(join(tmpdir(), 'cad-harness-fb2-'))
+  const model = `fb_特征_${Date.now() % 100000}`
+  await call('cad_studio_doc', { action: 'delete', name: model }).catch(() => {})
+
+  const made = await call('cad_studio_doc', {
+    action: 'create',
+    name: model,
+    kind: 'features',
+    features: [
+      { kind: 'box', size: [160, 100, 12] },
+      { kind: 'cut', with: [{ kind: 'cylinder', r: 8, h: 40, at: [40, 50, -10] }, { kind: 'cylinder', r: 8, h: 40, at: [120, 50, -10] }] },
+    ],
+  })
+  ok('a boolean takes a list of tools', made.ok === true && near(made.volume, 160 * 100 * 12 - 2 * Math.PI * 64 * 12, 2), JSON.stringify({ volume: made.volume }))
+  ok('feature rebuild reports triangles', typeof made.triangles === 'number' && made.triangles > 0, JSON.stringify({ triangles: made.triangles }))
+
+  const stepFromModel = `${dir}/from-model.step`
+  const viaExport = await call('cad_studio_export', { target: stepFromModel, model })
+  ok('export accepts a model name', viaExport.ok === true && viaExport.valid === true, JSON.stringify({ bytes: viaExport.bytes, source: viaExport.source }))
+  const back = await call('cad_studio_open', { path: stepFromModel })
+  ok('the exported STEP carries the same volume', near(back.volume, made.volume, 2), JSON.stringify({ step: back.volume, model: made.volume }))
+
+  const stepFromDoc = `${dir}/from-doc.step`
+  const withExport = await call('cad_studio_doc', { action: 'show', name: model, export: stepFromDoc })
+  ok('doc export writes the STEP in one call', withExport.exported?.ok === true && withExport.exported.valid === true, JSON.stringify(withExport.exported))
+
+  // validation must name the row, before FreeCAD ever runs
+  const rejected = await call('cad_studio_doc', {
+    action: 'create',
+    name: `${model}_bad`,
+    kind: 'features',
+    features: [{ kind: 'box', size: [50, 50, 10] }, { kind: 'cut', label: '忘了 with' }],
+  })
+  const bad = String(rejected.error ?? '')
+  ok('a cut without with is rejected early', /f2/.test(bad) && /with/.test(bad), bad.slice(0, 160))
+  await call('cad_studio_doc', { action: 'delete', name: `${model}_bad` }).catch(() => {})
+
+  // extrude in an arbitrary direction, from 3D points
+  const prism = await call('cad_studio_feature', {
+    ops: [
+      { kind: 'extrude', points: [[0, 0, 0], [40, 0, 0], [0, 30, 0]], dir: [0, 0, 20] },
+    ],
+    title: 'prism probe',
+  })
+  ok('extrude honours dir', prism.ok === true && near(prism.volume, 0.5 * 40 * 30 * 20, 1), JSON.stringify({ volume: prism.volume }))
+
+  // a pruned row must stay pruned across the next publish
+  const first = await call('cad_studio_run', { code: 'import Part\nscene = Part.makeBox(9,9,9)', title: 'prune_probe_a' })
+  await call('cad_studio_scene', { action: 'delete', id: first.sceneId })
+  await call('cad_studio_run', { code: 'import Part\nscene = Part.makeBox(8,8,8)', title: 'prune_probe_b' })
+  const rows = (await call('cad_studio_scene', { action: 'list' })).items.map((r) => r.id)
+  ok('a deleted row is not resurrected by the next publish', rows.includes(first.sceneId) === false, JSON.stringify(rows.slice(0, 4)))
+
+  await call('cad_studio_doc', { action: 'delete', name: model }).catch(() => {})
+}
+
 // ---- 8. teardown --------------------------------------------------------
 for (const d of disposed.reverse()) { try { d() } catch (e) { console.log('  [dispose warn]', e.message) } }
 ok('all tools unregistered on dispose', tools.size === 0, [...tools.keys()].join(','))
