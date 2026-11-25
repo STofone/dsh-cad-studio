@@ -1248,6 +1248,7 @@ _SK_CONSTRAINT = {
     "tangent": ("Tangent", "pair"), "distance_x": ("DistanceX", "size"),
     "distance_y": ("DistanceY", "size"), "radius": ("Radius", "size_one"),
     "angle": ("Angle", "size_pair"), "distance": ("Distance", "ab2v"),
+    "equal": ("Equal", "pair"), "symmetric": ("Symmetric", "sym3"),
 }
 
 def _sketch(name):
@@ -1297,8 +1298,13 @@ def _sketch(name):
         elif form == "ab2v":
             sk.addConstraint(Sketcher.Constraint(fc, gi(c["a"]), int(c.get("pa", 1)), gi(c["b"]), int(c.get("pb", 2)), float(v)))
             dims.append((c, fc, (gi(c["a"]), int(c.get("pa", 1))), (gi(c["b"]), int(c.get("pb", 2))), float(v)))
+        elif form == "sym3":
+            sk.addConstraint(Sketcher.Constraint(fc, gi(c["a"]), int(c.get("pa", 1)), gi(c["b"]), int(c.get("pb", 1)), gi(c.get("c")), int(c.get("pc", 1))))
         else:
-            sk.addConstraint(Sketcher.Constraint(fc, gi(c["a"]), gi(c["b"]), float(v)))
+            # Angle is documented in degrees because that is what a human types;
+            # the solver wants radians.
+            _sent = math.radians(float(v)) if fc == "Angle" else float(v)
+            sk.addConstraint(Sketcher.Constraint(fc, gi(c["a"]), gi(c["b"]), _sent))
             dims.append((c, fc, (gi(c["a"]), None), (gi(c["b"]), None), float(v)))
     rc = sk.solve()
     if rc < 0:
@@ -1315,6 +1321,16 @@ def _sketch(name):
         elif fc in ("DistanceX", "DistanceY"):
             p = _pt(ref1)
             got = p.x if fc == "DistanceX" else p.y
+        elif fc == "Equal":
+            got = 1.0 if abs(sk.Geometry[ref1[0]].length() - sk.Geometry[ref2[0]].length()) <= 1e-6 else 0.0
+            want = 1.0
+        elif fc == "Angle":
+            _a = sk.Geometry[ref1[0]]
+            _b = sk.Geometry[ref2[0]]
+            _va = _a.EndPoint - _a.StartPoint
+            _vb = _b.EndPoint - _b.StartPoint
+            _cos = max(-1.0, min(1.0, _va.dot(_vb) / (_va.Length * _vb.Length)))
+            got = math.degrees(math.acos(_cos))
         else:
             continue
         if abs(got - want) > 1e-6:

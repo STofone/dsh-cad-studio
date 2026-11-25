@@ -1192,6 +1192,52 @@ endsolid t
   try { await call('cad_studio_doc', { action: 'delete', name: skName }) } catch {}
 }
 
+// ---- 7aa. equal / angle sketch constraints -------------------------------
+{
+  const pin = (id, pa, v) => ({ id, type: 'distance_x', a: 'g1', pa, value: v })
+  const square = {
+    geometry: [
+      { id: 'g1', type: 'line', p1: [0, 0, 0], p2: [80, 0, 0] },
+      { id: 'g2', type: 'line', p1: [80, 0, 0], p2: [80, 40, 0] },
+      { id: 'g3', type: 'line', p1: [80, 40, 0], p2: [0, 40, 0] },
+      { id: 'g4', type: 'line', p1: [0, 40, 0], p2: [0, 0, 0] },
+    ],
+    constraints: [
+      { id: 'c1', type: 'coincident', a: 'g1', pa: 2, b: 'g2', pb: 1 },
+      { id: 'c2', type: 'coincident', a: 'g2', pa: 2, b: 'g3', pb: 1 },
+      { id: 'c3', type: 'coincident', a: 'g3', pa: 2, b: 'g4', pb: 1 },
+      { id: 'c4', type: 'coincident', a: 'g4', pa: 2, b: 'g1', pb: 1 },
+      { id: 'c5', type: 'horizontal', a: 'g1' }, { id: 'c6', type: 'vertical', a: 'g2' },
+      { id: 'c7', type: 'horizontal', a: 'g3' }, { id: 'c8', type: 'vertical', a: 'g4' },
+      // g1 is pinned to x=0..50; equal(g1,g2) then forces the height to 50 too.
+      { id: 'c9', type: 'equal', a: 'g1', b: 'g2' },
+      pin('c10', 1, 0), pin('c11', 2, 50),
+    ],
+  }
+  const eq = await call('cad_studio_feature', { ops: [{ kind: 'extrude', sketch: 'E1', h: 10 }], sketches: { E1: square } })
+  ok('sketch equal: equal(g1,g2) plus a pinned side gives 50x50x10', eq.ok === true && near(eq.volume ?? 0, 25000, 1), `ok=${eq.ok} vol=${eq.volume} err=${String(eq.error ?? '').slice(0, 90)}`)
+
+  const tri = {
+    geometry: [
+      { id: 'g1', type: 'line', p1: [0, 0, 0], p2: [80, 0, 0] },
+      { id: 'g2', type: 'line', p1: [80, 0, 0], p2: [40, 60, 0] },
+      { id: 'g3', type: 'line', p1: [40, 60, 0], p2: [0, 0, 0] },
+    ],
+    constraints: [
+      { id: 't1', type: 'coincident', a: 'g1', pa: 2, b: 'g2', pb: 1 },
+      { id: 't2', type: 'coincident', a: 'g2', pa: 2, b: 'g3', pb: 1 },
+      { id: 't3', type: 'coincident', a: 'g3', pa: 2, b: 'g1', pb: 1 },
+      { id: 't4', type: 'horizontal', a: 'g1' },
+      // 60 deg is documented in degrees; the emitter converts and then re-measures
+      // the angle after solve, so a silent "solved but wrong" would fail here.
+      { id: 't5', type: 'angle', a: 'g1', b: 'g2', value: 60 },
+      pin('t6', 1, 0), pin('t7', 2, 80),
+    ],
+  }
+  const ang = await call('cad_studio_feature', { ops: [{ kind: 'extrude', sketch: 'T1', h: 10 }], sketches: { T1: tri } })
+  ok('sketch angle: 60 deg constraint solves and passes its own re-measure', ang.ok === true && (ang.volume ?? 0) > 0, `ok=${ang.ok} vol=${ang.volume} err=${String(ang.error ?? '').slice(0, 100)}`)
+}
+
 // ---- 8. teardown --------------------------------------------------------
 for (const d of disposed.reverse()) { try { d() } catch (e) { console.log('  [dispose warn]', e.message) } }
 ok('all tools unregistered on dispose', tools.size === 0, [...tools.keys()].join(','))
