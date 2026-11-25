@@ -1215,6 +1215,9 @@ __out = {
     },
     execute: async ({ action, id, title }) => {
       const kind = String(action ?? 'list')
+      // A fresh process starts with an empty in-memory list; the rows live in
+      // state.json until the next publish hydrates them.
+      await bridge.hydrateHistory()
       if (kind === 'list') {
         const rows = bridge.listSceneRows()
         return { ok: true, scenes: rows.length, latest: bridge.latest ? bridge.latest.id : '', items: rows }

@@ -2668,7 +2668,10 @@ const FILE_EXTS = ['step', 'stp', 'iges', 'igs', 'brep', 'stl']
         try {
           Object.defineProperty(window, '__cadStudioAutoOpen', {
             configurable: true,
-            get: () => ({ ...autoOpenTrace, mode: cadAutoOpen, session: panelSession }),
+            // `open()` is for tooling: it is how a screenshot script (or a user
+            // who closed the pane) brings the tab back without hunting for the
+            // host's own launcher.
+            get: () => ({ ...autoOpenTrace, mode: cadAutoOpen, session: panelSession, open: () => openPane(0) }),
           })
         } catch (err) { /* a stale definition from a previous apply is fine */ }
 

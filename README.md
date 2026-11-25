@@ -2,9 +2,9 @@
 
 DeepSeek Harness 的 CAD 插件：**把 FreeCAD 桥接成给 AI 用的工具**，并在 Web 右栏提供一个只读+轻交互的 3D 面板。
 
-![面板](docs/preview.png)
+![CAD 工作室面板](https://raw.githubusercontent.com/STofone/dsh-cad-studio/main/docs/preview.png)
 
-- Host 侧（`index.js`）：14 个工具 + `/cad-studio/*` HTTP 路由 + `freecadcmd` 子进程桥
+- Host 侧（`index.js`）：16 个工具 + `/cad-studio/*` HTTP 路由 + `freecadcmd` 子进程桥
 - 客户端侧（`client.js`）：右栏页签「CAD 工作室」，three.js 视口 + 图标条浮层（零件 / 特征 / 选中项 / 运动 / 视图 / 模型 / 信息）
 - 数据：`<modelsDir>/<名字>.json` 存模型工程（脚本或声明式特征 + 参数 + 20 条历史）；场景网格落 `$TMPDIR/dsh-cad-studio/{state.json,scenes/*.json}`
 
@@ -14,7 +14,7 @@ DeepSeek Harness 的 CAD 插件：**把 FreeCAD 桥接成给 AI 用的工具**�
 |---|---|
 | 建模 | `cad_studio_feature` 声明式特征（box/cylinder/sphere/cone/torus/extrude/revolve/fuse/cut/common/fillet/chamfer/shell/pattern/translate/rotate/mirror）；`cad_studio_run` 跑任意 FreeCAD Python |
 | 工程文件 | `cad_studio_doc` 存 `script` 或 `features` 两种模型；`cad_studio_features` 改一条特征→整表重算（0.2–0.6 s），失败整表回滚 |
-| 装配 | `cad_studio_assembly` 读 manifest，`App::Link` 语义的实例位姿；零件是 STEP 文件级引用（改零件重开即跟随） |
+| 装配 | `cad_studio_assembly` 读 manifest，`App::Link` 语义的实例位姿；零件是 STEP 文件级引用（改零件重开即跟随）；`measure:true` 回每实例体积/包围盒，`interference:true` 回真正重叠的实例对 |
 | 运动 | `cad_studio_joint`（revolute/linear）+ `cad_studio_drive` + `cad_studio_explode`，面板拖滑杆看运动 |
 | 出图 | `cad_studio_drawing` HLR → SVG（主/俯/左/等轴） |
 | 其它 | `cad_studio_open`（STEP/STL/BREP/IGES 进来看）、`cad_studio_export`、`cad_studio_measure`、`cad_studio_env` |
@@ -56,7 +56,7 @@ npm 包：<https://www.npmjs.com/package/dsh-cad-studio>（`dsh plugin` / DSH �
 
 `autoOpen: 'session'` 的判据是宿主侧的两个信号：这个会话最近一次发布过场景（`lastSession`），或它拥有更早发布过的场景。也就是说——只有真正在这里建过模的对话，右栏才会自动让出位置；别的对话不受打扰。
 
-## 两个容易踩的接口约定
+## 接口约定与踩过的坑
 
 - **导出只走 `cad_studio_export`**。在 `cad_studio_run` 里直接 `Part.export([compound], path)` 会写出一个 1.6 KB 的 STEP 壳子，读回来是空形状，而脚本本身不报错。要么用 `cad_studio_export`，要么给 `cad_studio_run` 传 `check: ["/path/out.step"]`——它会在跑完后把这个文件读回来，回报 `{bytes, solids, volume, valid}`，壳子会显示 `valid:false`。
 - **探查脚本别发布场景**。`cad_studio_run` 默认会把绑定的 `scene` 发布成面板里的一行；只是量体积/查干涉的脚本传 `publish: false`，否则模型列表会被探针卡片塞满（实测一次会话攒到 28 行）。已经混进去的用 `cad_studio_scene {action:"delete", id:"scene-12"}` 清。
@@ -66,6 +66,38 @@ npm 包：<https://www.npmjs.com/package/dsh-cad-studio>（`dsh plugin` / DSH �
 - **`extrude` 支持 3D 剖面点与 `dir`**：三角棱柱写 `{kind:"extrude", points:[[0,0,0],[40,0,0],[0,30,0]], dir:[0,0,20]}`，不用再拿 `base`/`h` 手算覆盖范围。
 - 特征参数在 `normalizeFeature` 阶段就校验，报错带行号与名字：`特征 f10（倒角_左后） cut：需要 with 子图元（…）`——不会再从 FreeCAD 里冒出一句 `第 10 步（cut）失败：'with'`。
 - 删掉的面板行不会被下一次发布「复活」：`persist()` 会跟磁盘对账，只保留磁盘上还有的、或本进程发布过的行。
+
+## 截图
+
+都来自一个**测试实例**（合成的 `体验_特征 / 体验_参数化 / 体验_装配` 三个演示模型），并且**只截取面板元素**——图里没有真实工作区、会话或文件路径。
+
+**装配 + 视口**：零件按实例配色，左侧图标条、页签、坐标轴、网格、等轴视图。
+
+![装配与视口](https://raw.githubusercontent.com/STofone/dsh-cad-studio/main/docs/preview.png)
+
+**选中项**：视口点选 ↔ 列表联动；改色、显隐、透明度、隔离、线框、副本同透明度、重置。
+
+![选中项](https://raw.githubusercontent.com/STofone/dsh-cad-studio/main/docs/props.png)
+
+**声明式特征**：一条特征一行，改数值即整表重算；眼睛跳过该步，↑↓ 调顺序，× 删除。
+
+![特征列表](https://raw.githubusercontent.com/STofone/dsh-cad-studio/main/docs/features.png)
+
+**参数化脚本**：改 `params` 就重跑脚本，原地更新同一个场景（不新增模型行）。
+
+![参数](https://raw.githubusercontent.com/STofone/dsh-cad-studio/main/docs/params.png)
+
+**关节与爆炸**：每个关节都有数值框（可精确输入 0°）、归零按钮和滑杆；爆炸图一个滑杆。
+
+![关节与爆炸](https://raw.githubusercontent.com/STofone/dsh-cad-studio/main/docs/motion.png)
+
+**多页签**：最多 5 个模型页签，各自记住相机与配色；`+` 新增页签，文件夹图标切换当前页签。
+
+![多页签](https://raw.githubusercontent.com/STofone/dsh-cad-studio/main/docs/tabs.png)
+
+图标条（4× 放大）：立方体=零件、台阶=特征、滑杆=选中项、环形箭头=运动、相机=视图、文件夹=模型、ⓘ=信息。
+
+<img src="https://raw.githubusercontent.com/STofone/dsh-cad-studio/main/docs/rail.png" width="58" alt="图标条">
 
 ## 场景 JSON 协议
 
@@ -84,11 +116,22 @@ npm 包：<https://www.npmjs.com/package/dsh-cad-studio>（`dsh plugin` / DSH �
 ## 开发
 
 ```bash
-node test/harness.mjs      # 133 条回归：无浏览器，stub cordis ctx 直接调工具
-node test/stale-bridge.mjs # 热重载后旧 bridge 实例自愈
+# 165 条回归：无浏览器，stub cordis ctx 直接调工具
+rm -rf /tmp/cad-h && mkdir -p /tmp/cad-h && TMPDIR=/tmp/cad-h node test/harness.mjs
+node test/stale-bridge.mjs   # 热重载后旧 bridge 实例自愈
+
+# 在一台测试实例上造三个"什么都能试"的模型（体验_特征 / 体验_参数化 / 体验_装配）
+node scripts/dev-playground.mjs
+# 把这条实例的模型列表收敛回这几个演示模型（探针跑多了会攒出几十行）
+node scripts/dev-keep-demos.mjs --dry     # 先看要删哪些
+node scripts/dev-keep-demos.mjs
+# 重截 README 的截图（只截 [data-cad-panel-root]，需要能访问测试实例）
+node scripts/shots.mjs --url http://127.0.0.1:3201 --token-file /tmp/dev-token.txt
 ```
 
-`test/replicate.mjs`、`scripts/*.mjs` 是我自己造场景/验证用的夹具，按需改路径。
+> `TMPDIR` 必须指到临时目录：harness 会清空 `$TMPDIR/dsh-cad-studio`，指到默认位置就会把线上实例的场景缓存一起删掉。
+
+`test/replicate.mjs`、`scripts/*.mjs` 是造场景/验证用的夹具，按需改路径。截图脚本用 `window.__cadStudioAutoOpen.open()` 打开面板——宿主的页签启动器在不同版本里位置会变，这个钩子稳定些。
 
 ## 已知限制
 
