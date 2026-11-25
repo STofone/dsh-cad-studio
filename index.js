@@ -184,6 +184,7 @@ function diagnose(bridge, cfg = {}) {
   }
 }
 
+const defined = (obj) => Object.fromEntries(Object.entries(obj).filter(([, v]) => v !== undefined))
 const renderUndo = (v) => {
   if (!v || v.ok === false) return `✗ ${v?.error ?? '没有可撤销的操作'}`
   if (v.scope === 'assembly') {
@@ -1764,7 +1765,7 @@ __out = {
       const scope = typeof args.scope === 'string' ? args.scope : 'auto'
       const kind = scope === 'auto' ? undefined : scope
       const undone = await bridge.undoSession(kind)
-      if (undone) return { ok: true, scope: undone.kind, undone: undone.label, assembly: undone.assembly, scene: undone.scene, model: undone.model, remaining: bridge.sessionUndo.length, redo: bridge.sessionRedo.length }
+      if (undone) return defined({ ok: true, scope: undone.kind, undone: undone.label, assembly: undone.assembly, scene: undone.scene, model: undone.model, remaining: bridge.sessionUndo.length, redo: bridge.sessionRedo.length })
       if (scope !== 'doc') return { ok: false, error: scope === 'assembly' ? '装配层没有可撤销的操作' : scope === 'scene' ? '场景列表没有可撤销的操作' : '没有可撤销的操作' }
       const target = typeof args.model === 'string' && args.model ? args.model : ''
       if (!target) return { ok: false, error: '文档撤销需要 model 名称（可用 cad_studio_doc list 查看）' }
@@ -1792,7 +1793,7 @@ __out = {
       const scope = typeof args.scope === 'string' ? args.scope : 'auto'
       const kindR = scope === 'auto' ? undefined : scope
       const redone = await bridge.redoSession(kindR)
-      if (redone) return { ok: true, scope: redone.kind, redone: redone.label, assembly: redone.assembly, scene: redone.scene, model: redone.model, remaining: bridge.sessionRedo.length, undo: bridge.sessionUndo.length }
+      if (redone) return defined({ ok: true, scope: redone.kind, redone: redone.label, assembly: redone.assembly, scene: redone.scene, model: redone.model, remaining: bridge.sessionRedo.length, undo: bridge.sessionUndo.length })
       if (scope !== 'doc') return { ok: false, error: scope === 'assembly' ? '装配层没有可重做的操作' : '没有可重做的操作' }
       const target = typeof args.model === 'string' && args.model ? args.model : ''
       if (!target) return { ok: false, error: '文档重做需要 model 名称' }
@@ -2501,9 +2502,11 @@ if _TARGET:
       }
       if (mode === 'remove') {
         const before = record.joints.length
-        record.joints = record.joints.filter((j) => j.id !== joint)
+        const editRm = bridge.beginAssemblyEdit(record, 'joint remove')
+        record.joints = record.joints.filter((j) => j.id !== joint && j !== joint)
         if (record.joints.length === before) return { ok: false, error: `没有这个关节：${joint ?? '(未指定)'}` }
         const published = await bridge.republishAssembly(record)
+        bridge.endAssemblyEdit(editRm, record)
         return { ok: true, assembly: record.id, removed: joint, sceneId: published.id, joints: record.joints.length }
       }
       const edit = bridge.beginAssemblyEdit(record, 'joint')
@@ -2978,6 +2981,33 @@ if _TARGET:
    * Every mutating action rebuilds the whole list (one FreeCAD run, ~0.2–0.6 s),
    * so the model can never be left half-edited — a failed edit is rolled back.
    */
+  /**
+   * Journal a document creation so "undo" removes it again (and the scene row it
+   * published). File bytes are captured after the write, so redo is a plain
+   * restore-and-rebuild — no need to replay the tool arguments.
+   */
+  const journalDocCreate = async (key, dir, result) => {
+    const file = modelFile(key, dir)
+    let bytes = null
+    try { bytes = await readFile(file) } catch { return }
+    const sceneRow = result?.sceneId ? bridge.history.find((h) => h.id === result.sceneId) : null
+    bridge.journal({
+      kind: 'doc',
+      label: `create ${key}`,
+      undo: async () => {
+        await unlink(file).catch(() => {})
+        if (sceneRow) { try { await bridge.removeScene(sceneRow.id, { journal: false }) } catch {} }
+        return { model: key }
+      },
+      redo: async () => {
+        await writeFile(file, bytes)
+        const doc = await readModel(key, dir)
+        try { await rebuild(doc, dir, { note: 'redo create' }) } catch {}
+        return { model: key }
+      },
+    })
+  }
+
   const runFeatureAction = async (args, dir) => {
     bridge.noteModelsDir(dir)
     const action = String(args.action ?? 'list')
@@ -3223,6 +3253,7 @@ __out = {"ok": True, "exported": ${JSON.stringify(target)}, "volume": round(scen
           if (result.ok === false) return result
           doc.history.push({ at: doc.updatedAt, note: args.note ?? 'create', params: JSON.parse(JSON.stringify(doc.params)), features: JSON.parse(JSON.stringify(doc.features)), run: doc.run })
           await writeModel(doc, dir)
+          await journalDocCreate(key, dir, result)
           return { ...result, kind: 'features', features: publicFeatures(doc) }
         }
         const doc = {
@@ -3238,6 +3269,7 @@ __out = {"ok": True, "exported": ${JSON.stringify(target)}, "volume": round(scen
         if (result.ok === false) return result
         doc.history.push({ at: doc.updatedAt, note: args.note ?? 'create', params: JSON.parse(JSON.stringify(doc.params)), run: doc.run })
         await writeModel(doc, dir)
+        await journalDocCreate(key, dir, result)
         return result
       }
 

@@ -906,6 +906,49 @@ endsolid t
   ok('a check that fails always carries a fix', (doc.checks || []).every((c) => !/^FAIL/.test(c) || /—/.test(c)), JSON.stringify(doc.checks))
 }
 
+// ---- undo journal: documents and assembly joints ------------------------
+{
+  const model = 'harness_建撤'
+  await call('cad_studio_doc', { action: 'delete', name: model }).catch(() => {})
+  const made = await call('cad_studio_doc', { action: 'create', name: model, kind: 'features', features: [{ kind: 'box', label: '板', size: [50, 40, 10] }] })
+  ok('journal: create ok', made.ok === true, JSON.stringify(made).slice(0, 120))
+  const undone = await call('cad_studio_undo', { scope: 'auto' })
+  ok('journal: undo removes a new model', undone.ok === true && undone.scope === 'doc', JSON.stringify(undone).slice(0, 140))
+  const gone = await call('cad_studio_doc', { action: 'show', name: model })
+  ok('journal: model is gone after undo', gone.ok === false, JSON.stringify(gone).slice(0, 120))
+  const redone = await call('cad_studio_redo', { scope: 'auto' })
+  const back = await call('cad_studio_doc', { action: 'show', name: model })
+  ok('journal: redo brings it back', redone.ok === true && back.ok === true, `redo=${redone.ok} back=${back.ok}`)
+  await call('cad_studio_doc', { action: 'delete', name: model }).catch(() => {})
+}
+
+{
+  const model = 'harness_删撤'
+  await call('cad_studio_doc', { action: 'delete', name: model }).catch(() => {})
+  await call('cad_studio_doc', { action: 'create', name: model, kind: 'features', features: [{ kind: 'box', label: '板', size: [40, 30, 8] }] })
+  const del = await call('cad_studio_doc', { action: 'delete', name: model })
+  const undone = await call('cad_studio_undo', { scope: 'auto' })
+  const back = await call('cad_studio_doc', { action: 'show', name: model })
+  ok('journal: undo restores a deleted model', del.ok === true && undone.ok === true && back.ok === true, `del=${del.ok} undo=${undone.ok} back=${back.ok}`)
+  await call('cad_studio_doc', { action: 'delete', name: model }).catch(() => {})
+}
+
+{
+  const jdir = mkdtempSync(join(tmpdir(), 'cad-harness-journal-'))
+  const jstep = `${jdir}/post.step`
+  await call('cad_studio_export', { target: jstep, code: 'import Part\nscene = Part.makeBox(20, 20, 100, FreeCAD.Vector(0, 0, 0))' })
+  const asm = await call('cad_studio_assembly', {
+    parts: [{ name: 'post', path: jstep }],
+    instances: [{ name: 'left', part: 'post', at: [0, 0, 0] }, { name: 'right', part: 'post', at: [120, 0, 0] }],
+    joints: [{ id: 'j1', instance: 'right', type: 'revolute', axis: [0, 0, 1], origin: [120, 0, 0], min: -90, max: 90, value: 20 }],
+  })
+  const rm = await call('cad_studio_joint', { assembly: asm.assembly, action: 'remove', joint: 'j1' })
+  const undone = await call('cad_studio_undo', { scope: 'assembly' })
+  const after = await call('cad_studio_joint', { assembly: asm.assembly, action: 'list' })
+  ok('journal: undo restores a removed joint', asm.ok === true && rm.ok === true && undone.ok === true && Array.isArray(after.joints) && after.joints.length === 1, `asm=${asm.ok} err=${asm.error ?? ''} rm=${rm.ok} undo=${undone.ok} joints=${after.joints?.length}`)
+}
+
+
 // ---- 8. teardown --------------------------------------------------------
 for (const d of disposed.reverse()) { try { d() } catch (e) { console.log('  [dispose warn]', e.message) } }
 ok('all tools unregistered on dispose', tools.size === 0, [...tools.keys()].join(','))
