@@ -23,6 +23,7 @@ DeepSeek Harness 的 CAD 插件：**把 FreeCAD 桥接成给 AI 用的工具**�
 | 几何自检 | `cad_studio_check {source}` 在导出/打印前问一次：是否有效实体、外壳是否闭合、每个实体体积多少，返回中文问题清单（零体积 / 外壳未闭合 / 几何无效 / 没有实体） |
 | 打印网格 | `cad_studio_mesh {source, target:"…/x.stl"}` 三角化 + 去重合并点/面、修形变、统一法向，可选 `fillHoles`、`targetSize`（减面）；回报修复前后的 facets/points，避免「导出成功但网格是碎的」 |
 | 旋转体与凹槽 | `revolve` 的 `axis` 取草图平面内的轴（`"Y"` 或 `[0,1,0]`）才是实体；垂直轴（XY 草图的 Z）只会扫出零厚度圆环，插件会直接报错。凹槽＝`{kind:"cut", with:{kind:"revolve", …}}`，不需要单独 op |
+| 草图 + 放样/扫掠 | 草图存在文档里（`cad_studio_doc {action:"create", kind:"features", sketches:{S1:{geometry:[…],constraints:[…]}}, features:[{kind:"extrude",sketch:"S1",h:10}]}`）；`loft` 用 `sections:[{sketch:"S1"},{sketch:"S2",at:[0,0,40]}]`，`sweep` 用 `path:[[x,y,z],…]`。改草图会重建（草图进了缓存哈希，不会命中旧 BREP） |
 | 特征 → STEP | `cad_studio_export {model:"名字", target:"…/x.step"}` 或 `cad_studio_doc {action:"show", name, export:"…/x.step"}`；特征列表是源，STEP 是产物，不用自己复刻发射器 |
 | 旧 dsh-cad 文档 | `cad_studio_legacy`（`action: list / show`）只读列出 `/app/.dsh-cad` 的文档、op 数与体数 |
 | 自检/安装 | `cad_studio_setup`：报告 freecadcmd 是否可用、版本、包管理器与可执行命令；`action=install` 直接装 |

@@ -1146,6 +1146,52 @@ endsolid t
   ok('mesh: targetSize decimates instead of ignoring the budget', d.ok === true && (d.facets ?? 99) <= 12 && d.decimated === true, `facets=${d.facets} dec=${d.decimated}`)
 }
 
+// ---- 7z. sketches in documents, loft, sweep ------------------------------
+{
+  const rectSketch = (w, h) => ({
+    geometry: [
+      { id: 'g1', type: 'line', p1: [0, 0, 0], p2: [w, 0, 0] },
+      { id: 'g2', type: 'line', p1: [w, 0, 0], p2: [w, h, 0] },
+      { id: 'g3', type: 'line', p1: [w, h, 0], p2: [0, h, 0] },
+      { id: 'g4', type: 'line', p1: [0, h, 0], p2: [0, 0, 0] },
+    ],
+    constraints: [
+      { id: 'c1', type: 'coincident', a: 'g1', pa: 2, b: 'g2', pb: 1 },
+      { id: 'c2', type: 'coincident', a: 'g2', pa: 2, b: 'g3', pb: 1 },
+      { id: 'c3', type: 'coincident', a: 'g3', pa: 2, b: 'g4', pb: 1 },
+      { id: 'c4', type: 'coincident', a: 'g4', pa: 2, b: 'g1', pb: 1 },
+      { id: 'c5', type: 'horizontal', a: 'g1' }, { id: 'c6', type: 'vertical', a: 'g2' },
+      { id: 'c7', type: 'horizontal', a: 'g3' }, { id: 'c8', type: 'vertical', a: 'g4' },
+    ],
+  })
+  const skName = `harness_草图_${process.pid}`
+  try { await call('cad_studio_doc', { action: 'delete', name: skName }) } catch {}
+  const made = await call('cad_studio_doc', {
+    action: 'create', name: skName, kind: 'features',
+    sketches: { S1: rectSketch(80, 40) },
+    features: [{ kind: 'extrude', sketch: 'S1', h: 10 }],
+  })
+  ok('document sketches: a stored sketch drives extrude', made.ok === true && near(made.volume ?? 0, 32000, 1), `ok=${made.ok} vol=${made.volume} err=${String(made.error ?? '').slice(0, 90)}`)
+
+  const wider = await call('cad_studio_doc', { action: 'update', name: skName, sketches: { S1: rectSketch(120, 40) } })
+  ok('document sketches: editing the sketch rebuilds the model', wider.ok === true && near(wider.volume ?? 0, 48000, 1), `ok=${wider.ok} vol=${wider.volume} err=${String(wider.error ?? '').slice(0, 90)}`)
+
+  const lofted = await call('cad_studio_feature', {
+    ops: [{ kind: 'loft', sections: [{ sketch: 'A' }, { sketch: 'B', at: [0, 0, 40] }] }],
+    sketches: { A: rectSketch(20, 20), B: rectSketch(20, 20) },
+  })
+  ok('loft: two sections 40 mm apart give a prism', lofted.ok === true && near(lofted.volume ?? 0, 16000, 2), `ok=${lofted.ok} vol=${lofted.volume} err=${String(lofted.error ?? '').slice(0, 90)}`)
+
+  const swept = await call('cad_studio_feature', {
+    ops: [{ kind: 'sweep', sketch: 'A', path: [[0, 0, 0], [0, 0, 30], [0, 30, 30], [0, 30, 60]] }],
+    sketches: { A: rectSketch(20, 20) },
+  })
+  // 400 mm2 profile along ~90 mm of path: corner rounding eats a few percent.
+  ok('sweep: a sketch profile follows the path', swept.ok === true && (swept.volume ?? 0) > 30000 && (swept.volume ?? 0) < 36000, `ok=${swept.ok} vol=${swept.volume} err=${String(swept.error ?? '').slice(0, 90)}`)
+
+  try { await call('cad_studio_doc', { action: 'delete', name: skName }) } catch {}
+}
+
 // ---- 8. teardown --------------------------------------------------------
 for (const d of disposed.reverse()) { try { d() } catch (e) { console.log('  [dispose warn]', e.message) } }
 ok('all tools unregistered on dispose', tools.size === 0, [...tools.keys()].join(','))

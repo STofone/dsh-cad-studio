@@ -1163,9 +1163,12 @@ const EMITTER_VERSION = 'e1'
 /** One hash per prefix: hashes[i] = ops[0..i] applied. Skip markers reuse the
  *  previous hash, so toggling a suppressed feature does not invalidate
  *  anything upstream of it. */
-function chainHashes(ops) {
+function chainHashes(ops, seed = '') {
   const out = []
-  let h = crypto.createHash('sha1').update(`cad-studio:${EMITTER_VERSION}`).digest('hex').slice(0, 16)
+  // `seed` carries everything the op list does not spell out — currently the
+  // document's sketches. Without it, editing a sketch leaves the chain hash
+  // unchanged and the BREP cache happily serves the old geometry.
+  let h = crypto.createHash('sha1').update(`cad-studio:${EMITTER_VERSION}`).update(String(seed)).digest('hex').slice(0, 16)
   for (const op of Array.isArray(ops) ? ops : []) {
     if (op && op.kind === '__skip__') { out.push(h); continue }
     const bare = { ...op }
@@ -1397,6 +1400,40 @@ def _prim(op, _cur=None):
         ps = [Vector(float(p[0]), 0.0, float(p[1])) for p in op["points"]]
         ang = float(op.get("angle", 360.0))
         return Part.Face(Part.makePolygon(ps + [ps[0]])).revolve(Vector(0.0, 0.0, 0.0), Vector(0.0, 0.0, 1.0), ang)
+    if k == "loft":
+        # Sections are sketches (or their wires) placed at different heights:
+        # lofting two coplanar wires is degenerate on this kernel (Volume 0),
+        # which is exactly what a mis-specified loft would look like.
+        _sections = op.get("sections")
+        if not isinstance(_sections, list) or len(_sections) < 2:
+            raise RuntimeError("loft 需要至少两个 sections，例如 [{\\\"sketch\\\":\\\"S1\\\"},{\\\"sketch\\\":\\\"S2\\\",\\\"at\\\":[0,0,40]}]")
+        _wires = []
+        for _sec in _sections:
+            _w = _sketch(str(_sec.get("sketch"))) if isinstance(_sec, dict) and _sec.get("sketch") else None
+            if _w is None:
+                raise RuntimeError("loft 的每个 section 都要有 sketch 名字")
+            _at = _v3(_sec.get("at"), (0.0, 0.0, 0.0))
+            if _at.Length > 1e-9:
+                _w = _w.translated(_at)
+            _wires.append(_w)
+        _lofted = Part.makeLoft(_wires, True)
+        if abs(_lofted.Volume) < 1e-9 and len(_wires) > 1:
+            _z = [round(w.BoundBox.ZMin, 3) for w in _wires]
+            raise RuntimeError("loft 得到零体积：所有截面在同一平面上（z=%s）。给 section 加 at:[0,0,z] 把它们分层" % str(_z))
+        return _lofted
+    if k == "sweep":
+        _prof = _sketch(str(op["sketch"])) if op.get("sketch") else None
+        if _prof is None:
+            raise RuntimeError("sweep 需要 sketch（截面轮廓）")
+        _pts = op.get("path")
+        if not isinstance(_pts, list) or len(_pts) < 2:
+            raise RuntimeError("sweep 需要 path：至少两个点 [[x,y,z], ...]")
+        _path = Part.makePolygon([_v3(p) for p in _pts])
+        _tr = int(op.get("transition", 2))
+        _swept = Part.Wire(_path).makePipeShell([Part.Wire(_prof)], True, bool(op.get("frenet", False)), _tr)
+        if abs(_swept.Volume) < 1e-9:
+            raise RuntimeError("sweep 得到零体积：检查 path 是否退化（所有点共线）")
+        return _swept
     raise RuntimeError("未知图元：" + str(k))
 
 # ---- sub-shape selectors -------------------------------------------------
@@ -1538,7 +1575,7 @@ for _idx, _op in enumerate(_OPS):
         continue
     _snap = _shape
     try:
-        if _k in ("box", "cylinder", "sphere", "cone", "torus", "extrude", "revolve"):
+        if _k in ("box", "cylinder", "sphere", "cone", "torus", "extrude", "revolve", "loft", "sweep"):
             _s = _prim(_op, _shape)
             _shape = _s if _shape is None else _shape.fuse(_s)
         elif _k in ("fuse", "cut", "common"):
@@ -2625,7 +2662,7 @@ else:
   // A list of ops applied in order. `run` stays the escape hatch; this is the
   // path for "60×40×20 的盒子挖个 φ16 通孔、倒 2mm 圆角".
 
-  const FEATURE_KINDS = ['box', 'cylinder', 'sphere', 'cone', 'torus', 'hole', 'extrude', 'revolve', 'fuse', 'cut', 'common', 'fillet', 'chamfer', 'shell', 'pattern_linear', 'pattern_circular', 'translate', 'rotate', 'mirror']
+  const FEATURE_KINDS = ['box', 'cylinder', 'sphere', 'cone', 'torus', 'hole', 'extrude', 'revolve', 'loft', 'sweep', 'fuse', 'cut', 'common', 'fillet', 'chamfer', 'shell', 'pattern_linear', 'pattern_circular', 'translate', 'rotate', 'mirror']
 
   tool({
     name: 'cad_studio_feature',
@@ -3029,6 +3066,7 @@ if _TARGET:
     // Schema 2 keeps the list under `graph.nodes`; `features` stays the in-memory
     // name so every caller keeps working. Reading an old file migrates it.
     if (doc.graph && Array.isArray(doc.graph.nodes)) doc.features = doc.graph.nodes
+    if (!doc.sketches || typeof doc.sketches !== 'object' || Array.isArray(doc.sketches)) doc.sketches = {}
     doc.schema = 2
     // Named dimensions/expressions (schema 2): only finite numbers survive.
     doc.vars = doc.vars && typeof doc.vars === 'object' && !Array.isArray(doc.vars)
@@ -3109,6 +3147,29 @@ if _TARGET:
    * Accept both shapes: `{kind:'box', params:{size:…}}` and the flatter
    * `{kind:'box', size:…}` an agent tends to write.
    */
+  // Sketches live in the same document as the features, so one file is the
+  // whole model: geometry + constraints in, wires out at rebuild time.
+  const normalizeSketches = (raw, base = {}) => {
+    const out = { ...(base && typeof base === 'object' ? base : {}) }
+    if (raw === undefined) return out
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw new Error('sketches 必须是 {名字: {geometry:[…], constraints:[…]}}')
+    for (const [name, sk] of Object.entries(raw)) {
+      if (sk === null) { delete out[name]; continue }
+      if (!sk || typeof sk !== 'object') throw new Error(`sketch ${name} 必须是对象`)
+      const geometry = Array.isArray(sk.geometry) ? sk.geometry : []
+      const constraints = Array.isArray(sk.constraints) ? sk.constraints : []
+      if (!geometry.length) throw new Error(`sketch ${name} 的 geometry 不能为空`)
+      for (const g of geometry) {
+        if (!g || typeof g.type !== 'string') throw new Error(`sketch ${name} 的 geometry 每项都要有 type（line/circle/arc）`)
+      }
+      for (const c of constraints) {
+        if (!c || typeof c.type !== 'string') throw new Error(`sketch ${name} 的 constraints 每项都要有 type`)
+      }
+      out[name] = { geometry, constraints }
+    }
+    return out
+  }
+
   const normalizeFeature = (doc, raw) => {
     if (!raw || typeof raw !== 'object') throw new Error('feature 必须是对象（至少给 kind）')
     const kind = String(raw.kind ?? '')
@@ -3149,10 +3210,29 @@ if _TARGET:
     else if (kind === 'cone') need(num(probe.r1) && num(probe.r2) && pos(probe.h), '需要 r1 / r2 / h>0')
     else if (kind === 'torus') need(pos(probe.r1) && pos(probe.r2), '需要 r1>0（主半径）与 r2>0（管半径）')
     else if (kind === 'extrude') {
-      const points = Array.isArray(probe.points) ? probe.points : []
-      need(points.length >= 3, '需要 points（至少 3 个 [x,y] 或 [x,y,z] 剖面点）')
-      need(points.every((q) => Array.isArray(q) && q.length >= 2 && q.slice(0, 3).every(num)), 'points 的每个点都要是数字数组')
-      need(pos(probe.h) || triple(probe.dir), '需要 h>0（沿 +Z 挤出）或 dir:[dx,dy,dz]（任意方向）')
+      // `return` here would return from normalizeFeature itself and push
+      // `undefined` into doc.features (that cost me a crash on feature.id).
+      const fromSketch = typeof probe.sketch === 'string' && probe.sketch
+      if (fromSketch) {
+        need(pos(probe.h) || triple(probe.dir), `${where} extrude：给 sketch 时仍需要 h>0 或 dir:[dx,dy,dz]`)
+      } else {
+        const points = Array.isArray(probe.points) ? probe.points : []
+        need(points.length >= 3, '需要 points（至少 3 个 [x,y] 或 [x,y,z] 剖面点；或给 sketch:"S1" 用文档里的草图）')
+        need(points.every((q) => Array.isArray(q) && q.length >= 2 && q.slice(0, 3).every(num)), 'points 的每个点都要是数字数组')
+        need(pos(probe.h) || triple(probe.dir), '需要 h>0（沿 +Z 挤出）或 dir:[dx,dy,dz]（任意方向）')
+      }
+    } else if (kind === 'loft') {
+      const sections = probe.sections
+      need(Array.isArray(sections) && sections.length >= 2, `${where} loft：需要至少两个 sections，例如 [{sketch:"S1"},{sketch:"S2",at:[0,0,40]}]`)
+      for (const sec of sections) {
+        need(sec && typeof sec === 'object' && typeof sec.sketch === 'string' && sec.sketch, `${where} loft：每个 section 都要有 sketch 名字`)
+        if (sec.at !== undefined) need(Array.isArray(sec.at) && sec.at.length === 3 && sec.at.every((v) => Number.isFinite(v)), `${where} loft：section.at 必须是 [x,y,z]`)
+      }
+    } else if (kind === 'sweep') {
+      need(typeof probe.sketch === 'string' && probe.sketch, `${where} sweep：需要 sketch（截面轮廓）`)
+      const path = probe.path
+      need(Array.isArray(path) && path.length >= 2, `${where} sweep：需要 path，至少两个点 [[x,y,z], …]`)
+      for (const pt of path) need(Array.isArray(pt) && pt.length === 3 && pt.every((v) => Number.isFinite(v)), `${where} sweep：path 的每一项都必须是 [x,y,z]`)
     } else if (kind === 'revolve') {
       const points = Array.isArray(probe.points) ? probe.points : []
       need(points.length >= 2, '需要 points（至少 2 个 [x,z] 剖面点）')
@@ -3239,7 +3319,7 @@ if _TARGET:
     let hashes = []
     if (isFeatures) {
       const ops = featureOps(doc)
-      hashes = chainHashes(ops)
+      hashes = chainHashes(ops, JSON.stringify(doc.sketches ?? {}))
       const cacheDir = brepCacheDir()
       try { await mkdir(cacheDir, { recursive: true }) } catch {}
       cache = { dir: cacheDir, hashes }
@@ -3261,7 +3341,7 @@ if _TARGET:
       }
     }
     const code = isFeatures
-      ? featuresScript(featureOps(doc), null, { cache, resume })
+      ? featuresScript(featureOps(doc), null, { cache, resume, sketches: doc.sketches })
       : `${PRELUDE}\nP = ${JSON.stringify(doc.params ?? {})}\n${doc.script}`
     const meta = isFeatures ? { model: doc.name, features: publicFeatures(doc), tip: doc.tip ?? null } : { model: doc.name, params: doc.params ?? {} }
     doc.run = (doc.run ?? 0) + 1
@@ -3336,6 +3416,7 @@ if _TARGET:
         params: { type: 'object', description: 'Parameter dict. On update these are merged into the existing params (set a key to null to delete it).' },
         note: { type: 'string', description: 'What this revision changed (kept in history).' },
         to: { type: 'string', description: 'For action=rename / duplicate: the new model name.' },
+        sketches: { type: 'object', description: 'For kind="features": named sketches stored in the document, e.g. {S1:{geometry:[{id:"g1",type:"line",p1:[0,0,0],p2:[80,0,0]}, …],constraints:[…]}}. A feature extrudes/revolves/lofts one with {kind:"extrude",sketch:"S1"}.' },
         export: { type: 'string', description: 'Also write the model out as STEP at this path (create / update / show). Saves the caller from re-implementing the feature emitter.' },
       },
       required: ['action'],
@@ -3562,7 +3643,7 @@ if _TARGET:
     if (typeof target !== 'string' || !target) throw new Error('export 需要目标路径，例如 /path/model.step')
     await mkdir(dirname(target), { recursive: true })
     const head = doc.kind === 'features'
-      ? featuresScript(featureOps(doc), target)
+      ? featuresScript(featureOps(doc), target, { sketches: doc.sketches })
       : `${PRELUDE}\nP = ${JSON.stringify(doc.params ?? {})}\n${doc.script}\n`
     const code = doc.kind === 'features'
       ? head
@@ -3604,7 +3685,7 @@ __out = {"ok": True, "exported": ${JSON.stringify(target)}, "volume": round(scen
           kind: doc.kind,
           params: doc.params,
           ...(typeof doc.script === 'string' ? { script: doc.script } : {}),
-          ...(doc.kind === 'features' ? { features: publicFeatures(doc), graph: graphView(doc, { errors: [], executed: null }), tip: doc.tip ?? null, vars: doc.vars ?? {} } : {}),
+          ...(doc.kind === 'features' ? { features: publicFeatures(doc), graph: graphView(doc, { errors: [], executed: null }), tip: doc.tip ?? null, vars: doc.vars ?? {}, sketches: doc.sketches } : {}),
           runs: doc.run ?? 0,
           updatedAt: doc.updatedAt ?? '',
           stats: doc.stats ?? null,
@@ -3632,6 +3713,7 @@ __out = {"ok": True, "exported": ${JSON.stringify(target)}, "volume": round(scen
             // Vars must exist before the first feature is validated: dimensions
             // are allowed to be expressions over them.
             vars: normalizeVars(args.vars),
+            sketches: normalizeSketches(args.sketches),
             params: args.params && typeof args.params === 'object' ? args.params : {},
             run: 0,
             createdAt: new Date().toISOString(),
@@ -3668,6 +3750,7 @@ __out = {"ok": True, "exported": ${JSON.stringify(target)}, "volume": round(scen
       if (action === 'update') {
         const doc = await readModel(args.name, dir)
         if (args.vars !== undefined) doc.vars = normalizeVars(args.vars, doc.vars)
+        if (args.sketches !== undefined) doc.sketches = normalizeSketches(args.sketches, doc.sketches)
         const before = {
           script: doc.script,
           params: JSON.parse(JSON.stringify(doc.params)),

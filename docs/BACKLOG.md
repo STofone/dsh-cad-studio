@@ -10,7 +10,7 @@
 - [x] 4. 旋转切除（= cut + revolve，已由 harness 钉住） `groove`（依赖 #2）
 
 ## P1 草图
-- [ ] 5. 草图→`loft` / `sweep`（多草图截面）
+- [x] 5. 草图→`loft` / `sweep`（多草图截面）+ 草图存进文档
 - [ ] 6. 面板草图页签：几何与约束列表、数值可改、冲突标红
 - [ ] 7. 草图约束补全：angle / tangent / symmetric / equal
 
