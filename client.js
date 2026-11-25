@@ -80,6 +80,13 @@ window.__ModuleLoader__.load({
       modelRow: (active) => ({ display: 'flex', flexDirection: 'column', gap: 1, width: '100%', textAlign: 'left', padding: '5px 9px', border: 'none', background: active ? 'rgba(77,107,254,0.14)' : 'transparent', color: 'inherit', cursor: 'pointer', font: 'inherit', borderRadius: 0 }),
       modelName: { fontSize: 11.5, fontWeight: active => (active ? 600 : 400), overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
       modelMeta: { fontSize: 9.5, opacity: 0.55, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' },
+      guide: { display: 'flex', flexDirection: 'column', gap: 8, padding: '14px 12px', fontSize: 12, lineHeight: 1.6, overflowY: 'auto' },
+      guideTitle: { fontSize: 13, fontWeight: 600, display: 'flex', alignItems: 'center', gap: 6 },
+      guideStep: { display: 'flex', gap: 7, alignItems: 'flex-start' },
+      guideNum: { flex: '0 0 auto', width: 16, height: 16, borderRadius: 8, marginTop: 2, display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 10, fontWeight: 700, background: 'rgba(120,130,145,.18)' },
+      guideCode: { fontFamily: 'ui-monospace, monospace', fontSize: 11, padding: '3px 6px', borderRadius: 4, background: 'rgba(120,130,145,.14)', display: 'inline-block', marginTop: 2, userSelect: 'all', wordBreak: 'break-all' },
+      guideRow: { display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap', marginTop: 2 },
+      guideDot: (ok, required) => ({ flex: '0 0 auto', width: 6, height: 6, borderRadius: 3, marginTop: 6, background: ok ? '#2ea043' : (required ? '#e5534b' : '#e0a33a') }),
       installBox: { margin: '8px 9px 6px', padding: '8px 9px', borderRadius: 8, border: '1px solid rgba(224,163,58,.45)', background: 'rgba(224,163,58,.10)', fontSize: 11, lineHeight: 1.5 },
       installBtn: { marginTop: 6, width: '100%', padding: '5px 8px', borderRadius: 6, border: '1px solid rgba(77,107,254,.5)', background: 'rgba(77,107,254,.16)', color: 'inherit', fontSize: 11, cursor: 'pointer' },
       installHint: { opacity: 0.72, marginTop: 4, wordBreak: 'break-all' },
@@ -1246,6 +1253,7 @@ const FILE_EXTS = ['step', 'stp', 'iges', 'igs', 'brep', 'stl']
       const [visibility, setVisibility] = useState({})
       const [error, setError] = useState('')
       const [installing, setInstalling] = useState('')
+      const [installMsg, setInstallMsg] = useState('')
       // The visible scene, and the identity the per-scene view state is keyed
       // on: republishing one assembly (drive / explode) keeps its colours,
       // switching to another scene does not.
@@ -2147,6 +2155,78 @@ const FILE_EXTS = ['step', 'stp', 'iges', 'igs', 'brep', 'stl']
         }
       }
 
+      const redetect = async () => {
+        setInstallMsg('正在检测…')
+        try {
+          const res = await fetch(`${ROUTE}/state`, { headers: { accept: 'application/json' } })
+          if (res.ok) setState(await res.json())
+          const doc = await fetch(`${ROUTE}/doctor`, { headers: { accept: 'application/json' } })
+          if (doc.ok) {
+            const d = await doc.json()
+            const bad = (d.checks || []).filter((c) => !c.ok)
+            setInstallMsg(d.ready ? '检测通过，可以用了。' : (bad.length ? `${bad[0].label}：${bad[0].detail}` : '仍未就绪'))
+          } else setInstallMsg('')
+        } catch (e) {
+          setInstallMsg(`检测失败：${String(e).slice(0, 120)}`)
+        }
+      }
+
+      const installNow = async () => {
+        setInstallMsg('')
+        await installFreecad()
+        setInstallMsg(installing || '')
+        try {
+          const doc = await fetch(`${ROUTE}/doctor`, { headers: { accept: 'application/json' } })
+          if (doc.ok) {
+            const d = await doc.json()
+            setInstallMsg(d.ready ? '装好了，正在重新读取模型…' : ((d.checks || []).filter((c) => !c.ok)[0] || {}).fix || '装完但仍未就绪')
+          }
+        } catch {}
+      }
+
+      // Install-and-run promise: when the kernel is missing, the panel is a
+      // three-step guide, not an empty viewport with a red dot somewhere else.
+      const diagChecks = (state && state.diag && state.diag.checks) || []
+      const guideNode = h('div', { key: 'guide', style: styles.guide, 'data-cad-guide': '1' }, [
+        h('div', { key: 't', style: styles.guideTitle }, [h('span', { style: styles.guideDot(false, true) }), '需要 FreeCAD（唯一的外部依赖）']),
+        h('div', { key: 'why', style: { opacity: 0.75, fontSize: 11 } }, `几何内核不随插件分发（约 213 MB，按平台编译）。装好之后这个面板就能用，无需再配置。`),
+        h('div', { key: 's1', style: styles.guideStep }, [
+          h('span', { key: 'n', style: styles.guideNum }, '1'),
+          h('div', { key: 'b' }, [
+            h('div', { key: 'l' }, setup.canInstall ? `点下面的按钮自动安装（${setup.packageManager || '系统包管理器'}）` : '用系统的包管理器安装'),
+            setup.command ? h('div', { key: 'c', style: styles.guideCode }, setup.reason ? `${setup.command}  # ${setup.reason}` : setup.command) : null,
+          ]),
+        ]),
+        h('div', { key: 's2', style: styles.guideStep }, [
+          h('span', { key: 'n', style: styles.guideNum }, '2'),
+          h('div', { key: 'b' }, [h('div', { key: 'l' }, '装完点「重新检测」；也可以直接装好再来，面板每次打开都会自检'),]),
+        ]),
+        h('div', { key: 's3', style: styles.guideStep }, [
+          h('span', { key: 'n', style: styles.guideNum }, '3'),
+          h('div', { key: 'b' }, [
+            h('div', { key: 'l' }, '装在非标准位置？配置 freecadPath 指到 freecadcmd 即可（探测顺序：配置 → /usr/bin → /usr/local/bin → /opt/freecad → macOS app）'),
+          ]),
+        ]),
+        h('div', { key: 'row', style: styles.guideRow }, [
+          h('button', {
+            key: 'install',
+            type: 'button',
+            style: styles.installBtn,
+            'data-cad-install': '1',
+            disabled: installing !== '' || !setup.canInstall,
+            onClick: installNow,
+          }, installing || (setup.canInstall ? '安装 FreeCAD' : '需要 root 才能自动安装')),
+          h('button', {
+            key: 'recheck',
+            type: 'button',
+            style: styles.microBtn,
+            'data-cad-recheck': '1',
+            onClick: () => { redetect() },
+          }, '重新检测'),
+        ]),
+        installMsg ? h('div', { key: 'msg', style: { fontSize: 11, opacity: 0.8, whiteSpace: 'pre-wrap' }, 'data-cad-install-msg': '1' }, installMsg) : null,
+      ])
+
       const installNode = runtime.available
         ? null
         : h('div', { key: 'install', style: styles.installBox, 'data-cad-install-box': '1' }, [
@@ -2412,6 +2492,11 @@ const FILE_EXTS = ['step', 'stp', 'iges', 'igs', 'brep', 'stl']
                 h('span', { key: 'k', style: styles.infoKey }, key),
                 h('span', { key: 'v', style: { ...styles.infoVal, maxWidth: '65%', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }, title: value }, value),
               ])),
+                ...diagChecks.map((chk) => h('div', { key: `diag-${chk.id}`, style: { ...styles.infoRow, alignItems: 'flex-start' }, 'data-cad-diag': chk.id }, [
+                  h('span', { key: 'd', style: styles.guideDot(chk.ok, chk.required) }),
+                  h('span', { key: 'k', style: { ...styles.infoKey, maxWidth: '46%', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }, title: chk.label }, chk.label),
+                  h('span', { key: 'v', style: { ...styles.infoVal, maxWidth: '52%', whiteSpace: 'normal' }, title: chk.fix || chk.detail }, chk.ok ? chk.detail : (chk.fix || chk.detail)),
+                ])),
                 ...(installNode ? [installNode] : []),
               ]
               : null
@@ -2538,7 +2623,9 @@ const FILE_EXTS = ['step', 'stp', 'iges', 'igs', 'brep', 'stl']
             onClick: () => { setAddOpen(false); setPanel((p) => (p === item.id ? '' : item.id)) },
           }, h(RailIcon, { name: item.id })))),
           h('div', { key: 'main', style: { flex: '1 1 auto', minWidth: 0, position: 'relative', display: 'flex', flexDirection: 'column' } }, [
-            payload
+            !runtime.available
+              ? guideNode
+              : payload
               ? h('div', { key: 'stage', style: styles.stage }, h(Viewport, { payload, visibility, options: { ...display, overrides, opacities, wireframes, restoreCamera: pendingCameraRef.current, onPick: pickInViewport }, handleRef: viewportRef }))
               : h('div', { key: 'empty', style: styles.empty }, '还没有模型。让 AI 跑一次 FreeCAD 脚本或打开一个 STEP 文件，这里会自动显示。'),
             picked && panel !== 'parts'

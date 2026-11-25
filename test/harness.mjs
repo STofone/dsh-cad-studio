@@ -828,6 +828,82 @@ endsolid t
   const iAgain = await call('cad_studio_features', { model: iModel, action: 'update', id: 'f1', feature: { params: { size: [140, 80, 16] } } })
   ok('suppressing nothing still short-circuits', iAgain.revalidated === true, JSON.stringify({ revalidated: iAgain.revalidated }))
   await call('cad_studio_doc', { action: 'delete', name: iModel }).catch(() => {})
+
+  // ---- 7o1. five declared joint kinds --------------------------------------
+  {
+    const mkPart = async (name, size) => {
+      // The feature tool returns the run result; the export path is the one we
+      // asked for (it writes it through writeShapeFile).
+      await call('cad_studio_feature', { ops: [{ kind: 'box', size }], title: name, export: `${dir}/joint-${name}.step` })
+      return `${dir}/joint-${name}.step`
+    }
+    const base = await mkPart('jbase', [80, 60, 10])
+    const arm = await mkPart('jarm', [20, 20, 60])
+    const asm = await call('cad_studio_assembly', {
+      parts: [{ id: 'base', name: 'base', path: base }, { id: 'arm', name: 'arm', path: arm }],
+      instances: [{ name: 'base', part: 'base', at: [0, 0, 0] }, { name: 'arm', part: 'arm', at: [30, 0, 10] }],
+      title: 'harness_关节',
+      joints: [
+        { id: 'cyl', instance: 'arm', type: 'cylindrical', axis: [0, 0, 1], value: 45 },
+        { id: 'pl', instance: 'base', type: 'planar', axis: [1, 0, 0], value: 5 },
+      ],
+    })
+    ok('cylindrical and planar joints are accepted', asm.ok === true && asm.joints === 2, `${asm.joints} joints ${asm.error || ''}`.trim())
+    const rows = await call('cad_studio_joint', { action: 'list', assembly: asm.assembly })
+    const cyl = (rows.joints || []).find((j) => j.id === 'cyl')
+    ok('cylindrical is listed with its own type', cyl && cyl.type === 'cylindrical', JSON.stringify(cyl))
+    const driven = await call('cad_studio_drive', { assembly: asm.assembly, joint: 'cyl', value: 90 })
+    ok('a cylindrical joint drives its rotation', driven.ok === true, String(driven.error || ''))
+    const badKind = await call('cad_studio_joint', { action: 'set', assembly: asm.assembly, joint: 'x', instance: 'arm', type: 'screw' })
+    ok('an unknown joint kind falls back to revolute', badKind.ok === true && badKind.joint.type === 'revolute', JSON.stringify(badKind.joint?.type))
+  }
+
+  // ---- 7o2. vars + expressions, and the three extra joint kinds ----------
+  {
+    const m = 'harness_表达式'
+    await call('cad_studio_doc', { action: 'delete', name: m })
+    const mk = (w) => [{ kind: 'box', size: ['w', 'd', 't'] }, { kind: 'cut', with: { kind: 'cylinder', r: 'w/10', h: 't*3', at: ['w/2', 'd/2', '-t'] } }]
+    const c1 = await call('cad_studio_doc', { action: 'create', name: m, kind: 'features', vars: { w: 100, d: 80, t: 10 }, features: mk(100) })
+    const c2 = await call('cad_studio_doc', { action: 'update', name: m, vars: { w: 200 } })
+    const shown = await call('cad_studio_doc', { action: 'show', name: m })
+    // 160000 − π·20²·10 = 147433.63
+    ok('expressions over vars build geometry', c1.evaluated === true && near(c1.volume, 76858.41, 1), String(c1.volume))
+    ok('changing a var moves every dependent dimension', near(c2.volume, 147433.63, 1), String(c2.volume))
+    ok('the document keeps its vars', shown.vars && shown.vars.w === 200 && shown.vars.d === 80, JSON.stringify(shown.vars))
+    const bad = await call('cad_studio_features', { model: m, action: 'add', feature: { kind: 'box', size: ['nope', 1, 1] } })
+    ok('an undefined var never silently becomes 0', bad.ok === false && /size|变量/.test(String(bad.error)), String(bad.error).slice(0, 70))
+    const hostile = await call('cad_studio_features', { model: m, action: 'add', feature: { kind: 'box', size: ['__import__("os")', 1, 1] } })
+    ok('a non-arithmetic string is rejected, never evaluated', hostile.ok === false, String(hostile.error).slice(0, 60))
+    await call('cad_studio_doc', { action: 'delete', name: m })
+  }
+
+  // ---- 7p. at.ref: a feature anchored to a face follows that face ----------
+  {
+    const m = 'harness_锚定'
+    const feats = (t) => [
+      { kind: 'box', size: [100, 80, t] },
+      { kind: 'fuse', with: { kind: 'cylinder', r: 10, h: 12, at: { ref: { axis: 'Z', mode: 'aligned', dir: '+', type: 'plane' }, offset: [0, 0, -6] } } },
+    ]
+    await call('cad_studio_doc', { action: 'delete', name: m })
+    const thin = await call('cad_studio_doc', { action: 'create', name: m, kind: 'features', features: feats(16) })
+    await call('cad_studio_doc', { action: 'update', name: m, features: feats(30) })
+    const thick = await call('cad_studio_doc', { action: 'show', name: m })
+    const grew = thick.stats?.volume - thin.volume
+    // 100×80×14 thicker plate = 112000 mm³ extra; the boss rides along.
+    ok('at.ref follows the face it names', near(grew, 112000, 5), `${thin.volume} → ${thick.stats?.volume} (Δ${Math.round(grew)})`)
+    ok('graph marks the anchored node', Boolean(thick.graph?.nodes?.some((n) => n.anchored)), JSON.stringify(thick.graph?.nodes?.map((n) => n.anchored)))
+    ok('graph exposes the evaluation chain', (thick.graph?.nodes || []).every((n) => Array.isArray(n.dependsOn)), JSON.stringify(thick.graph?.nodes?.[1]?.dependsOn))
+    const miss = await call('cad_studio_features', { model: m, action: 'add', feature: { kind: 'cut', with: { kind: 'cylinder', r: 4, h: 8, at: { ref: { axis: 'Z', type: 'circle' } } } } })
+    ok('a selector that matches nothing fails loudly', miss.evaluated === false && /没有选中任何面/.test(JSON.stringify(miss.errors || [])), JSON.stringify(miss.errors?.[0]?.message || '').slice(0, 80))
+    await call('cad_studio_doc', { action: 'delete', name: m })
+  }
+
+  // ---- 7q. install-and-run: the doctor must answer "why can't I use this?" --
+  const doc = await call('cad_studio_doctor', {})
+  ok('doctor reports a ready or a fixed-able state', typeof doc.ready === 'boolean', JSON.stringify(doc.ready))
+  ok('doctor lists the kernel check first', Array.isArray(doc.checks) && /内核|FreeCAD/.test(doc.checks[0]), JSON.stringify(doc.checks.slice(0, 2)))
+  ok('doctor exposes per-capability flags', doc.capabilities && typeof doc.capabilities.modeling === 'boolean' && typeof doc.capabilities.drawing === 'boolean', JSON.stringify(doc.capabilities))
+  ok('a check that fails always carries a fix', (doc.checks || []).every((c) => !/^FAIL/.test(c) || /—/.test(c)), JSON.stringify(doc.checks))
 }
 
 // ---- 8. teardown --------------------------------------------------------

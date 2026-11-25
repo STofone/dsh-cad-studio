@@ -168,3 +168,54 @@ node scripts/shots.mjs --url http://127.0.0.1:3201 --token-file /tmp/dev-token.t
 ## License
 
 MIT
+
+## 安装即用 与 环境自检
+
+插件本体零依赖（只有 JS + three.js），但**几何内核是外部程序**：`freecadcmd`（约 213 MB，
+按平台编译，LGPL）。这是唯一一个「不能安装即用」的必要依赖，所以它必须有引导：
+
+- **面板内引导**：内核缺失时，面板主体不是空白视口，而是三步卡片——① 点「安装 FreeCAD」
+  （apt/dnf/pacman/brew 自动识别，非 root 会显示原因与手抄命令）② 装完点「重新检测」
+  ③ 装在非标准位置就配 `freecadPath`。装好后面板自动恢复，无需重启。
+- **给 AI 的自检**：`cad_studio_doctor` 返回每一项前置条件的 `ok / detail / fix` 与
+  当前能力开关（modeling / assembly / drawing / measure / export / incremental）；
+  `cad_studio_setup` 负责实际安装。**报错先自检**，别把环境问题当成模型问题。
+- **可选能力**：全部随内核可用，没有第二个需要单独安装的可选项；出图（HLR→SVG）、
+  测量、STEP/STL 导出都在进程内完成。若将来引入外部可选件，同样走「状态检测 + 安装引导」。
+
+## 特征挂在面上（`at.ref`）
+
+图元的位置可以写成一个面选择器加偏移，而不是绝对坐标：
+
+```json
+{"kind": "fuse", "with": {"kind": "cylinder", "r": 10, "h": 12,
+  "at": {"ref": {"axis": "Z", "mode": "aligned", "dir": "+", "type": "plane"},
+         "offset": [0, 0, -6]}}}
+```
+
+板子从 16 厚改到 30 厚，凸台跟着顶面走（实测总面积增量恒为 100×80×14 = 112000 mm³）。
+选择器选不中时会**明确报错**（`at.ref 没有选中任何面：{…}（当前形状有 6 个面）`），
+不会静默落到原点。
+
+## 变量与表达式
+
+文档可以带一组命名的尺寸，特征的数值可以写表达式：
+
+```json
+{"vars": {"w": 100, "d": 80, "t": 10},
+ "features": [
+   {"kind": "box", "size": ["w", "d", "t"]},
+   {"kind": "cut", "with": {"kind": "cylinder", "r": "w/10", "h": "t*3",
+                            "at": ["w/2", "d/2", "-t"]}}]}
+```
+
+改 `w` 只需 `cad_studio_doc {"action":"update","vars":{"w":200}}`，所有依赖它的尺寸一起变
+（100→200 实测体积 76858.41→147433.63 mm³）。表达式由 60 行 shunting-yard 在 JS 里算，
+**绝不用 `eval`、也不交给 FreeCAD**：只接受 `数字 / 变量名 / + - * / ( ) / 一元负号`，
+出现引号或函数调用的字符串一律当字面量并随后被类型校验拒掉。
+
+## 依赖关系（哪些东西会互相影响）
+
+`cad_studio_features {action:"list"}` 与 `cad_studio_doc {action:"show"}` 返回的 `graph.nodes`
+里，每个节点带 `dependsOn / dependents / anchored`：特征是顺序求值链（`f3` 依赖 `f2`），
+`anchored: true` 表示它还跟着某个面走。这是如实的表示——我们不假装有一个比实际更复杂的图。

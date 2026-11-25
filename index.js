@@ -14,7 +14,7 @@
  *   GET /cad-studio/client.js    the panel bundle (dev-mode serving)
  */
 import { spawn, spawnSync } from 'node:child_process'
-import { existsSync, readdirSync, statSync, rmSync } from 'node:fs'
+import { existsSync, mkdirSync, readdirSync, rmSync, statSync, statfsSync, writeFileSync } from 'node:fs'
 import crypto from 'node:crypto'
 import { mkdtemp, mkdir, readdir, readFile, rm, stat, unlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -110,6 +110,89 @@ function setupStatus(bridge, { withVersion = true } = {}) {
 }
 
 /** Install FreeCAD through the detected packager; returns a plain outcome. */
+/**
+ * "Install and it works" is the product promise; this is the function that
+ * tells the truth about whether we can keep it. Every check says what is wrong
+ * AND what to do about it, so the panel never shows a dead end.
+ */
+function diagnose(bridge, cfg = {}) {
+  const kernel = setupStatus(bridge, { withVersion: true })
+  const dir = FreeCadBridge.dataDir
+  const checks = []
+  checks.push({
+    id: 'kernel',
+    label: '几何内核（FreeCAD / OCCT）',
+    required: true,
+    ok: kernel.available === true,
+    detail: kernel.available ? [kernel.binary, kernel.version].filter(Boolean).join(' · ') : '没有找到 freecadcmd',
+    fix: kernel.available ? '' : (kernel.canInstall
+      ? '点「安装 FreeCAD」自动装（需要 root），或手动执行：' + (kernel.command || 'apt install freecad')
+      : (kernel.reason || '请手动安装 FreeCAD，再把 freecadPath 指到 freecadcmd')),
+    action: kernel.available ? '' : (kernel.canInstall ? 'install' : ''),
+    packageManager: kernel.packageManager || '',
+  })
+  let writable = false
+  try {
+    mkdirSync(dir, { recursive: true })
+    const probe = join(dir, '.write-probe')
+    writeFileSync(probe, '1')
+    rmSync(probe, { force: true })
+    writable = true
+  } catch {}
+  checks.push({
+    id: 'datadir',
+    label: '数据目录（场景与缓存）',
+    required: true,
+    ok: writable,
+    detail: writable ? dir : `${dir}（不可写）`,
+    fix: writable ? '' : '把这个目录改成可写，或用环境变量 TMPDIR 指到可写位置',
+  })
+  let freeMB = null
+  try { const st = statfsSync(dir); freeMB = Math.round((st.bavail * st.bsize) / 1048576) } catch {}
+  checks.push({
+    id: 'disk',
+    label: '可用磁盘',
+    required: false,
+    ok: freeMB === null || freeMB > 500,
+    detail: freeMB === null ? '无法读取' : `${freeMB} MB`,
+    fix: freeMB !== null && freeMB <= 500 ? '剩余空间不足 500 MB，重建大模型可能失败' : '',
+  })
+  const modelsDir = cfg.modelsDir || ''
+  checks.push({
+    id: 'models',
+    label: '模型目录',
+    required: false,
+    ok: true,
+    detail: modelsDir || '跟随会话工作区（<cwd>/cad-models）',
+    fix: '',
+  })
+  const ready = checks.filter((c) => c.required).every((c) => c.ok)
+  return {
+    ready,
+    kernel,
+    checks,
+    // What the plugin can actually do right now. The panel greys out the rest
+    // instead of letting a click fail deep inside a spawn.
+    capabilities: {
+      modeling: ready,
+      assembly: ready,
+      drawing: ready,
+      measure: ready,
+      export: ready,
+      incremental: ready,
+    },
+  }
+}
+
+const renderDoctor = (v) => {
+  const lines = [`ready: ${v.ready ? 'yes' : 'no'}`]
+  if (v.kernel) lines.push(`kernel: ${v.kernel}`)
+  for (const c of v.checks || []) lines.push(`- ${c}`)
+  const caps = Object.entries(v.capabilities || {}).map(([k, ok]) => `${k}=${ok ? 'yes' : 'no'}`).join(' ')
+  if (caps) lines.push(`capabilities: ${caps}`)
+  return lines.join('\n')
+}
+
 function installFreeCad(bridge, { timeoutMs = 900000 } = {}) {
   const before = setupStatus(bridge)
   if (before.available) return { ok: true, alreadyInstalled: true, ...before, log: '' }
@@ -271,17 +354,128 @@ function bboxCenterOfInstances(parts, instances) {
 function normalizeJoint(record, spec) {
   const inst = record.base.find((b) => b.name === spec.instance)
   if (!inst) throw new Error(`装配里没有这个实例：${spec.instance}`)
-  const type = spec.type === 'linear' ? 'linear' : 'revolute'
-  const fallbackAxis = type === 'linear' ? [1, 0, 0] : [0, 0, 1]
+  // Five declared joint kinds, all driven along their single declared axis.
+  // This is deliberately not a constraint solver: a joint states which DOF the
+  // AI/user may drive, and the panel exposes exactly that one number.
+  //   revolute   rotate about axis          linear      slide along axis
+  //   cylindrical rotate about axis   planar  slide in the plane
+  //   ball       rotate about axis (free direction, single driven angle)
+  const JOINTS = ['revolute', 'linear', 'cylindrical', 'planar', 'ball']
+  const type = JOINTS.includes(spec.type) ? spec.type : 'revolute'
+  const slidey = type === 'linear' || type === 'planar'
+  const fallbackAxis = slidey ? [1, 0, 0] : [0, 0, 1]
   const axis = normVec(Array.isArray(spec.axis) && spec.axis.length === 3 ? spec.axis : fallbackAxis)
   // Rotating about the instance's own centre is the useful default (a spinning
   // wheel); a hinge passes an explicit origin on the edge.
   const origin = Array.isArray(spec.origin) && spec.origin.length === 3 ? spec.origin.map(Number) : inst.center.slice()
-  const min = Number.isFinite(spec.min) ? Number(spec.min) : type === 'linear' ? -1000 : -180
-  const max = Number.isFinite(spec.max) ? Number(spec.max) : type === 'linear' ? 1000 : 180
+  const min = Number.isFinite(spec.min) ? Number(spec.min) : slidey ? -1000 : -180
+  const max = Number.isFinite(spec.max) ? Number(spec.max) : slidey ? 1000 : 180
   const value = Math.min(max, Math.max(min, Number.isFinite(spec.value) ? Number(spec.value) : 0))
+  // A cylindrical joint has two DOF but we drive one number; the other is a
+  // fixed second parameter so the geometry stays deterministic.
+
   const id = typeof spec.id === 'string' && spec.id.trim() ? spec.id.trim() : `${type}-${record.joints.length + 1}`
   return { id, instance: spec.instance, type, axis, origin, min, max, value }
+}
+
+/**
+ * Variables and expressions (DESIGN §7 Phase 4).
+ *
+ * Dimensions are allowed to be expressions over the document's `vars`, e.g.
+ * `"w*2 + 10"`. They are evaluated here, in JS, with a 60-line shunting-yard —
+ * deliberately NOT by handing the string to FreeCAD or to `eval`: a model file
+ * that arrives from someone else must not be able to execute anything.
+ */
+/** `vars` is a flat bag of named dimensions; anything else is ignored. */
+function normalizeVars(raw, base = {}) {
+  const out = { ...base }
+  if (raw === null) return {}
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return out
+  for (const [k, v] of Object.entries(raw)) {
+    if (!/^[A-Za-z_]\w{0,40}$/.test(k)) continue
+    if (v === null) { delete out[k]; continue }
+    if (Number.isFinite(Number(v))) out[k] = Number(v)
+  }
+  return out
+}
+
+const EXPR_OK = /^[0-9A-Za-z_+\-*/(). \t]*$/
+
+function evalExpression(src, vars) {
+  const text = String(src).trim()
+  if (!EXPR_OK.test(text)) throw new Error(`表达式里有不支持的字符：${text}`)
+  const tokens = text.match(/\d+\.?\d*|[A-Za-z_]\w*|[+\-*/()]/g) || []
+  const out = []
+  const ops = []
+  const prec = { '+': 1, '-': 1, '*': 2, '/': 2 }
+  const apply = (op) => {
+    const b = out.pop()
+    const a = out.pop()
+    if (a === undefined || b === undefined) throw new Error(`表达式不完整：${text}`)
+    out.push(op === '+' ? a + b : op === '-' ? a - b : op === '*' ? a * b : a / b)
+  }
+  let prev = ''
+  for (const tk of tokens) {
+    if (tk === '-' && (prev === '' || prev === '(' || prec[prev])) {
+      // Unary minus: "−t" is 0 − t, not a syntax error.
+      out.push(0)
+      ops.push('-')
+      prev = '-'
+      continue
+    }
+    if (/^\d/.test(tk)) out.push(Number(tk))
+    else if (/^[A-Za-z_]/.test(tk)) {
+      const v = vars?.[tk]
+      if (!Number.isFinite(v)) throw new Error(`表达式里的变量没有定义或不是数字：${tk}`)
+      out.push(Number(v))
+    } else if (tk === '(') ops.push(tk)
+    else if (tk === ')') {
+      while (ops.length && ops[ops.length - 1] !== '(') apply(ops.pop())
+      if (ops.pop() !== '(') throw new Error(`括号不配对：${text}`)
+      prev = tk
+    } else {
+      while (ops.length && prec[ops[ops.length - 1]] >= prec[tk]) apply(ops.pop())
+      ops.push(tk)
+    }
+  }
+  while (ops.length) {
+    const op = ops.pop()
+    if (op === '(') throw new Error(`括号不配对：${text}`)
+    apply(op)
+  }
+  if (out.length !== 1 || !Number.isFinite(out[0])) throw new Error(`表达式算不出数值：${text}`)
+  return out[0]
+}
+
+// Keys whose strings are vocabulary, not arithmetic: a `kind: "cylinder"` or a
+// selector's `axis: "Z"` must never be mistaken for an expression.
+const EXPR_SKIP_KEYS = new Set(['kind', 'type', 'axis', 'mode', 'dir', 'pick', 'label', 'name', 'ref'])
+
+/** Deep-walk feature params and resolve any expression string. */
+function resolveParams(value, vars, where) {
+  if (typeof value === 'string') {
+    // A string is an expression only when it is plain arithmetic AND every
+    // identifier in it is a declared var. Selectors ("Z", "aligned", "+") and
+    // enums therefore pass through untouched.
+    const text = value.trim()
+    if (!text || !/^[\w.\s+\-*/()]+$/.test(text)) return value
+    const ids = text.match(/[A-Za-z_]\w*/g) || []
+    const known = ids.filter((id) => Number.isFinite(vars?.[id]))
+    if (ids.length && !known.length) return value
+    if (!ids.length && !/[+\-*/]/.test(text)) return /^\d+(\.\d+)?$/.test(text) ? Number(text) : value
+    try { return evalExpression(text, vars) } catch (error) {
+      throw new Error(`${where}：${error.message}`)
+    }
+  }
+  if (Array.isArray(value)) return value.map((v) => resolveParams(v, vars, where))
+  if (value && typeof value === 'object') {
+    const out = {}
+    for (const [k, v] of Object.entries(value)) {
+      out[k] = EXPR_SKIP_KEYS.has(k) ? v : resolveParams(v, vars, where)
+    }
+    return out
+  }
+  return value
 }
 
 /** Base placements + joints + explode → a scene payload ready to publish. */
@@ -293,7 +487,7 @@ function assembleScene(record) {
     for (const joint of record.joints) {
       if (joint.instance !== base.name) continue
       const axis = normVec(joint.axis)
-      if (joint.type === 'linear') {
+      if (joint.type === 'linear' || joint.type === 'planar') {
         translate = addVec(translate, scaleVec(axis, joint.value))
       } else {
         const R = axisAngle(axis, joint.value)
@@ -365,6 +559,13 @@ class FreeCadBridge {
 
   refresh() {
     this.bin = probeBinary(this.getConfig().freecadPath)
+    // Version costs a spawn, so ask once per binary rather than every poll
+    // (the panel polls /state every 1.5 s).
+    if (this.bin && this.versionOf !== this.bin) {
+      this.versionOf = this.bin
+      try { this.kernelVersion = freecadVersion(this.bin) } catch { this.kernelVersion = '' }
+    }
+    if (!this.bin) { this.kernelVersion = ''; this.versionOf = '' }
     return this.bin
   }
 
@@ -421,7 +622,7 @@ class FreeCadBridge {
     const latest = this.latest
     if (latest) await writeFile(join(dir, 'scenes', `${latest.id}.json`), JSON.stringify(latest.scene), 'utf8')
     const pointer = {
-      runtime: this.status(),
+      runtime: { ...this.status(), version: this.kernelVersion || '' },
       latest: latest ? { id: latest.id, title: latest.title, at: latest.at } : null,
       // Newest first, trimmed: the panel's model switcher reads this list.
       history: this.history.slice(0, 30),
@@ -918,9 +1119,28 @@ def _dir(x, d=(0.0, 0.0, 1.0)):
     v = _v3(x, d)
     return v if v.Length > 1e-9 else _v3(d, (0.0, 0.0, 1.0))
 
-def _prim(op):
+def _anchor(_spec, _cur):
+    # A feature can hang off a face instead of absolute coordinates:
+    #   "at": {"ref": {"axis":"Z","mode":"aligned","dir":"+","type":"plane"},
+    #          "offset": [10, 0, 0]}
+    # The point is the face's centre plus the offset in world axes, so changing
+    # the thickness upstream moves the hole with the face instead of leaving it
+    # floating at the old Z.
+    if not isinstance(_spec, dict) or "ref" not in _spec:
+        return None
+    if _cur is None:
+        raise RuntimeError("at.ref 需要前面至少有一个已建好的实体")
+    _hits = _sel(_cur, "face", _spec.get("ref") or {})
+    if not _hits:
+        raise RuntimeError("at.ref 没有选中任何面：%s" % json.dumps(_spec.get("ref"), ensure_ascii=False))
+    _off = _spec.get("offset")
+    return _center_of(_hits[0]) + (_v3(_off) if _off else Vector(0.0, 0.0, 0.0))
+
+def _prim(op, _cur=None):
     k = op.get("kind")
-    at = _v3(op.get("at"))
+    _at_spec = op.get("at")
+    _anchored = _anchor(_at_spec, _cur) if isinstance(_at_spec, dict) else None
+    at = _anchored if _anchored is not None else _v3(_at_spec)
     if k == "box":
         s = op.get("size") or [10, 10, 10]
         return Part.makeBox(float(s[0]), float(s[1]), float(s[2]), at)
@@ -1089,7 +1309,7 @@ for _idx, _op in enumerate(_OPS):
     _snap = _shape
     try:
         if _k in ("box", "cylinder", "sphere", "cone", "torus", "extrude", "revolve"):
-            _s = _prim(_op)
+            _s = _prim(_op, _shape)
             _shape = _s if _shape is None else _shape.fuse(_s)
         elif _k in ("fuse", "cut", "common"):
 # A U-shaped wall is one feature, not two: with takes a list, and
@@ -1098,7 +1318,7 @@ for _idx, _op in enumerate(_OPS):
             if not isinstance(_ws, (list, tuple)):
                 _ws = [_ws]
             for _w in _ws:
-                _s = _prim(_w)
+                _s = _prim(_w, _shape)
                 _shape = _shape.fuse(_s) if _k == "fuse" else (_shape.cut(_s) if _k == "cut" else _shape.common(_s))
         elif _k == "fillet":
             _eds = _sel(_shape, "edge", _op.get("edges")) or list(_shape.Edges)
@@ -1463,6 +1683,26 @@ __out = {
       if (kind === 'delete') return bridge.removeScene(id)
       if (kind === 'rename') return bridge.renameScene(id, title)
       return { ok: false, error: `不支持的 action：${kind}（list / delete / rename）` }
+    },
+  })
+
+  tool({
+    name: 'cad_studio_doctor',
+    description: 'Environment self-check for CAD Studio: reports every prerequisite (FreeCAD/OCCT kernel, data directory, disk space, model directory) with what is wrong, what to do about it, and which capabilities are currently available. Run this before blaming a modelling failure on the model.',
+    parameters: {
+      type: 'object',
+      properties: {},
+      additionalProperties: false,
+    },
+    output: { schema: { type: 'object' }, render: (args, value) => [{ type: 'text', text: renderDoctor(value) }] },
+    execute: async () => {
+      const diag = diagnose(bridge, bridge.getConfig())
+      return {
+        ready: diag.ready,
+        kernel: diag.kernel.available ? [diag.kernel.binary, diag.kernel.version].filter(Boolean).join(' · ') : '',
+        checks: diag.checks.map((c) => `${c.ok ? 'ok' : (c.required ? 'FAIL' : 'warn')} ${c.label}: ${c.detail}${c.fix ? ` — ${c.fix}` : ''}`),
+        capabilities: diag.capabilities,
+      }
     },
   })
 
@@ -1899,13 +2139,13 @@ ${pair ? `    __out["distance"] = round((FreeCAD.Vector(${JSON.stringify(from)})
         assembly: { type: 'string', description: 'Assembly label for cad_studio_joint / cad_studio_drive / cad_studio_explode (defaults to the title).' },
         joints: {
           type: 'array',
-          description: 'Joints to declare up front: [{id?, instance, type:"revolute"|"linear", axis?, origin?, value?, min?, max?}]. Rotating about the instance centre is the default; pass origin for a hinge.',
+          description: 'Joints to declare up front: [{id?, instance, type:"revolute"|"linear"|"cylindrical"|"planar"|"ball", axis?, origin?, value?, min?, max?}]. Rotating about the instance centre is the default; pass origin for a hinge.',
           items: {
             type: 'object',
             properties: {
               id: { type: 'string' },
               instance: { type: 'string' },
-              type: { type: 'string', enum: ['revolute', 'linear'] },
+              type: { type: 'string', enum: ['revolute', 'linear', 'cylindrical', 'planar', 'ball'] },
               axis: { type: 'array', items: { type: 'number' } },
               origin: { type: 'array', items: { type: 'number' } },
               value: { type: 'number' },
@@ -2077,7 +2317,7 @@ if _TARGET:
         assembly: { type: 'string', description: 'Assembly id (asm-1) or its label. Default: newest.' },
         joint: { type: 'string', description: 'Joint id for remove.' },
         instance: { type: 'string', description: 'Instance name the joint moves (set).' },
-        type: { type: 'string', enum: ['revolute', 'linear'], description: 'Default: revolute.' },
+        type: { type: 'string', enum: ['revolute', 'linear', 'cylindrical', 'planar', 'ball'], description: 'Default: revolute. cylindrical rotates and holds a fixed slide; planar/ball drive one number too (documented limitation).' },
         axis: { type: 'array', items: { type: 'number' }, description: 'Rotation/slide axis in world space. Default [0,0,1] revolute / [1,0,0] linear.' },
         origin: { type: 'array', items: { type: 'number' }, description: 'Point the rotation axis passes through. Default: the instance centre.' },
         value: { type: 'number', description: 'Current value in degrees (revolute) or mm (linear).' },
@@ -2240,6 +2480,10 @@ if _TARGET:
     // name so every caller keeps working. Reading an old file migrates it.
     if (doc.graph && Array.isArray(doc.graph.nodes)) doc.features = doc.graph.nodes
     doc.schema = 2
+    // Named dimensions/expressions (schema 2): only finite numbers survive.
+    doc.vars = doc.vars && typeof doc.vars === 'object' && !Array.isArray(doc.vars)
+      ? Object.fromEntries(Object.entries(doc.vars).filter(([, v]) => Number.isFinite(v)))
+      : {}
     doc.tip = typeof doc.tip === 'string' && doc.tip ? doc.tip : null
     doc.undo = Array.isArray(doc.undo) ? doc.undo : []
     doc.redo = Array.isArray(doc.redo) ? doc.redo : []
@@ -2303,7 +2547,8 @@ if _TARGET:
         if (stopAtSuppressed) ops.push({ kind: '__skip__', _id: f.id, _label: f.label || '' })
         continue
       }
-      ops.push({ kind: f.kind, ...(f.params ?? {}), _id: f.id, _label: f.label || '' })
+      const where = `特征 ${f.id}${f.label ? `（${f.label}）` : ''} ${f.kind}`
+      ops.push({ kind: f.kind, ...resolveParams(f.params ?? {}, doc.vars, where), _id: f.id, _label: f.label || '' })
     }
     return ops
   }
@@ -2339,31 +2584,39 @@ if _TARGET:
       if (!cond) throw new Error(`${where}：${hint}`)
     }
     const tool = (v) => v && typeof v === 'object' && ['box', 'cylinder', 'sphere', 'cone', 'torus', 'extrude', 'revolve'].includes(String(v.kind))
-    const withs = params.with
-    if (kind === 'box') need(triple(params.size) && params.size.every(pos), '需要 size:[dx,dy,dz]（三个正数）')
-    else if (kind === 'cylinder') need(pos(params.r) && pos(params.h), '需要 r>0 与 h>0')
-    else if (kind === 'sphere') need(pos(params.r), '需要 r>0')
-    else if (kind === 'cone') need(num(params.r1) && num(params.r2) && pos(params.h), '需要 r1 / r2 / h>0')
-    else if (kind === 'torus') need(pos(params.r1) && pos(params.r2), '需要 r1>0（主半径）与 r2>0（管半径）')
+    // Expressions are legal in the document, numbers at validation time.
+    let probe = params
+    try { probe = resolveParams(params, doc.vars, where) } catch (error) { throw new Error(`${where}：${error.message}`) }
+    // `at` is either a point or an anchor on a face ({ref, offset}).
+    if (probe.at && typeof params.at === 'object' && !Array.isArray(probe.at)) {
+      need(probe.at.ref && typeof params.at.ref === 'object', 'at.ref 需要一个面选择器（如 {axis:"Z",mode:"aligned",dir:"+",type:"plane"}）')
+      need(probe.at.offset === undefined || triple(probe.at.offset), 'at.offset 需要 [x,y,z]')
+    }
+    const withs = probe.with
+    if (kind === 'box') need(triple(probe.size) && probe.size.every(pos), '需要 size:[dx,dy,dz]（三个正数）')
+    else if (kind === 'cylinder') need(pos(probe.r) && pos(probe.h), '需要 r>0 与 h>0')
+    else if (kind === 'sphere') need(pos(probe.r), '需要 r>0')
+    else if (kind === 'cone') need(num(probe.r1) && num(probe.r2) && pos(probe.h), '需要 r1 / r2 / h>0')
+    else if (kind === 'torus') need(pos(probe.r1) && pos(probe.r2), '需要 r1>0（主半径）与 r2>0（管半径）')
     else if (kind === 'extrude') {
-      const points = Array.isArray(params.points) ? params.points : []
+      const points = Array.isArray(probe.points) ? probe.points : []
       need(points.length >= 3, '需要 points（至少 3 个 [x,y] 或 [x,y,z] 剖面点）')
       need(points.every((q) => Array.isArray(q) && q.length >= 2 && q.slice(0, 3).every(num)), 'points 的每个点都要是数字数组')
-      need(pos(params.h) || triple(params.dir), '需要 h>0（沿 +Z 挤出）或 dir:[dx,dy,dz]（任意方向）')
+      need(pos(probe.h) || triple(probe.dir), '需要 h>0（沿 +Z 挤出）或 dir:[dx,dy,dz]（任意方向）')
     } else if (kind === 'revolve') {
-      const points = Array.isArray(params.points) ? params.points : []
+      const points = Array.isArray(probe.points) ? probe.points : []
       need(points.length >= 2, '需要 points（至少 2 个 [x,z] 剖面点）')
     } else if (kind === 'fuse' || kind === 'cut' || kind === 'common') {
       const list = Array.isArray(withs) ? withs : withs ? [withs] : []
       need(list.length > 0, `需要 with 子图元（{kind:"box",size:[…]}，或用数组一次减/并多个）`)
       need(list.every(tool), 'with 里的每一项都要是图元（box/cylinder/sphere/cone/torus/extrude/revolve），且带 kind')
-    } else if (kind === 'fillet') need(pos(params.r), '需要 r>0')
-    else if (kind === 'chamfer') need(pos(params.d), '需要 d>0')
-    else if (kind === 'shell') need(pos(params.t), '需要 t>0（壁厚）')
-    else if (kind === 'pattern_linear') need(triple(params.delta) && num(params.count) && params.count >= 2, '需要 delta:[dx,dy,dz] 与 count>=2')
-    else if (kind === 'pattern_circular') need(num(params.count) && params.count >= 2, '需要 count>=2')
-    else if (kind === 'translate') need(triple(params.v), '需要 v:[dx,dy,dz]')
-    else if (kind === 'rotate') need(num(params.deg), '需要 deg（角度）')
+    } else if (kind === 'fillet') need(pos(probe.r), '需要 r>0')
+    else if (kind === 'chamfer') need(pos(probe.d), '需要 d>0')
+    else if (kind === 'shell') need(pos(probe.t), '需要 t>0（壁厚）')
+    else if (kind === 'pattern_linear') need(triple(probe.delta) && num(probe.count) && probe.count >= 2, '需要 delta:[dx,dy,dz] 与 count>=2')
+    else if (kind === 'pattern_circular') need(num(probe.count) && probe.count >= 2, '需要 count>=2')
+    else if (kind === 'translate') need(triple(probe.v), '需要 v:[dx,dy,dz]')
+    else if (kind === 'rotate') need(num(probe.deg), '需要 deg（角度）')
     return {
       id,
       kind,
@@ -2382,6 +2635,15 @@ if _TARGET:
    * Per-node status for the panel and for the caller: ok / failed / blocked /
    * skipped. Derived from what the kernel actually executed, not guessed.
    */
+  // True when this step hangs off a face (`at.ref`) instead of absolute XYZ.
+  const anchoredOn = (params) => {
+    if (!params || typeof params !== 'object') return false
+    const has = (v) => Boolean(v && typeof v === 'object' && v.ref)
+    if (has(params.at)) return true
+    const w = params.with
+    return Array.isArray(w) ? w.some((x) => has(x?.at)) : has(w?.at)
+  }
+
   const graphView = (doc, out) => {
     const list = Array.isArray(doc.features) ? doc.features : []
     const errors = Array.isArray(out?.errors) ? out.errors : []
@@ -2402,7 +2664,19 @@ if _TARGET:
       if (executed !== null && i >= executed) { why = `因为 ${f.id} 没有执行`; return { ...base, status: 'blocked', message: why } }
       return { ...base, status: 'ok', message: '' }
     })
-    return { tip: doc.tip ?? null, nodes }
+    // Dependencies are a chain, not a secret: features are evaluated in order
+    // and each one consumes the shape the previous one produced. Saying so
+    // out loud is what lets the panel answer "what breaks if I change this?"
+    // without inventing a graph we do not have.
+    const withDeps = nodes.map((n, i) => ({
+      ...n,
+      dependsOn: i > 0 ? [String(nodes[i - 1].id)] : [],
+      dependents: i + 1 < nodes.length ? [String(nodes[i + 1].id)] : [],
+      // An anchored primitive (`at.ref`) also follows the face it names, which
+      // is the only non-sequential edge we support today.
+      anchored: anchoredOn(list[i]?.params),
+    }))
+    return { tip: doc.tip ?? null, nodes: withDeps }
   }
 
   const rebuild = async (doc, dir, { note } = {}) => {
@@ -2752,7 +3026,7 @@ __out = {"ok": True, "exported": ${JSON.stringify(target)}, "volume": round(scen
           kind: doc.kind,
           params: doc.params,
           ...(typeof doc.script === 'string' ? { script: doc.script } : {}),
-          ...(doc.kind === 'features' ? { features: publicFeatures(doc) } : {}),
+          ...(doc.kind === 'features' ? { features: publicFeatures(doc), graph: graphView(doc, { errors: [], executed: null }), tip: doc.tip ?? null, vars: doc.vars ?? {} } : {}),
           runs: doc.run ?? 0,
           updatedAt: doc.updatedAt ?? '',
           stats: doc.stats ?? null,
@@ -2777,6 +3051,9 @@ __out = {"ok": True, "exported": ${JSON.stringify(target)}, "volume": round(scen
             name: key,
             kind: 'features',
             features: [],
+            // Vars must exist before the first feature is validated: dimensions
+            // are allowed to be expressions over them.
+            vars: normalizeVars(args.vars),
             params: args.params && typeof args.params === 'object' ? args.params : {},
             run: 0,
             createdAt: new Date().toISOString(),
@@ -2810,6 +3087,7 @@ __out = {"ok": True, "exported": ${JSON.stringify(target)}, "volume": round(scen
 
       if (action === 'update') {
         const doc = await readModel(args.name, dir)
+        if (args.vars !== undefined) doc.vars = normalizeVars(args.vars, doc.vars)
         const before = {
           script: doc.script,
           params: JSON.parse(JSON.stringify(doc.params)),
@@ -2893,10 +3171,14 @@ __out = {"ok": True, "exported": ${JSON.stringify(target)}, "volume": round(scen
         try {
           const parsed = JSON.parse(await readFile(join(dir, 'state.json'), 'utf8'))
           const setup = setupStatus(bridge, { withVersion: false })
-          return send(200, JSON.stringify({ runtime, setup, config: { autoOpen: resolved.autoOpen }, latest: parsed.latest ?? null, lastSession: parsed.lastSession ?? '', assemblies: parsed.assemblies ?? [], running: bridge.running || 0, runningSession: bridge.runningSession || '' }))
+          const diag = diagnose(bridge, resolved)
+          diag.checks = diag.checks.map((c) => (c.id === 'kernel' ? { ...c, detail: runtime.available ? [runtime.binary, runtime.version].filter(Boolean).join(' · ') : c.detail } : c))
+          return send(200, JSON.stringify({ runtime, setup, diag, config: { autoOpen: resolved.autoOpen }, latest: parsed.latest ?? null, lastSession: parsed.lastSession ?? '', assemblies: parsed.assemblies ?? [], running: bridge.running || 0, runningSession: bridge.runningSession || '' }))
         } catch {
           const setup = setupStatus(bridge, { withVersion: false })
-          return send(200, JSON.stringify({ runtime, setup, config: { autoOpen: resolved.autoOpen }, latest: null, lastSession: '', running: bridge.running || 0, runningSession: bridge.runningSession || '' }))
+          const diag = diagnose(bridge, resolved)
+          diag.checks = diag.checks.map((c) => (c.id === 'kernel' ? { ...c, detail: runtime.available ? [runtime.binary, runtime.version].filter(Boolean).join(' · ') : c.detail } : c))
+          return send(200, JSON.stringify({ runtime, setup, diag, config: { autoOpen: resolved.autoOpen }, latest: null, lastSession: '', running: bridge.running || 0, runningSession: bridge.runningSession || '' }))
         }
       }
       if (url.pathname === `${ROUTE_PREFIX}/scenes`) {
@@ -2921,6 +3203,10 @@ __out = {"ok": True, "exported": ${JSON.stringify(target)}, "volume": round(scen
         try { return JSON.parse(raw) } catch { return null }
       }
 
+      if (url.pathname === `${ROUTE_PREFIX}/doctor`) {
+        bridge.refresh()
+        return send(200, JSON.stringify(diagnose(bridge, resolved)))
+      }
       if (url.pathname === `${ROUTE_PREFIX}/setup`) {
         // The panel's "install FreeCAD" button; same code path as the tool so
         // both report identical fields.
