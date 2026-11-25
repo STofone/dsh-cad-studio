@@ -2415,6 +2415,291 @@ else:
   })
 
   tool({
+    name: 'cad_studio_sheet',
+    description: 'Write a drawing sheet you can hand to a shop: sheet frame, title block, arranged HLR views (first- or third-angle), overall dimensions in mm, SVG (and optional DXF). Views are oriented to the usual convention (front = width x height, top = width x depth, right = depth x height) by measuring the projection basis instead of assuming it.',
+    parameters: {
+      type: 'object',
+      properties: {
+        target: { type: 'string', description: 'Absolute .svg output path.' },
+        source: { type: 'string', description: 'Existing BRep model file (STEP/IGES/BREP).' },
+        code: { type: 'string', description: 'FreeCAD Python that binds `scene` or `export_shapes`.' },
+        model: { type: 'string', description: 'Draw a saved model document by name instead of a file or a script.' },
+        size: { type: 'string', description: 'Sheet size: A4, A3 or A2 (landscape). Default A3.' },
+        projection: { type: 'string', description: 'first (GB/ISO, default) or third (ASME).' },
+        views: { type: 'array', items: { type: 'string' }, description: 'Subset of ["front","top","right"]. Default all three.' },
+        scale: { type: 'number', description: 'Drawing scale factor, e.g. 0.5 for 1:2. Omit to fit the sheet.' },
+        title: { type: 'string', description: 'Part name for the title block.' },
+        number: { type: 'string', description: 'Drawing number for the title block.' },
+        material: { type: 'string', description: 'Material text for the title block.' },
+        dims: { type: 'boolean', description: 'Draw overall dimension lines (default true).' },
+        dxf: { type: 'boolean', description: 'Also write a sidecar .dxf next to the SVG.' },
+      },
+      required: ['target'],
+      additionalProperties: false,
+    },
+    output: {
+      schema: { type: 'object', properties: { ok: { type: 'boolean' }, path: { type: 'string' }, scale: { type: 'number' } } },
+      render: (_a, v) => [{ type: 'text', text: JSON.stringify(v, null, 2) }],
+    },
+    execute: async ({ target, source, code, model, size, projection, views, scale, title, number, material, dims, dxf }) => {
+      if (!target || extOf(target) !== 'svg') return { ok: false, error: 'target must be a .svg path' }
+      let src = ''
+      if (typeof model === 'string' && model) {
+        src = await modelShapes(model)
+        if (!src) return { ok: false, error: `没有这个模型：${model}` }
+      } else {
+        const x = shapesFrom({ source, code })
+        if (!x) return { ok: false, error: 'pass either source (a model file), model (a saved document) or code' }
+        src = x
+      }
+      const wanted = Array.isArray(views) && views.length ? views : ['front', 'top', 'right']
+      const py = `${PRELUDE}
+${src}
+import os, re, TechDraw
+_SIZES = {"A4": (297.0, 210.0), "A3": (420.0, 297.0), "A2": (594.0, 420.0)}
+# (view direction, horizontal model axis, vertical model axis) — the pair is what
+# a reader expects: front shows width x height, top shows width x depth.
+_WANT = {"front": ("X", "Z"), "top": ("X", "Y"), "right": ("Y", "Z")}
+_CAND = {"front": ((0, -1, 0), (0, 1, 0)), "top": ((0, 0, 1), (0, 0, -1)), "right": ((1, 0, 0), (-1, 0, 0))}
+_M = 10.0
+_TBW, _TBH = 180.0, 40.0
+_GAP = 26.0
+_PL = 10.0  # probe segment length (mm)
+
+def _seg(vec):
+    return Part.makeLine(FreeCAD.Vector(0, 0, 0), FreeCAD.Vector(*vec))
+
+def _nums(d):
+    return [float(x) for x in re.findall(r'-?[0-9]+(?:[.][0-9]+)?(?:[eE]-?[0-9]+)?', d)]
+
+def _axis_vectors(dv):
+    """Fragment-space image of each model axis, as a unit vector (+-1, 0).
+
+    One 10 mm edge per axis, projected on its own: an axis pointing along the
+    view direction collapses to nothing, the other two give their direction in
+    the fragment. Probing beats guessing — TechDraw's basis is not the naive
+    "front shows X-Z" one.
+    """
+    out = {}
+    for name, vec in (("X", (_PL, 0, 0)), ("Y", (0, _PL, 0)), ("Z", (0, 0, _PL))):
+        frag = TechDraw.projectToSVG(_seg(vec), FreeCAD.Vector(*dv))
+        ds = re.findall(r'd="([^"]+)"', frag)
+        if not ds:
+            continue
+        ns = _nums(ds[0])
+        if len(ns) < 4:
+            continue
+        dx, dy = ns[-2] - ns[0], ns[-1] - ns[1]
+        ln = math.hypot(dx, dy)
+        if ln < 1e-6:
+            continue  # this axis is the view direction
+        out[name] = (round(dx / ln), round(dy / ln))
+    return out
+
+def _solve(view):
+    """Pick a projection direction whose fragment basis is a rotation.
+
+    F maps read-space (u', v') to fragment-space (u, v): its columns are the
+    fragment images of the two read axes. det(F) < 0 means the drawing would be
+    mirrored (a reader would see the part the wrong way round), so the opposite
+    candidate direction wins instead.
+    """
+    pa, pb = _WANT[view]
+    for dv in _CAND[view]:
+        vec = _axis_vectors(dv)
+        if pa not in vec or pb not in vec:
+            continue
+        fu, fv = vec[pa], vec[pb]
+        det = fu[0] * fv[1] - fu[1] * fv[0]
+        if det <= 0:
+            continue
+        inv = (fv[1] / det, -fv[0] / det, -fu[1] / det, fu[0] / det)
+        return {"dir": dv, "inv": inv}
+    return None
+
+def _remap(frag, inv):
+    """Rewrite the fragment paths in read-space, y flipped for SVG."""
+    ia, ib, ic, id_ = inv
+    out = []
+    for d in re.findall(r'd="([^"]+)"', frag):
+        ns = _nums(d)
+        pts = [(ns[i], ns[i + 1]) for i in range(0, len(ns) - 1, 2)]
+        if not pts:
+            continue
+        q = [(ia * x + ib * y, -(ic * x + id_ * y)) for x, y in pts]
+        out.append("M " + " L ".join("%r %r" % p for p in q))
+    return out
+
+if not _shapes:
+    __out = {"ok": False, "error": "nothing to draw: pass a source path, a model, or bind scene / export_shapes"}
+else:
+    _shape = _shapes[0] if len(_shapes) == 1 else Part.makeCompound(_shapes)
+    _SW, _SH = _SIZES.get(str(${JSON.stringify(String(size || 'A3').toUpperCase())}).upper(), _SIZES["A3"])
+    _wanted = [v for v in ${JSON.stringify(wanted)} if v in _WANT] or ["front", "top", "right"]
+    _views = {}
+    _missing = []
+    for _v in _wanted:
+        _sol = _solve(_v)
+        if not _sol:
+            _missing.append(_v)
+            continue
+        _paths = _remap(TechDraw.projectToSVG(_shape, FreeCAD.Vector(*_sol["dir"])), _sol["inv"])
+        _pts = []
+        for _d in _paths:
+            _ns = _nums(_d)
+            _pts += [(_ns[i], _ns[i + 1]) for i in range(0, len(_ns) - 1, 2)]
+        if not _pts:
+            _missing.append(_v)
+            continue
+        _xs = [p[0] for p in _pts]; _ys = [p[1] for p in _pts]
+        _views[_v] = {"paths": _paths, "dir": _sol["dir"],
+                      "box": (min(_xs), min(_ys), max(_xs), max(_ys))}
+    if _missing:
+        __out = {"ok": False, "error": "无法为这些视图找到保持手性的投影方向：" + ", ".join(_missing)}
+    else:
+        _need_w = max(_views[v]["box"][2] - _views[v]["box"][0] for v in _wanted) + _GAP
+        _need_h = max(_views[v]["box"][3] - _views[v]["box"][1] for v in _wanted) + _GAP
+        _avail_w = _SW - 2 * _M
+        _avail_h = _SH - 2 * _M - _TBH - 6.0
+        _fit = min(_avail_w / max(_need_w, 1e-6), _avail_h / max(_need_h, 1e-6))
+        _given = float(${Number.isFinite(scale) && Number(scale) > 0 ? Number(scale) : 0})
+        if _given > 0:
+            _scale = _given
+        else:
+            _scale = 0.0
+            for _cand in (2.0, 1.5, 1.0, 0.5, 0.4, 0.25, 0.2, 0.1, 0.05):
+                if _cand <= _fit:
+                    _scale = _cand
+                    break
+            if _scale <= 0:
+                _scale = _fit
+
+        def _size(view):
+            _bx = _views[view]["box"]
+            return ((_bx[2] - _bx[0]) * _scale, (_bx[3] - _bx[1]) * _scale)
+
+        _first = str(${JSON.stringify(String(projection || 'first').toLowerCase())}).lower() != "third"
+        _cells = {}
+        _fw, _fh = _size("front") if "front" in _views else (0.0, 0.0)
+        for _v in _wanted:
+            _w, _h = _size(_v)
+            if _v == "front":
+                _cells[_v] = (0.0, 0.0, _w, _h)
+            elif _v == "top":
+                _cells[_v] = (0.0, (_fh + _GAP) if _first else -(_h + _GAP), _w, _h)
+            else:
+                _cells[_v] = ((_fw + _GAP) if not _first else -(_w + _GAP), 0.0, _w, _h)
+        _minx = min(c[0] for c in _cells.values()); _miny = min(c[1] for c in _cells.values())
+        _maxx = max(c[0] + c[2] for c in _cells.values()); _maxy = max(c[1] + c[3] for c in _cells.values())
+        _offx = _M + (_avail_w - (_maxx - _minx)) / 2.0 - _minx
+        _offy = _M + (_avail_h - (_maxy - _miny)) / 2.0 - _miny
+
+        _views_svg = []; _dims_svg = []; _labels = []; _dim_list = []
+        _draw_dims = bool(${dims === false ? 'False' : 'True'})
+        for _v in _wanted:
+            _vv = _views[_v]
+            _n0x, _n0y, _n1x, _n1y = _vv["box"]
+            _bw = _n1x - _n0x; _bh = _n1y - _n0y
+            _cx, _cy, _w, _h = _cells[_v]
+            _px = _cx + _offx; _py = _cy + _offy
+            # The paths are already in read-space (y down); place the bbox corner
+            # at the cell corner and scale.
+            _views_svg.append('<g fill="none" stroke="#111" stroke-width="0.25" stroke-linejoin="round" stroke-linecap="round" '
+                              'transform="translate(%r %r) scale(%r)">%s</g>' % (
+                                  _px - _n0x * _scale, _py - _n0y * _scale, _scale,
+                                  "".join('<path d="%s"/>' % _d for _d in _vv["paths"])))
+            _labels.append('<text x="%r" y="%r" font-size="3.0" fill="#555" font-family="sans-serif" text-anchor="middle">%s</text>' % (
+                _px + _w / 2.0, _py - 3.0, {"front": "主视图", "top": "俯视图", "right": "左视图"}.get(_v, _v)))
+            _wm = round(_bw, 2); _hm = round(_bh, 2)
+            _dim_list.append({"view": _v, "width_mm": _wm, "height_mm": _hm})
+            if _draw_dims and _w > 1e-6 and _h > 1e-6:
+                _yd = _py + _h + 9.0
+                _xd = _px + _w + 9.0
+                _dims_svg.append('<g stroke="#111" stroke-width="0.25" fill="none">'
+                                 '<path d="M %r %r L %r %r" stroke-dasharray="1,1"/>'
+                                 '<path d="M %r %r L %r %r" stroke-dasharray="1,1"/>'
+                                 '<path d="M %r %r L %r %r"/>'
+                                 '<path d="M %r %r L %r %r" stroke-dasharray="1,1"/>'
+                                 '<path d="M %r %r L %r %r" stroke-dasharray="1,1"/>'
+                                 '<path d="M %r %r L %r %r"/></g>' % (
+                                     _px, _py + _h, _px, _yd + 2.0, _px + _w, _py + _h, _px + _w, _yd + 2.0,
+                                     _px, _yd, _px + _w, _yd,
+                                     _px + _w, _py, _xd + 2.0, _py, _px + _w, _py + _h, _xd + 2.0, _py + _h,
+                                     _xd, _py, _xd, _py + _h))
+                _dims_svg.append('<text x="%r" y="%r" font-size="3.2" fill="#111" text-anchor="middle" font-family="sans-serif">%s</text>' % (
+                    _px + _w / 2.0, _yd + 4.2, _wm))
+                _dims_svg.append('<text x="%r" y="%r" font-size="3.2" fill="#111" text-anchor="middle" font-family="sans-serif" transform="rotate(90 %r %r)">%s</text>' % (
+                    _xd + 7.0, _py + _h / 2.0, _xd + 7.0, _py + _h / 2.0, _hm))
+
+        _frame = ('<g stroke="#111" fill="none" stroke-width="0.5">'
+                  '<rect x="%r" y="%r" width="%r" height="%r"/>'
+                  '<rect x="%r" y="%r" width="%r" height="%r"/></g>' % (
+                      _M, _M, _SW - 2 * _M, _SH - 2 * _M,
+                      _M + 2.0, _M + 2.0, _SW - 2 * _M - 4.0, _SH - 2 * _M - 4.0))
+        _tb_x = _SW - _M - _TBW
+        _tb_y = _SH - _M - _TBH
+        _title = str(${JSON.stringify(typeof title === 'string' ? title : '')}) or os.path.splitext(os.path.basename(${JSON.stringify(target)}))[0]
+        _number = str(${JSON.stringify(typeof number === 'string' ? number : '')})
+        _material = str(${JSON.stringify(typeof material === 'string' ? material : '')})
+        _scale_txt = ("1:%g" % round(1.0 / _scale, 4)) if _scale < 1.0 else (("%g:1" % _scale) if _scale > 1.0 else "1:1")
+        _tb = ['<g stroke="#111" fill="none" stroke-width="0.4">'
+               '<rect x="%r" y="%r" width="%r" height="%r"/>'
+               '<path d="M %r %r L %r %r"/><path d="M %r %r L %r %r"/><path d="M %r %r L %r %r"/></g>' % (
+                   _tb_x, _tb_y, _TBW, _TBH,
+                   _tb_x, _tb_y + 12.0, _tb_x + _TBW, _tb_y + 12.0,
+                   _tb_x, _tb_y + 24.0, _tb_x + _TBW, _tb_y + 24.0,
+                   _tb_x + 100.0, _tb_y + 12.0, _tb_x + 100.0, _tb_y + _TBH)]
+        _tb.append('<text x="%r" y="%r" font-size="4.4" font-weight="600" fill="#111" font-family="sans-serif">%s</text>' % (
+            _tb_x + 3.0, _tb_y + 8.4, _title.replace("&", "&amp;").replace("<", "&lt;")))
+        _tb.append('<text x="%r" y="%r" font-size="3.2" fill="#333" font-family="sans-serif">图号 %s</text>' % (
+            _tb_x + 3.0, _tb_y + 19.4, (_number or "-")))
+        _tb.append('<text x="%r" y="%r" font-size="3.2" fill="#333" font-family="sans-serif">材料 %s</text>' % (
+            _tb_x + 3.0, _tb_y + 31.4, (_material or "-")))
+        _tb.append('<text x="%r" y="%r" font-size="3.2" fill="#333" font-family="sans-serif">比例 %s</text>' % (
+            _tb_x + 103.0, _tb_y + 19.4, _scale_txt))
+        _tb.append('<text x="%r" y="%r" font-size="3.2" fill="#333" font-family="sans-serif">图幅 %s · 单位 mm</text>' % (
+            _tb_x + 103.0, _tb_y + 31.4, str(${JSON.stringify(String(size || 'A3').toUpperCase())})))
+        _tb.append('<text x="%r" y="%r" font-size="2.8" fill="#666" font-family="sans-serif">%s</text>' % (
+            _tb_x + 103.0, _tb_y + 8.4, __import__("datetime").date.today().isoformat()))
+        _svg = ('<svg xmlns="http://www.w3.org/2000/svg" width="%rmm" height="%rmm" viewBox="0 0 %r %r">'
+                '<rect width="100%%" height="100%%" fill="white"/>%s%s%s%s%s</svg>') % (
+            _SW, _SH, _SW, _SH, _frame, "".join(_views_svg), "".join(_dims_svg), "".join(_labels), "".join(_tb))
+        os.makedirs(os.path.dirname(${JSON.stringify(target)}) or ".", exist_ok=True)
+        open(${JSON.stringify(target)}, "w").write(_svg)
+        __out = {"ok": True, "path": ${JSON.stringify(target)}, "bytes": os.path.getsize(${JSON.stringify(target)}),
+                 "sheet_mm": [_SW, _SH], "scale": round(_scale, 4), "views": _wanted,
+                 "projection": "first" if _first else "third", "dimensions": _dim_list,
+                 "directions": {v: list(_views[v]["dir"]) for v in _wanted}}
+`
+      const out = await bridge.run(py, { title: `sheet → ${target}`, publishHint: false })
+      if (out && out.ok && dxf) {
+        const side = target.replace(/\.svg$/i, '.dxf')
+        const py2 = `${PRELUDE}
+${src}
+import os, TechDraw
+_doc = FreeCAD.newDocument("sheet")
+_obj = _doc.addObject("Part::Feature", "S")
+_obj.Shape = _shapes[0] if len(_shapes) == 1 else Part.makeCompound(_shapes)
+_page = _doc.addObject("TechDraw::DrawPage", "Page")
+for _v, _dir in (("front", (0, -1, 0)), ("top", (0, 0, 1)), ("right", (1, 0, 0))):
+    _view = _doc.addObject("TechDraw::DrawViewPart", "V" + _v)
+    _page.addView(_view)
+    _view.Source = [_obj]
+    _view.Direction = _dir
+_doc.recompute()
+_side = ${JSON.stringify(side)}
+os.makedirs(os.path.dirname(_side) or ".", exist_ok=True)
+TechDraw.writeDXFPage(_page, _side)
+__out = {"ok": True, "path": _side, "bytes": os.path.getsize(_side)}
+`
+        const d = await bridge.run(py2, { title: `sheet dxf → ${side}`, publishHint: false })
+        if (d && d.ok) out.dxf = { path: d.path, bytes: d.bytes }
+      }
+      return out
+    },
+  })
+
+  tool({
     name: 'cad_studio_measure',
     description: 'Measure a model: volume, surface area, bounding box, centroid, face/edge counts, and optionally the distance between two points.',
     parameters: {
@@ -3821,6 +4106,18 @@ if _TARGET:
    * the emitter. A feature model runs its own `featuresScript` (which already
    * knows how to export); a script model gets three extra lines appended.
    */
+  /** Python source that rebuilds a saved model's shapes into `_shapes`. */
+  async function modelShapes(name) {
+    const dirs = bridge.modelsCandidates()
+    const dir = dirs.find((d) => existsSync(join(d, `${name}.json`))) || dirs[0]
+    if (!existsSync(join(dir, `${name}.json`))) return ''
+    const doc = await readModel(name, dir)
+    bridge.noteModelsDir(dir)
+    return doc.kind === 'features'
+      ? featuresScript(featureOps(doc), '', { sketches: doc.sketches })
+      : `${PRELUDE}\nP = ${JSON.stringify(doc.params ?? {})}\n${doc.script}\n`
+  }
+
   async function exportModelStep(doc, target) {
     if (typeof target !== 'string' || !target) throw new Error('export 需要目标路径，例如 /path/model.step')
     await mkdir(dirname(target), { recursive: true })

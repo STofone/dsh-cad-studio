@@ -1264,6 +1264,48 @@ endsolid t
   ok('journal: undoing the restored create removed the model file', !existsSync(`/workspace/cad-models/${name}.json`), 'dir=/workspace/cad-models')
 }
 
+// ---- 7c. sheet: 正式图纸（图框 + 三视图 + 尺寸） ----------------------
+{
+  const target = join(tmpdir(), 'sheet_box.svg')
+  const sheet = await call('cad_studio_sheet', {
+    target,
+    code: 'scene = Part.makeBox(60, 40, 20)\n__out = {}',
+    size: 'A3',
+    title: '箱体',
+  })
+  ok('sheet: 60x40x20 → A3 at 2:1', sheet.ok === true && sheet.sheet_mm[0] === 420 && sheet.scale === 2, JSON.stringify(sheet).slice(0, 240))
+  const dims = Object.fromEntries((sheet.dimensions || []).map((d) => [d.view, [d.width_mm, d.height_mm]]))
+  ok('sheet: 前视 60x20 / 俯视 60x40 / 左视 40x20',
+    dims.front && dims.front[0] === 60 && dims.front[1] === 20 && dims.top[1] === 40 && dims.right[1] === 20,
+    JSON.stringify(dims))
+  // Drawn size = model size x scale. A rotated or unscaled view passes the
+  // numbers above but fails here — this is the regression that made the first
+  // version come out turned 90 degrees.
+  const svg = readFileSync(target, 'utf8')
+  const scale = sheet.scale
+  const boxes = [...svg.matchAll(/stroke-width="0\.25"[^>]*transform="translate\(([-\d.]+) ([-\d.]+)\) scale\(([-\d.]+)\)">(.*?)<\/g>/g)]
+    .map((m) => {
+      const nums = [...m[4].matchAll(/-?[0-9.]+/g)].map((x) => Number(x[0]))
+      const k = Number(m[3]); const tx = Number(m[1]); const ty = Number(m[2])
+      const pts = []
+      for (let i = 0; i < nums.length - 1; i += 2) pts.push([nums[i] * k + tx, nums[i + 1] * k + ty])
+      const xs = pts.map((q) => q[0]); const ys = pts.map((q) => q[1])
+      return { w: Math.max(...xs) - Math.min(...xs), h: Math.max(...ys) - Math.min(...ys), x: Math.min(...xs), y: Math.min(...ys) }
+    })
+  const want = [[120, 40], [120, 80], [80, 40]]
+  ok('sheet: 画出来的三个视图正好是 尺寸×比例（不是转过 90° 的）',
+    boxes.length === 3 && want.every((w, i) => near(boxes[i].w, w[0], 0.5) && near(boxes[i].h, w[1], 0.5)),
+    JSON.stringify(boxes))
+  const tbTop = 297 - 10 - 40
+  ok('sheet: 视图都落在图框内、不压标题栏',
+    boxes.every((b) => b.x >= 10 && b.y >= 10 && b.x + b.w <= 410 && b.y + b.h <= tbTop + 0.5),
+    JSON.stringify({ tbTop, boxes }))
+  ok('sheet: 视图名与尺寸标注都在', ['主视图', '俯视图', '左视图'].every((t) => svg.includes(t)) && svg.includes('比例 2:1'), 'labels')
+  // first-angle: the top view sits under the front view (ISO convention).
+  ok('sheet: 第一角法把俯视图放在主视图下方', boxes[1].y > boxes[0].y, JSON.stringify(boxes.map((b) => b.y)))
+  ok('sheet: 换 A4 就换图幅', (await call('cad_studio_sheet', { target: join(tmpdir(), 'sheet_a4.svg'), code: 'scene = Part.makeBox(30, 20, 10)\n__out = {}', size: 'A4' })).sheet_mm[0] === 297, 'A4=297 wide')
+}
+
 // ---- 8. teardown --------------------------------------------------------
 for (const d of disposed.reverse()) { try { d() } catch (e) { console.log('  [dispose warn]', e.message) } }
 ok('all tools unregistered on dispose', tools.size === 0, [...tools.keys()].join(','))

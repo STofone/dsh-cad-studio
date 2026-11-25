@@ -11,13 +11,13 @@
 
 ## P1 草图
 - [x] 5. 草图→`loft` / `sweep`（多草图截面）+ 草图存进文档
-- [ ] 6. 面板草图页签：几何与约束列表、数值可改、冲突标红
-- [ ] 7. 草图约束补全：angle / tangent / symmetric / equal
+- [x] 6. 面板草图页签：几何与约束列表、数值可改、冲突标红（特征抽屉里的「草图 N」，改数值即重建）
+- [x] 7. 草图约束补全：angle / symmetric / equal（angle 用户按度、内核按弧度，solve 后自检重测）
 
 ## P2 交付链
 - [x] 8. Mesh 修复与减面（`MeshPart.meshFromShape` + 去重/补洞/减面），导出前自检
 - [x] 9. 几何自检 `cad_studio_check`：isValid / 是否闭合 / 反向面 / 最小壁厚提示
-- [ ] 10. TechDraw 正式图纸（多视图 + 尺寸标注 + 图框）——HLR SVG 已有，缺标注
+- [x] 10. 正式图纸 `cad_studio_sheet`（A4/A3/A2 图框 + 标题栏 + 三视图 + 尺寸 + 第一/三角法；`dxf:true` 走 `TechDraw.writeDXFPage`）。TechDraw 0.20 headless 没有 PDF/整页 SVG 导出，所以图框与标注自己拼。
 - [ ] 11. 展开图 DXF（钣金式平铺）
 
 ## P3 装配
