@@ -1677,6 +1677,8 @@ const FILE_EXTS = ['step', 'stp', 'iges', 'igs', 'brep', 'stl']
       const [featDraft, setFeatDraft] = useState({})
       const [featAdd, setFeatAdd] = useState(false)
       const [featError, setFeatError] = useState('')
+      // Which document sketch is expanded in the 草图 section.
+      const [openSketch, setOpenSketch] = useState('')
       const featTimer = useRef(null)
       const dragRef = useRef({ timer: 0, pending: null })
       const viewportRef = useRef(null)
@@ -2019,10 +2021,64 @@ const FILE_EXTS = ['step', 'stp', 'iges', 'igs', 'brep', 'stl']
       }, [featureModel])
       const graphNodes = (payload && payload.graph && payload.graph.nodes) || []
       const graphTip = (payload && payload.graph && payload.graph.tip) || null
+      // Sketches are document data, so the panel edits the same thing the
+      // agent writes: change a dimension, the sketch is re-solved, re-measured
+      // and the whole feature chain rebuilds. Non-numeric constraints are shown
+      // read-only — they are geometry relations, not numbers.
+      const sketchDocs = (payload && payload.sketches) || {}
+      const sketchNames = Object.keys(sketchDocs || {})
+      const sketchSection = sketchNames.length
+        ? [
+          h('div', { key: 'sk-h', style: { ...styles.treeHint, display: 'flex', gap: 6, alignItems: 'center', marginTop: 2 }, 'data-cad-sketch-head': '1' }, `草图 ${sketchNames.length}`),
+          ...sketchNames.map((name) => {
+            const sk = sketchDocs[name] || {}
+            const geos = Array.isArray(sk.geometry) ? sk.geometry : []
+            const cons = Array.isArray(sk.constraints) ? sk.constraints : []
+            const open = openSketch === name
+            const setValue = (cid, raw) => {
+              const value = Number(raw)
+              if (!Number.isFinite(value)) return
+              const next = JSON.parse(JSON.stringify(sk))
+              const hit = (next.constraints || []).find((c) => String(c.id) === String(cid))
+              if (!hit) return
+              hit.value = value
+              postFeature({ action: 'sketch', sketch: { name, def: next } })
+            }
+            return h('div', { key: `sk-${name}`, style: styles.featBlock, 'data-cad-sketch': name }, [
+              h('div', {
+                key: 'r',
+                style: { ...styles.featHead, cursor: 'pointer' },
+                'data-cad-sketch-toggle': name,
+                onClick: (event) => { event.stopPropagation(); setOpenSketch(open ? '' : name) },
+              }, [
+                h('span', { key: 'n', style: { ...styles.featLabel, minWidth: 0, flex: '1 1 auto', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }, title: `${name}：${geos.length} 条线 · ${cons.length} 个约束` }, `${name} · ${geos.length} 线 ${cons.length} 约束`),
+              ]),
+              open
+                ? h('div', { key: 'b', style: { paddingLeft: 8, paddingBottom: 4 } }, [
+                  ...cons.filter((c) => typeof c.value === 'number').map((c) => h('div', { key: `d-${c.id}`, style: { display: 'flex', gap: 6, alignItems: 'center', margin: '2px 0' } }, [
+                    h('span', { key: 'l', style: { fontSize: 11, opacity: 0.72, flex: '1 1 auto', minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }, title: `${c.type} ${c.a || ''} ${c.b || ''}` }, `${c.type}${c.a ? ` ${c.a}` : ''}`),
+                    h('input', {
+                      key: 'i',
+                      type: 'number',
+                      style: { ...styles.jointNum, width: 62, fontSize: 11, flex: '0 0 auto', boxSizing: 'border-box' },
+                      'data-cad-sk-value': `${name}:${c.id}`,
+                      value: String(c.value),
+                      onChange: (event) => setValue(c.id, event.currentTarget.value),
+                    }),
+                  ])),
+                  ...cons.filter((c) => typeof c.value !== 'number').map((c) => h('div', { key: `g-${c.id}`, style: { fontSize: 11, opacity: 0.62, margin: '1px 0' }, 'data-cad-sk-geo': `${name}:${c.id}` }, `${c.type} ${c.a || ''}${c.b ? ` · ${c.b}` : ''}`)),
+                  h('div', { key: 'geo', style: { fontSize: 10.5, opacity: 0.5, marginTop: 2, whiteSpace: 'normal' } }, geos.map((g) => g.id).join(' · ')),
+                ])
+                : null,
+            ])
+          }),
+        ]
+        : []
       const featureBody = paramsSection.length
         ? [...paramsSection, ...(!featureList.length
           ? [h('div', { key: 'script-hint', style: { ...styles.treeHint, whiteSpace: 'nowrap' }, title: '脚本模型：改参数会重跑脚本；逐条特征只适用于声明式模型' }, '脚本模型 · 改参数即重跑脚本')]
           : [h('div', { key: 'feat-h', style: { ...styles.treeHint, marginTop: 2 } }, `${featureList.length} 特征`)])]
+        .concat(sketchSection)
         : !featureModel || !featureList.length
         ? [h('div', { key: 'none', style: styles.propEmpty },
           featureModel
@@ -2054,6 +2110,7 @@ const FILE_EXTS = ['step', 'stp', 'iges', 'igs', 'brep', 'stl']
             }, kind)))
             : null,
           featError ? h('div', { key: 'e', style: styles.featError, 'data-cad-feat-error': '1' }, featError) : null,
+          ...sketchSection,
           ...featureList.map((feature, index) => {
             const off = feature.enabled === false
             const node = graphNodes.find((n) => n.id === feature.id)

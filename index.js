@@ -3359,7 +3359,7 @@ if _TARGET:
     const code = isFeatures
       ? featuresScript(featureOps(doc), null, { cache, resume, sketches: doc.sketches })
       : `${PRELUDE}\nP = ${JSON.stringify(doc.params ?? {})}\n${doc.script}`
-    const meta = isFeatures ? { model: doc.name, features: publicFeatures(doc), tip: doc.tip ?? null } : { model: doc.name, params: doc.params ?? {} }
+    const meta = isFeatures ? { model: doc.name, features: publicFeatures(doc), sketches: doc.sketches ?? {}, tip: doc.tip ?? null } : { model: doc.name, params: doc.params ?? {} }
     doc.run = (doc.run ?? 0) + 1
     doc.updatedAt = new Date().toISOString()
     // One row per model: a rebuild rewrites the model's existing scene.
@@ -3505,8 +3505,55 @@ if _TARGET:
       throw new Error(`${doc.name} 是脚本模型，没有特征列表（用 cad_studio_doc update 改 params，或新建 kind="features" 的模型）`)
     }
     if (action === 'list') {
-      return { ok: true, model: doc.name, kind: doc.kind, features: publicFeatures(doc), graph: graphView(doc, { errors: [], executed: null }), stats: doc.stats ?? null }
+      return { ok: true, model: doc.name, kind: doc.kind, features: publicFeatures(doc), sketches: doc.sketches ?? {}, graph: graphView(doc, { errors: [], executed: null }), stats: doc.stats ?? null }
     }
+    if (action === 'sketch') {
+      // Sketches are document data (geometry + constraints), so editing one is
+      // a document edit: same rollback rule as a feature edit, and the sketch
+      // rides into the BREP cache hash so geometry actually changes.
+      const raw = args.sketch && typeof args.sketch === 'object' ? args.sketch : {}
+      const name = String(raw.name ?? '')
+      if (!name) throw new Error('sketch 需要 name（要改的草图名）')
+      const beforeSketches = JSON.parse(JSON.stringify(doc.sketches ?? {}))
+      const beforeStats = doc.stats ? JSON.parse(JSON.stringify(doc.stats)) : null
+      doc.sketches = normalizeSketches({ [name]: raw.remove ? null : (raw.def ?? raw) }, doc.sketches ?? {})
+      let result
+      try {
+        result = await rebuild(doc, dir, { note: `sketch ${name} ${raw.remove ? 'remove' : 'edit'}` })
+      } catch (error) {
+        doc.sketches = beforeSketches
+        doc.stats = beforeStats
+        await writeModel(doc, dir)
+        return { ok: false, evaluated: false, model: doc.name, action, error: String(error?.message ?? error), sketches: doc.sketches }
+      }
+      doc.history = Array.isArray(doc.history) ? doc.history : []
+      doc.history.push({ at: new Date().toISOString(), note: `sketch ${name}`, params: null, run: result.ok !== false })
+      doc.history = doc.history.slice(-20)
+      await writeModel(doc, dir)
+      return {
+        ok: true,
+        evaluated: result.ok !== false && (result.errors ?? []).length === 0,
+        model: doc.name,
+        kind: doc.kind,
+        action,
+        // A whole-emitter failure has no per-node error, only this message.
+        error: result.ok === false ? String(result.error ?? 'rebuild failed') : '',
+        features: publicFeatures(doc),
+        sketches: doc.sketches ?? {},
+        graph: result.graph,
+        errors: result.errors ?? [],
+        undo: doc.undo.length,
+        redo: doc.redo.length,
+        volume: doc.stats?.volume ?? null,
+        triangles: doc.stats?.triangles ?? null,
+        sceneId: doc.stats?.sceneId ?? '',
+        run: doc.run,
+        cached: result.cached ?? 0,
+        computed: result.computed ?? null,
+        revalidated: result.revalidated === true,
+      }
+    }
+
     const snapshot = () => JSON.parse(JSON.stringify({ features: doc.features, tip: doc.tip ?? null }))
     const restore = (snap) => {
       doc.features = JSON.parse(JSON.stringify(snap.features))
@@ -3607,6 +3654,7 @@ if _TARGET:
       kind: doc.kind,
       action,
       features: publicFeatures(doc),
+      sketches: doc.sketches ?? {},
       graph: result.graph,
       errors: result.errors ?? [],
       undo: doc.undo.length,
@@ -3624,12 +3672,18 @@ if _TARGET:
 
   tool({
     name: 'cad_studio_features',
-    description: `Edit a feature-list model one feature at a time (the "边画边改" path): change one feature's parameters and the whole list is re-derived in ~0.2–0.6 s. Actions: list / add / update / remove / move / toggle (alias suppress) / tip / undo / redo. Feature kinds: ${FEATURE_KINDS.join(', ')}. A feature is {kind, label?, params} — params hold that kind's fields (box: size:[dx,dy,dz], at?; cylinder: r,h,at?,axis?; cut/fuse/common: with:<primitive>; fillet: r; chamfer: d; shell: t,open?; pattern_linear: delta,count; rotate: axis?,at?,deg; mirror: normal?,at?). Flat form ({kind:'box', size:[…]}) is accepted too.`,
+    description: `Edit a feature-list model one feature at a time (the "边画边改" path): change one feature's parameters and the whole list is re-derived in ~0.2–0.6 s. Actions: list / add / update / remove / move / toggle (alias suppress) / tip / undo / redo / sketch (edit one document sketch and rebuild). Feature kinds: ${FEATURE_KINDS.join(', ')}. A feature is {kind, label?, params} — params hold that kind's fields (box: size:[dx,dy,dz], at?; cylinder: r,h,at?,axis?; cut/fuse/common: with:<primitive>; fillet: r; chamfer: d; shell: t,open?; pattern_linear: delta,count; rotate: axis?,at?,deg; mirror: normal?,at?). Flat form ({kind:'box', size:[…]}) is accepted too.`,
     parameters: {
       type: 'object',
       properties: {
         model: { type: 'string', description: 'Feature-list model name (created with cad_studio_doc kind="features").' },
-        action: { type: 'string', enum: ['list', 'add', 'update', 'remove', 'move', 'toggle', 'suppress', 'tip', 'undo', 'redo'] },
+        action: { type: 'string', enum: ['list', 'add', 'update', 'remove', 'move', 'toggle', 'suppress', 'tip', 'undo', 'redo', 'sketch'] },
+        sketch: {
+          type: 'object',
+          description: 'With action:"sketch": {name, def:{geometry:[…],constraints:[…]}} replaces one sketch, {name, remove:true} deletes it. The document is rebuilt immediately; a constraint the solver cannot meet rolls the sketch back.',
+          properties: { name: { type: 'string' }, remove: { type: 'boolean' }, def: { type: 'object' } },
+          required: ['name'],
+        },
         feature: { type: 'object', description: 'add: the feature to append. update/toggle: {id, ...fields to change}. remove/move: {id}.' },
         id: { type: 'string', description: 'Feature id (f1, f2 …); alternative to feature.id.' },
         to: { type: 'integer', description: 'move: target index (0-based). Default: to the end.' },
