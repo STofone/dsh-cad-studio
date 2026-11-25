@@ -1097,6 +1097,21 @@ window.__ModuleLoader__.load({
     // better-sidebar matches on the extension WITHOUT the dot (see its builtin
     // viewers: ['md','markdown']), so a dot-prefixed list would never match.
     /** mm³ → a unit a human reads without counting zeros (1 L = 1e6 mm³). */
+// Ctrl+Z belongs to the panel whenever the focus is not in a text field.
+// Checking the tag alone is wrong: a range slider (opacity) is an INPUT too,
+// and while it keeps focus after a drag every undo press was swallowed until
+// the popover closed. Only elements that actually edit text keep the browser's
+// own undo.
+const TEXT_INPUT_TYPES = new Set(['', 'text', 'search', 'url', 'tel', 'email', 'password', 'number', 'date', 'time', 'datetime-local', 'month', 'week'])
+function isTextEntry(el) {
+  if (!el || !el.tagName) return false
+  const tag = String(el.tagName).toLowerCase()
+  if (tag === 'textarea') return true
+  if (el.isContentEditable) return true
+  if (tag !== 'input') return false
+  return TEXT_INPUT_TYPES.has(String(el.type || 'text').toLowerCase())
+}
+
 function formatVolume(mm3) {
   const v = Number(mm3) || 0
   if (v >= 1e6) return `${(v / 1e6).toFixed(2)} L`
@@ -1685,8 +1700,7 @@ const FILE_EXTS = ['step', 'stp', 'iges', 'igs', 'brep', 'stl']
           if (!(event.ctrlKey || event.metaKey)) return
           if (key !== 'z' && key !== 'y') return
           const target = event.target
-          const tag = target && target.tagName ? target.tagName.toLowerCase() : ''
-          if (tag === 'input' || tag === 'textarea' || tag === 'select' || (target && target.isContentEditable)) return
+          if (isTextEntry(target)) return
           if (panelRef.current === 'features') return
           const host = panelRootRef.current
           const focused = document.activeElement
@@ -2073,8 +2087,7 @@ const FILE_EXTS = ['step', 'stp', 'iges', 'igs', 'brep', 'stl']
         : []
       useEffect(() => {
         const onKey = (event) => {
-          const tag = (event.target && event.target.tagName) || ''
-          if (/^(INPUT|TEXTAREA|SELECT)$/.test(tag)) return
+          if (isTextEntry(event.target)) return
           if (!(event.metaKey || event.ctrlKey) || !featureModel) return
           const key = String(event.key || '').toLowerCase()
           if (key === 'z') {
