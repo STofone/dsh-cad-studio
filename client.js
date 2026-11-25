@@ -61,13 +61,29 @@ window.__ModuleLoader__.load({
         boxShadow: '6px 0 18px rgba(0,0,0,.16)',
       },
       headBtn: { font: 'inherit', fontSize: 11, padding: '2px 7px', borderRadius: 5, border: '1px solid rgba(120,130,145,.45)', background: 'transparent', cursor: 'pointer', flex: 'none', lineHeight: 1.5 },
-      undoPair: { position: 'absolute', right: 8, bottom: 8, display: 'flex', gap: 4, zIndex: 12 },
-      undoBtn: (active) => ({
-        width: 24, height: 24, borderRadius: 6, border: '1px solid rgba(140,150,165,.34)',
+      // Undo/redo live at the top-right of the panel header, not floating over
+      // the viewport: they act on the whole panel, and a floating pair sat on
+      // top of the model exactly where the user wanted to look.
+      headActions: { display: 'flex', alignItems: 'center', gap: 2, flex: '0 0 auto', marginLeft: 2 },
+      histBtn: (active) => ({
+        width: 22, height: 22, borderRadius: 5, border: '1px solid transparent',
         background: active ? 'rgba(120,130,145,.16)' : 'transparent', color: 'inherit',
-        opacity: active ? 0.9 : 0.28, cursor: active ? 'pointer' : 'default',
-        fontSize: 14, padding: 0, display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
+        opacity: active ? 0.9 : 0.3, cursor: active ? 'pointer' : 'default',
+        fontSize: 13, padding: 0, display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
+        lineHeight: 1,
       }),
+      histRow: (active) => ({
+        display: 'flex', alignItems: 'center', gap: 6, width: '100%', minWidth: 0,
+        padding: '4px 6px', border: 'none', borderRadius: 5, textAlign: 'left',
+        font: 'inherit', fontSize: 11.5, cursor: 'pointer', color: 'inherit',
+        background: active ? 'rgba(77,107,254,.16)' : 'transparent',
+      }),
+      histIndex: {
+        flex: '0 0 auto', width: 18, textAlign: 'right', fontSize: 10,
+        opacity: 0.55, fontVariantNumeric: 'tabular-nums',
+      },
+      histTime: { flex: '0 0 auto', fontSize: 9.5, opacity: 0.5, fontVariantNumeric: 'tabular-nums' },
+      histEmpty: { padding: '4px 6px', fontSize: 11, opacity: 0.7, display: 'flex', flexDirection: 'column', gap: 5, lineHeight: 1.5 },
       stats: { position: 'absolute', left: 8, bottom: 6, zIndex: 10, fontSize: 10, opacity: 0.62, pointerEvents: 'none', whiteSpace: 'nowrap', fontVariantNumeric: 'tabular-nums' },
       menu: { position: 'absolute', right: 6, top: 30, zIndex: 40, minWidth: 132, padding: 4, borderRadius: 6, border: '1px solid', boxShadow: '0 10px 26px rgba(0,0,0,.3)' },
       menuRow: { display: 'flex', gap: 4, padding: '3px 4px', flexWrap: 'wrap' },
@@ -392,6 +408,64 @@ window.__ModuleLoader__.load({
     // Icons are inline SVG on a 20x20 grid rendered at exactly 20 CSS px, so the
     // scale is 1:1 and the strokes land on whole pixels (a 16-unit viewBox
     // stretched to 17 px is what made the previous set look soft).
+    // What one appearance step actually changed, in one short line. The history
+    // drawer exists so a user can tell "which step hid that part", which means
+    // the label has to name the target, not just say "外观改动".
+    function lookDiffLabel(before, after) {
+      let a = {}
+      let b = {}
+      try { a = JSON.parse(before) || {} } catch (err) { a = {} }
+      try { b = JSON.parse(after) || {} } catch (err) { b = {} }
+      const out = []
+      const av = a.v || {}
+      const bv = b.v || {}
+      const names = new Set([...Object.keys(av), ...Object.keys(bv)])
+      const hidden = []
+      const shown = []
+      for (const name of names) {
+        const was = av[name] !== false
+        const now = bv[name] !== false
+        if (was === now) continue
+        if (now) shown.push(name)
+        else hidden.push(name)
+      }
+      if (hidden.length === 1) out.push(`隐藏 ${hidden[0]}`)
+      else if (hidden.length > 1) out.push(`隐藏 ${hidden.length} 件`)
+      if (shown.length === 1) out.push(`显示 ${shown[0]}`)
+      else if (shown.length > 1) out.push(`显示 ${shown.length} 件`)
+      const colors = []
+      for (const kind of ['inst', 'part']) {
+        const ao = (a.o && a.o[kind]) || {}
+        const bo = (b.o && b.o[kind]) || {}
+        for (const key of new Set([...Object.keys(ao), ...Object.keys(bo)])) {
+          const from = ao[key] || ''
+          const to = bo[key] || ''
+          if (from !== to) colors.push({ key, to })
+        }
+      }
+      if (colors.length === 1) out.push(colors[0].to ? `换色 ${colors[0].key} → ${colors[0].to}` : `恢复默认色 ${colors[0].key}`)
+      else if (colors.length > 1) out.push(`换色 ${colors.length} 处`)
+      const ao2 = a.a || {}
+      const bo2 = b.a || {}
+      const ops = []
+      for (const key of new Set([...Object.keys(ao2), ...Object.keys(bo2)])) {
+        const from = typeof ao2[key] === 'number' ? ao2[key] : 1
+        const to = typeof bo2[key] === 'number' ? bo2[key] : 1
+        if (Math.abs(from - to) > 1e-6) ops.push({ key, to })
+      }
+      if (ops.length === 1) out.push(`透明度 ${ops[0].key} ${Math.round(ops[0].to * 100)}%`)
+      else if (ops.length > 1) out.push(`透明度 ${ops.length} 件`)
+      const aw = a.w || {}
+      const bw = b.w || {}
+      const wires = []
+      for (const key of new Set([...Object.keys(aw), ...Object.keys(bw)])) {
+        if (Boolean(aw[key]) !== Boolean(bw[key])) wires.push({ key, on: Boolean(bw[key]) })
+      }
+      if (wires.length === 1) out.push(`线框 ${wires[0].on ? '开' : '关'} ${wires[0].key}`)
+      else if (wires.length > 1) out.push(`线框 ${wires.length} 件`)
+      return out.join(' · ') || '外观改动'
+    }
+
     function RailIcon({ name }) {
       const common = {
         width: 20,
@@ -451,6 +525,14 @@ window.__ModuleLoader__.load({
         return h('svg', common, [
           h('path', { key: 'a', d: 'M2.6 6.4c0-.9.5-1.4 1.4-1.4h3.4l1.6 1.8h7.4c.9 0 1.4.5 1.4 1.4v6.4c0 .9-.5 1.4-1.4 1.4H4c-.9 0-1.4-.5-1.4-1.4V6.4Z' }),
           h('path', { key: 'b', d: 'M2.6 9.4h14.8' }),
+        ])
+      }
+      if (name === 'history') {
+        // A clock face with a counter-clockwise arrow: "what changed, in order".
+        return h('svg', common, [
+          h('path', { key: 'a', d: 'M10 3.1a6.9 6.9 0 1 1-6.1 3.7' }),
+          h('path', { key: 'b', d: 'M2.6 3.2v3.9h3.9' }),
+          h('path', { key: 'c', d: 'M10 6.6V10l2.6 1.7' }),
         ])
       }
       return h('svg', common, [
@@ -1638,6 +1720,30 @@ const FILE_EXTS = ['step', 'stp', 'iges', 'igs', 'brep', 'stl']
         applyLook(entry.after)
         setHistTick((t) => t + 1)
       }
+      // Jump to an arbitrary point of the stack, which is what the history
+      // drawer's rows do: index -1 means "the look before the first step".
+      const jumpTo = (index) => {
+        const h = histRef.current
+        if (!h.undo.length) return
+        const target = index < 0 ? h.undo[0].before : h.undo[Math.min(index, h.undo.length - 1)].after
+        const tail = h.undo.splice(index + 1)
+        h.redo = tail.reverse().concat(h.redo)
+        h.at = 0
+        applyLook(target)
+        setHistTick((t) => t + 1)
+      }
+      // Clicking a dimmed (already undone) row walks forward again.
+      const jumpForward = (step) => {
+        const h = histRef.current
+        const seq = h.redo.slice().reverse()
+        const entry = seq[step]
+        if (!entry) return
+        h.undo = h.undo.concat(seq.slice(0, step + 1))
+        h.redo = seq.slice(step + 1).reverse()
+        h.at = 0
+        applyLook(entry.after)
+        setHistTick((t) => t + 1)
+      }
 
       // Async callbacks (the 1.5 s poller) close over the render they were
       // created in, so the live look has to be read from a ref, not from state.
@@ -1659,9 +1765,12 @@ const FILE_EXTS = ['step', 'stp', 'iges', 'igs', 'brep', 'stl']
         if (h.quiet) { h.quiet = false; h.last = lookSnap; return }
         if (lookSnap === h.last) return
         const top = h.undo[h.undo.length - 1]
-        if (top && now - h.at < 1500) top.after = lookSnap
-        else {
-          h.undo.push({ before: h.last, after: lookSnap })
+        if (top && now - h.at < 1500) {
+          top.after = lookSnap
+          top.label = lookDiffLabel(top.before, lookSnap)
+          top.at = now
+        } else {
+          h.undo.push({ before: h.last, after: lookSnap, label: lookDiffLabel(h.last, lookSnap), at: now })
           if (h.undo.length > 40) h.undo.shift()
         }
         h.redo = []
@@ -2488,7 +2597,7 @@ const FILE_EXTS = ['step', 'stp', 'iges', 'igs', 'brep', 'stl']
         ]
         : []
 
-      const panelTitle = { parts: '零件', features: '特征', props: '选中项', motion: '运动', view: '视图', models: '模型', info: '信息' }[panel] || ''
+      const panelTitle = { parts: '零件', features: '特征', props: '选中项', history: '操作历史', motion: '运动', view: '视图', models: '模型', info: '信息' }[panel] || ''
       // The scene carries `asm:<id>` for an assembly, which is how the deps list
       // is matched to what is on screen.
       const depsModel = deps && payload && typeof payload.docKey === 'string' && payload.docKey.startsWith('asm:')
@@ -2697,12 +2806,79 @@ const FILE_EXTS = ['step', 'stp', 'iges', 'igs', 'brep', 'stl']
         const base = String(sc.title || sc.id || '').split('/').pop()
         return base.replace(/\.(step|stp|stl|brep|iges|igs|stpz)$/i, '') || String(sc.id || '')
       }
+      // ---- 操作历史抽屉 ----------------------------------------------------
+      // The undo stack is a list of appearance snapshots; the drawer turns it
+      // into readable rows ("隐藏 缸体_外包络 · 14:22:03") and lets a click
+      // land on any of them instead of stepping through Ctrl+Z one by one.
+      const histStamp = (ms) => (ms ? new Date(ms).toLocaleTimeString('zh-CN', { hour12: false }) : '')
+      const histRows = (() => {
+        const state = histRef.current
+        const rows = []
+        if (!state.undo.length && !state.redo.length) {
+          return [h('div', { key: 'none', style: styles.histEmpty }, [
+            h('div', { key: 'a' }, '还没有外观改动。'),
+            h('div', { key: 'b' }, '改颜色、显隐、透明度或线框之后，每一步都会记在这里，点一行就能跳回那一步。'),
+          ])]
+        }
+        if (state.undo.length) {
+          rows.push(h('button', {
+            key: 'origin',
+            type: 'button',
+            'data-cad-hist': 'origin',
+            style: { ...styles.histRow(false), fontSize: 10.5, opacity: 0.72 },
+            title: '回到所有外观改动之前',
+            onClick: () => jumpTo(-1),
+          }, '回到最初的样子'))
+        }
+        for (let i = state.undo.length - 1; i >= 0; i -= 1) {
+          const entry = state.undo[i]
+          rows.push(h('button', {
+            key: `u${i}`,
+            type: 'button',
+            'data-cad-hist': `u${i}`,
+            'data-cad-hist-state': i === state.undo.length - 1 ? 'current' : 'past',
+            style: styles.histRow(i === state.undo.length - 1),
+            title: `${entry.label || '外观改动'}（回到这一步之后）`,
+            onClick: () => jumpTo(i),
+          }, [
+            h('span', { key: 'n', style: styles.histIndex }, String(i + 1)),
+            h('span', { key: 'l', style: { flex: '1 1 auto', minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, entry.label || '外观改动'),
+            h('span', { key: 't', style: styles.histTime }, histStamp(entry.at)),
+          ]))
+        }
+        const future = state.redo.slice().reverse()
+        for (let k = 0; k < future.length; k += 1) {
+          const entry = future[k]
+          rows.push(h('button', {
+            key: `r${k}`,
+            type: 'button',
+            'data-cad-hist': `r${k}`,
+            'data-cad-hist-state': 'undone',
+            style: { ...styles.histRow(false), opacity: 0.45 },
+            title: `${entry.label || '外观改动'}（已撤销，点一下再做一次）`,
+            onClick: () => jumpForward(k),
+          }, [
+            h('span', { key: 'n', style: styles.histIndex }, '↷'),
+            h('span', { key: 'l', style: { flex: '1 1 auto', minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, entry.label || '外观改动'),
+            h('span', { key: 't', style: styles.histTime }, histStamp(entry.at)),
+          ]))
+        }
+        return rows
+      })()
+      const historyBody = h('div', { key: 'hist', style: { display: 'flex', flexDirection: 'column', gap: 1 }, 'data-cad-history': `${histRef.current.undo.length}/${histRef.current.redo.length}` }, [
+        ...histRows,
+        h('div', { key: 'note', style: { ...styles.treeHint, whiteSpace: 'normal', padding: '6px 6px 0' } },
+          '这里只记外观（颜色/显隐/透明度/线框），一步一条，快捷键 Ctrl+Z / Ctrl+Shift+Z。模型特征与参数的撤销在「特征」里。'),
+      ])
+
       const panelBody = panel === 'parts'
         ? rows
         : panel === 'features'
           ? featureBody
         : panel === 'props'
           ? inspectorBody
+        : panel === 'history'
+          ? historyBody
           : panel === 'motion'
           ? motionBody
           : panel === 'view'
@@ -2784,13 +2960,14 @@ const FILE_EXTS = ['step', 'stp', 'iges', 'igs', 'brep', 'stl']
         { id: 'parts', label: '零件：显隐与配色' },
         { id: 'features', label: '特征列表：改一条就重建' },
         { id: 'props', label: '选中项属性' },
+        { id: 'history', label: '操作历史：外观改动的每一步，可点回' },
         { id: 'motion', label: '关节与运动、爆炸图' },
         { id: 'view', label: '视图与显示' },
         { id: 'models', label: '切换模型' },
         { id: 'info', label: '模型信息' },
       ]
 
-      return h('div', { style: styles.root, 'data-cad-panel-root': '1', onMouseDown: () => { panelTouchRef.current = Date.now() } }, [
+      return h('div', { style: styles.root, ref: panelRootRef, 'data-cad-panel-root': '1', onMouseDown: () => { panelTouchRef.current = Date.now() } }, [
         h('div', {
           key: 'head',
           style: styles.head,
@@ -2883,6 +3060,28 @@ const FILE_EXTS = ['step', 'stp', 'iges', 'igs', 'brep', 'stl']
                 : null,
             ]),
           ]),
+          h('div', { key: 'hist', style: styles.headActions, 'data-cad-head-actions': '1' }, [
+            h('button', {
+              key: 'u',
+              type: 'button',
+              style: styles.histBtn(histRef.current.undo.length > 0),
+              title: histRef.current.undo.length ? `撤销：${histRef.current.undo[histRef.current.undo.length - 1].label || '外观改动'}` : '没有可撤销的外观改动',
+              'aria-label': '撤销外观改动',
+              'data-cad-undo': histRef.current.undo.length,
+              disabled: !histRef.current.undo.length,
+              onClick: doUndo,
+            }, '↶'),
+            h('button', {
+              key: 'r',
+              type: 'button',
+              style: styles.histBtn(histRef.current.redo.length > 0),
+              title: histRef.current.redo.length ? '重做外观改动' : '没有可重做的改动',
+              'aria-label': '重做外观改动',
+              'data-cad-redo': histRef.current.redo.length,
+              disabled: !histRef.current.redo.length,
+              onClick: doRedo,
+            }, '↷'),
+          ]),
         ]),
         error ? h('div', { key: 'err', style: styles.warn }, error) : null,
         h('div', { key: 'body', style: { display: 'flex', flex: 1, minHeight: 0, minWidth: 0 } }, [
@@ -2907,19 +3106,6 @@ const FILE_EXTS = ['step', 'stp', 'iges', 'igs', 'brep', 'stl']
               : payload
               ? h('div', { key: 'stage', style: styles.stage }, [
                 h(Viewport, { payload, visibility, options: { ...display, overrides, opacities, wireframes, restoreCamera: pendingCameraRef.current, onPick: pickInViewport }, handleRef: viewportRef }),
-                h('div', { key: 'undo', style: styles.undoPair, ref: panelRootRef }, [
-                  h('button', {
-                    key: 'u', type: 'button', style: styles.undoBtn(histRef.current.undo.length > 0),
-                    title: histRef.current.undo.length ? '撤销上一次外观改动' : '没有可撤销的改动',
-                    'aria-label': '撤销外观改动', 'data-cad-undo': histRef.current.undo.length,
-                    onClick: doUndo,
-                  }, '↶'),
-                  h('button', {
-                    key: 'r', type: 'button', style: styles.undoBtn(histRef.current.redo.length > 0),
-                    title: '重做外观改动', 'aria-label': '重做外观改动', 'data-cad-redo': histRef.current.redo.length,
-                    onClick: doRedo,
-                  }, '↷'),
-                ]),
               ])
               : h('div', { key: 'empty', style: styles.empty }, '还没有模型。让 AI 跑一次 FreeCAD 脚本或打开一个 STEP 文件，这里会自动显示。'),
             picked && panel !== 'parts'
