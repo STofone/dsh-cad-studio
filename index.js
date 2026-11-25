@@ -652,6 +652,101 @@ function normalizeLook(raw) {
   }
 }
 
+/**
+ * The assembly script: read each part file once, tessellate it, place one copy
+ * per instance. Shared by `cad_studio_assembly` and by a relink, which re-runs
+ * it against a corrected path so the model keeps its identity.
+ */
+function assemblyScript(parts, instances, target, measure, interference) {
+  return `${PRELUDE}
+` + `
+import os
+_PART_FILES = ${JSON.stringify(parts.map((p) => (p.color ? { name: p.name, path: p.path, color: p.color } : { name: p.name, path: p.path })))}
+_INSTS = ${JSON.stringify(instances.map((i) => ({ name: i.name, part: i.part, at: i.at ?? [0, 0, 0], rot: i.rot ?? [0, 0, 0] })))}
+_TARGET = ${target ? JSON.stringify(target) : 'None'}
+
+_shapes = {}
+_parts = []
+for _p in _PART_FILES:
+    if not os.path.isfile(_p["path"]):
+        raise RuntimeError("part file not found: " + _p["path"])
+    _s = Part.Shape()
+    _s.read(_p["path"])
+    _shapes[_p["name"]] = _s
+    _m = _mesh(_s)
+    _part = {"id": _p["name"], "verts": _m["verts"], "tris": _m["tris"], "volume": round(_s.Volume, 3)}
+    if "color" in _p and _p["color"]:
+        _part["color"] = _p["color"]
+    _parts.append(_part)
+
+_placed = []
+_instances = []
+for _i in _INSTS:
+    if _i["part"] not in _shapes:
+        raise RuntimeError("instance '" + _i["name"] + "' references unknown part '" + _i["part"] + "'")
+    _rx, _ry, _rz = _i["rot"]
+    _R = FreeCAD.Rotation(FreeCAD.Vector(0, 0, 1), _rz) * FreeCAD.Rotation(FreeCAD.Vector(0, 1, 0), _ry) * FreeCAD.Rotation(FreeCAD.Vector(1, 0, 0), _rx)
+    _ax = _R.multVec(FreeCAD.Vector(1, 0, 0))
+    _ay = _R.multVec(FreeCAD.Vector(0, 1, 0))
+    _az = _R.multVec(FreeCAD.Vector(0, 0, 1))
+    _rot = [_ax.x, _ay.x, _az.x, _ax.y, _ay.y, _az.y, _ax.z, _ay.z, _az.z]
+    _instances.append({"name": _i["name"], "part": _i["part"], "rot": _rot, "translate": [float(c) for c in _i["at"]]})
+    _copy = _shapes[_i["part"]].copy()
+    _copy.Placement = FreeCAD.Placement(FreeCAD.Vector(*_i["at"]), _R)
+    _placed.append(_copy)
+
+_MEASURE = ${measure ? 'True' : 'False'}
+_INTERF = ${interference ? 'True' : 'False'}
+
+__out = {"ok": True, "instances": len(_instances), "parts": len(_parts),
+         "scene": {"parts": _parts, "instances": _instances}}
+
+if _MEASURE:
+    # Per-instance numbers, so "how big is this part, and does it fit" is one
+    # call instead of an export plus a re-import.
+    _rows = []
+    for _k, _inst in enumerate(_INSTS):
+        _s = _placed[_k]
+        _bb = _s.BoundBox
+        _rows.append({
+            "name": _inst["name"], "part": _inst["part"],
+            "volume": round(float(_s.Volume), 3), "solids": len(_s.Solids),
+            "bounds": {"min": [round(_bb.XMin, 3), round(_bb.YMin, 3), round(_bb.ZMin, 3)],
+                       "max": [round(_bb.XMax, 3), round(_bb.YMax, 3), round(_bb.ZMax, 3)]},
+        })
+    _box = Part.makeCompound(_placed).BoundBox
+    __out["measure"] = {
+        "instances": _rows,
+        "totalVolume": round(sum(r["volume"] for r in _rows), 3),
+        "bounds": {"min": [round(_box.XMin, 3), round(_box.YMin, 3), round(_box.ZMin, 3)],
+                   "max": [round(_box.XMax, 3), round(_box.YMax, 3), round(_box.ZMax, 3)]},
+    }
+
+if _INTERF:
+    # Bounding boxes first: a boolean common on every pair of a 30-solid
+    # assembly is minutes of work for answers that are mostly zero.
+    _pairs = []
+    for _i in range(len(_placed)):
+        for _j in range(_i + 1, len(_placed)):
+            _a, _b = _placed[_i], _placed[_j]
+            if not _a.BoundBox.intersect(_b.BoundBox):
+                continue
+            try:
+                _c = _a.common(_b)
+                _v = float(_c.Volume) if (_c is not None and not _c.isNull()) else 0.0
+            except Exception:
+                _v = 0.0
+            if _v > 1e-3:
+                _pairs.append({"a": _INSTS[_i]["name"], "b": _INSTS[_j]["name"], "volume": round(_v, 3)})
+    __out["interference"] = _pairs
+if _TARGET:
+    os.makedirs(os.path.dirname(_TARGET) or ".", exist_ok=True)
+    Part.makeCompound(_placed).exportStep(_TARGET)
+    __out["exported"] = _TARGET
+    __out["bytes"] = os.path.getsize(_TARGET)
+`
+}
+
 class FreeCadBridge {
   constructor(getConfig, log) {
     this.getConfig = getConfig
@@ -792,6 +887,7 @@ class FreeCadBridge {
         center: a.center,
         joints: a.joints.map((j) => ({ id: j.id, instance: j.instance, type: j.type, value: j.value, min: j.min, max: j.max, axis: j.axis, origin: j.origin })),
         mates: a.mates ?? [],
+        spec: a.spec ?? null,
         explode: a.explode,
       })),
     }
@@ -1010,7 +1106,7 @@ class FreeCadBridge {
   }
 
   /** Register the base placements of a published assembly so joints can move it. */
-  registerAssembly({ title, sceneId, scene, joints, id: givenId }) {
+  registerAssembly({ title, sceneId, scene, joints, id: givenId, spec = null }) {
     const id = givenId ?? `asm-${++this.assemblySeq}`
     const seq = /^asm-(\d+)$/.exec(id)
     if (seq) this.assemblySeq = Math.max(this.assemblySeq, Number(seq[1]))
@@ -1029,6 +1125,9 @@ class FreeCadBridge {
       center: bboxCenterOfInstances(scene.parts, scene.instances),
       joints: joints ?? [],
       mates: [],
+      // What was asked for (part files + placements), so a relink can re-run the
+      // same build against a corrected path.
+      spec: spec ?? null,
       explode: 0,
     }
     this.assemblies.set(id, record)
@@ -1218,6 +1317,24 @@ class FreeCadBridge {
    * scene file (geometry never changes when a joint moves, so any scene of
    * this assembly carries the right parts).
    */
+  /** Load every assembly the pointer knows about. Assembly records are otherwise
+   * lazy (they load when a tool or route names one), so a dependency listing
+   * would show an empty table after a restart without this. */
+  async hydrateAssemblies() {
+    let pointer
+    try {
+      pointer = JSON.parse(await readFile(join(FreeCadBridge.dataDir, 'state.json'), 'utf8'))
+    } catch {
+      return this.assemblies
+    }
+    for (const meta of Array.isArray(pointer.assemblies) ? pointer.assemblies : []) {
+      if (meta?.id && !this.assemblies.has(meta.id)) {
+        try { await this.loadAssembly(meta.id) } catch {}
+      }
+    }
+    return this.assemblies
+  }
+
   async loadAssembly(id) {
     if (id && this.assemblies.has(id)) return this.assemblies.get(id)
     let pointer
@@ -1987,7 +2104,7 @@ if _EXPORT:
  */
 const BRIDGE_API = [
   'run', 'publishScene', 'hydrateHistory', 'registerAssembly', 'loadAssembly',
-  'setJoint', 'driveJoint', 'setExplode', 'republishAssembly', 'status', 'refresh',
+  'setJoint', 'driveJoint', 'setExplode', 'republishAssembly', 'hydrateAssemblies', 'status', 'refresh',
 ]
 
 function sharedState(resolved, logger) {
@@ -3300,92 +3417,7 @@ else:
       const missing = [...referenced].filter((name) => !parts.some((p) => p.name === name))
       if (missing.length) return { ok: false, error: `instances reference unknown parts: ${missing.slice(0, 5).join(', ')}` }
       const used = parts.filter((p) => referenced.has(p.name))
-      const py = `${PRELUDE}
-import os
-_PART_FILES = ${JSON.stringify(used.map((p) => (p.color ? { name: p.name, path: p.path, color: p.color } : { name: p.name, path: p.path })))}
-_INSTS = ${JSON.stringify(instances.map((i) => ({ name: i.name, part: i.part, at: i.at ?? [0, 0, 0], rot: i.rot ?? [0, 0, 0] })))}
-_TARGET = ${target ? JSON.stringify(target) : 'None'}
-
-_shapes = {}
-_parts = []
-for _p in _PART_FILES:
-    if not os.path.isfile(_p["path"]):
-        raise RuntimeError("part file not found: " + _p["path"])
-    _s = Part.Shape()
-    _s.read(_p["path"])
-    _shapes[_p["name"]] = _s
-    _m = _mesh(_s)
-    _part = {"id": _p["name"], "verts": _m["verts"], "tris": _m["tris"], "volume": round(_s.Volume, 3)}
-    if "color" in _p and _p["color"]:
-        _part["color"] = _p["color"]
-    _parts.append(_part)
-
-_placed = []
-_instances = []
-for _i in _INSTS:
-    if _i["part"] not in _shapes:
-        raise RuntimeError("instance '" + _i["name"] + "' references unknown part '" + _i["part"] + "'")
-    _rx, _ry, _rz = _i["rot"]
-    _R = FreeCAD.Rotation(FreeCAD.Vector(0, 0, 1), _rz) * FreeCAD.Rotation(FreeCAD.Vector(0, 1, 0), _ry) * FreeCAD.Rotation(FreeCAD.Vector(1, 0, 0), _rx)
-    _ax = _R.multVec(FreeCAD.Vector(1, 0, 0))
-    _ay = _R.multVec(FreeCAD.Vector(0, 1, 0))
-    _az = _R.multVec(FreeCAD.Vector(0, 0, 1))
-    _rot = [_ax.x, _ay.x, _az.x, _ax.y, _ay.y, _az.y, _ax.z, _ay.z, _az.z]
-    _instances.append({"name": _i["name"], "part": _i["part"], "rot": _rot, "translate": [float(c) for c in _i["at"]]})
-    _copy = _shapes[_i["part"]].copy()
-    _copy.Placement = FreeCAD.Placement(FreeCAD.Vector(*_i["at"]), _R)
-    _placed.append(_copy)
-
-_MEASURE = ${measure ? 'True' : 'False'}
-_INTERF = ${interference ? 'True' : 'False'}
-
-__out = {"ok": True, "instances": len(_instances), "parts": len(_parts),
-         "scene": {"parts": _parts, "instances": _instances}}
-
-if _MEASURE:
-    # Per-instance numbers, so "how big is this part, and does it fit" is one
-    # call instead of an export plus a re-import.
-    _rows = []
-    for _k, _inst in enumerate(_INSTS):
-        _s = _placed[_k]
-        _bb = _s.BoundBox
-        _rows.append({
-            "name": _inst["name"], "part": _inst["part"],
-            "volume": round(float(_s.Volume), 3), "solids": len(_s.Solids),
-            "bounds": {"min": [round(_bb.XMin, 3), round(_bb.YMin, 3), round(_bb.ZMin, 3)],
-                       "max": [round(_bb.XMax, 3), round(_bb.YMax, 3), round(_bb.ZMax, 3)]},
-        })
-    _box = Part.makeCompound(_placed).BoundBox
-    __out["measure"] = {
-        "instances": _rows,
-        "totalVolume": round(sum(r["volume"] for r in _rows), 3),
-        "bounds": {"min": [round(_box.XMin, 3), round(_box.YMin, 3), round(_box.ZMin, 3)],
-                   "max": [round(_box.XMax, 3), round(_box.YMax, 3), round(_box.ZMax, 3)]},
-    }
-
-if _INTERF:
-    # Bounding boxes first: a boolean common on every pair of a 30-solid
-    # assembly is minutes of work for answers that are mostly zero.
-    _pairs = []
-    for _i in range(len(_placed)):
-        for _j in range(_i + 1, len(_placed)):
-            _a, _b = _placed[_i], _placed[_j]
-            if not _a.BoundBox.intersect(_b.BoundBox):
-                continue
-            try:
-                _c = _a.common(_b)
-                _v = float(_c.Volume) if (_c is not None and not _c.isNull()) else 0.0
-            except Exception:
-                _v = 0.0
-            if _v > 1e-3:
-                _pairs.append({"a": _INSTS[_i]["name"], "b": _INSTS[_j]["name"], "volume": round(_v, 3)})
-    __out["interference"] = _pairs
-if _TARGET:
-    os.makedirs(os.path.dirname(_TARGET) or ".", exist_ok=True)
-    Part.makeCompound(_placed).exportStep(_TARGET)
-    __out["exported"] = _TARGET
-    __out["bytes"] = os.path.getsize(_TARGET)
-`
+      const py = assemblyScript(used, instances, target, measure, interference)
       // Allocate the assembly id before publishing: the scene carries `asm:<id>`
       // so later joint moves rewrite this same entry instead of adding one.
       // Re-running with `assembly` rebuilds THAT assembly in place: same id, so
@@ -3405,7 +3437,14 @@ if _TARGET:
       if (!scene) return out
       const record = reuse
         ? bridge.rebaseAssembly(reuse, { title: title || reuse.title, sceneId: out.sceneId, scene })
-        : bridge.registerAssembly({ id: asmId, title: assembly || title || 'assembly', sceneId: out.sceneId, scene, joints: [] })
+        : bridge.registerAssembly({
+          id: asmId,
+          title: assembly || title || 'assembly',
+          sceneId: out.sceneId,
+          scene,
+          joints: [],
+          spec: { parts: used.map((p) => ({ name: p.name, path: p.path, ...(p.color ? { color: p.color } : {}) })), instances },
+        })
       for (const spec of joints ?? []) {
         try {
           bridge.setJoint(record, spec)
@@ -3444,6 +3483,118 @@ if _TARGET:
     if (!all.length) throw new Error('还没有装配：先 cad_studio_assembly 建一个')
     return all[all.length - 1]
   }
+
+  // ---- Dependencies: which files a model is made of, and relinking them ---
+  // An assembly stores the part files it read. Moving or re-exporting a STEP
+  // breaks the next rebuild, and the failure only surfaces deep in a Python
+  // traceback, so the files are listed with their state and can be repointed.
+
+  const specRows = (record) => (record.spec?.parts ?? []).map((p) => {
+    let exists = false
+    let bytes = 0
+    let modified = ''
+    try {
+      const st = statSync(p.path)
+      exists = st.isFile()
+      bytes = st.size
+      modified = new Date(st.mtimeMs).toISOString()
+    } catch {}
+    return {
+      part: p.name,
+      path: p.path,
+      exists,
+      bytes,
+      modified,
+      color: Array.isArray(p.color) ? p.color : null,
+      instances: (record.spec?.instances ?? []).filter((i) => i.part === p.name).map((i) => i.name),
+    }
+  })
+
+  // relink: swap one part's file, then re-run the same build so the model keeps
+  // its id, joints, mates and saved look. Shared by the tool and the panel route.
+  // relink: swap one part's file, then re-run the same build so the model keeps
+  // its id, joints, mates and saved look. Shared by the tool and the panel route.
+  const relinkPart = async ({ assembly, part, path }) => {
+      let record
+      try { record = findAssembly(assembly) } catch (error) { return { ok: false, error: String(error?.message ?? error) } }
+      if (!record.spec) return { ok: false, error: `${record.id} 没有记录来源文件（不是用 cad_studio_assembly 建的）` }
+      const name = String(part ?? '').trim()
+      const next = String(path ?? '').trim()
+      if (!name) return { ok: false, error: 'relink 需要 part（零件名）' }
+      if (!next) return { ok: false, error: 'relink 需要 path（新的文件路径）' }
+      const idx = record.spec.parts.findIndex((p) => p.name === name)
+      if (idx < 0) return { ok: false, error: `这个装配里没有零件：${name}（有 ${record.spec.parts.map((p) => p.name).join(', ')}）` }
+      if (!existsSync(next)) return { ok: false, error: `文件不存在：${next}` }
+      const before = { ...record.spec.parts[idx] }
+      record.spec.parts[idx] = { ...before, path: next }
+      const py = assemblyScript(record.spec.parts, record.spec.instances, '', false, false)
+      const out = await bridge.run(py, { title: record.title, docKey: `asm:${record.id}` })
+      if (!out.ok || !out.sceneId) {
+        record.spec.parts[idx] = before   // a bad file must not leave the model pointing at it
+        return { ok: false, error: out.error ?? '重新读取文件失败', stderr: out.stderr ?? '' }
+      }
+      const scene = bridge.scenes.get(out.sceneId)
+      if (!scene) {
+        record.spec.parts[idx] = before
+        return { ok: false, error: '重新读取后没有拿到场景' }
+      }
+      bridge.rebaseAssembly(record, { title: record.title, sceneId: out.sceneId, scene })
+      const published = await bridge.republishAssembly(record)
+      return {
+        ok: true,
+        assembly: record.id,
+        sceneId: published.id,
+        part: name,
+        from: before.path,
+        to: next,
+        instances: record.spec.instances.length,
+        volume: round6(Number(scene.parts.find((p) => p.id === name)?.volume ?? 0)),
+        missingParts: specRows(record).filter((f) => !f.exists).map((f) => f.part),
+      }
+  }
+
+  tool({
+    name: 'cad_studio_deps',
+    description: 'List the part files a model was built from (existence, size, mtime, which instances use each) or repoint one of them with relink and rebuild the model in place. Only assemblies record their sources; a feature-built part has none.',
+    parameters: {
+      type: 'object',
+      properties: {
+        action: { type: 'string', enum: ['list', 'relink'], description: 'Default: list.' },
+        assembly: { type: 'string', description: 'Assembly id (asm-1) or unique title. Omitted: every assembly for `list`, newest for `relink`.' },
+        part: { type: 'string', description: 'Part name to repoint (relink).' },
+        path: { type: 'string', description: 'New file path for that part (relink).' },
+      },
+      additionalProperties: false,
+    },
+    output: {
+      schema: { type: 'object', properties: { ok: { type: 'boolean' }, models: { type: 'array' }, missing: { type: 'number' } } },
+      render: (_a, v) => [{ type: 'text', text: JSON.stringify(v, null, 2) }],
+    },
+    execute: async ({ action, assembly, part, path }) => {
+      const mode = action ?? 'list'
+      if (mode === 'list') {
+        if (!assembly) await bridge.hydrateAssemblies()
+        const records = assembly
+          ? [(() => { try { return findAssembly(assembly) } catch { return null } })()].filter(Boolean)
+          : [...bridge.assemblies.values()]
+        if (!records.length) return { ok: false, error: assembly ? `没有这个装配：${assembly}` : '还没有装配' }
+        const models = records.map((r) => {
+          const files = specRows(r)
+          return {
+            assembly: r.id,
+            title: r.title,
+            sceneId: r.sceneId,
+            tracked: Boolean(r.spec),
+            files,
+            missingParts: files.filter((f) => !f.exists).map((f) => f.part),
+          }
+        })
+        const missing = models.reduce((n, m) => n + m.missingParts.length, 0)
+        return { ok: true, models, missing }
+      }
+      return relinkPart({ assembly, part, path })
+    },
+  })
 
   tool({
     name: 'cad_studio_joint',
@@ -4740,6 +4891,37 @@ __out = {"ok": True, "exported": ${JSON.stringify(target)}, "volume": round(scen
         try {
           const saved = await bridge.setAppearance(body.docKey, body.look ?? body.appearance ?? {})
           return send(200, JSON.stringify({ ok: true, docKey: body.docKey, appearance: saved }))
+        } catch (error) {
+          return send(200, JSON.stringify({ ok: false, error: String(error?.message ?? error) }))
+        }
+      }
+      if (url.pathname === `${ROUTE_PREFIX}/deps`) {
+        // What the panel shows under "来源文件": which STEP each part came from
+        // and whether it is still there.
+        const records = [...(await bridge.hydrateAssemblies()).values()]
+        const models = records.map((r) => {
+          const files = (r.spec?.parts ?? []).map((p) => {
+            let exists = false
+            let bytes = 0
+            let modified = ''
+            try {
+              const st = statSync(p.path)
+              exists = st.isFile()
+              bytes = st.size
+              modified = new Date(st.mtimeMs).toISOString()
+            } catch {}
+            return { part: p.name, path: p.path, exists, bytes, modified }
+          })
+          return { assembly: r.id, title: r.title, tracked: Boolean(r.spec), files, missingParts: files.filter((f) => !f.exists).map((f) => f.part) }
+        })
+        return send(200, JSON.stringify({ ok: true, models }))
+      }
+      if (url.pathname === `${ROUTE_PREFIX}/relink` && req.method === 'POST') {
+        const body = await bodyOf()
+        if (!body || typeof body.part !== 'string' || typeof body.path !== 'string') return send(400, JSON.stringify({ error: 'bad request' }))
+        try {
+          const out = await relinkPart({ assembly: body.assembly, part: body.part, path: body.path })
+          return send(200, JSON.stringify(out))
         } catch (error) {
           return send(200, JSON.stringify({ ok: false, error: String(error?.message ?? error) }))
         }

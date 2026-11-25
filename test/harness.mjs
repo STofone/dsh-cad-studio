@@ -6,7 +6,7 @@
  *   node /workspace/cad-studio/test/harness.mjs
  */
 import { writeFile } from 'node:fs/promises'
-import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { copyFileSync, existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { apply } from '../index.js'
 
 const tools = new Map()
@@ -1382,6 +1382,40 @@ endsolid t
   ok('appearance: 重新发布同一模型仍带着外观', scene2.appearance && scene2.appearance.wireframes.base === true, JSON.stringify(scene2.appearance))
   const empty = await hit('/cad-studio/appearance', '127.0.0.1:3180', { look: {} })
   ok('appearance: 缺 docKey 被拒', empty.status === 400, String(empty.status))
+}
+
+// ---- 7m. dependencies: list the source files, relink a moved one ---------
+{
+  const dir = mkdtempSync(join(tmpdir(), 'cad-harness-deps-'))
+  const src = `${dir}/orig.step`
+  const moved = `${dir}/moved.step`
+  await call('cad_studio_export', { target: src, code: 'scene = Part.makeBox(20, 20, 20)' })
+  const asm = await call('cad_studio_assembly', {
+    parts: [{ name: 'blk', path: src }],
+    instances: [{ name: 'one', part: 'blk', at: [0, 0, 0] }],
+    title: 'harness_deps',
+  })
+  const list = await call('cad_studio_deps', { assembly: asm.assembly })
+  ok('deps: 列出该模型的来源文件', list.ok === true && list.models.length === 1 && list.models[0].assembly === asm.assembly
+    && list.models[0].files[0].part === 'blk' && list.models[0].files[0].exists === true && list.models[0].missingParts.length === 0,
+    JSON.stringify(list.models?.[0]?.files))
+  ok('deps: 记录实例到哪里去用', list.models[0].files[0].instances?.includes('one') === true, JSON.stringify(list.models?.[0]?.files[0]?.instances))
+  // A moved file is what breaks a rebuild; relink repoints it and rebuilds in
+  // place, so the assembly keeps its id.
+  copyFileSync(src, moved)
+  rmSync(src)
+  const broken = await call('cad_studio_deps', { assembly: asm.assembly })
+  ok('deps: 文件被移走后能看出来', broken.models[0].missingParts?.includes('blk') === true && broken.missing === 1, JSON.stringify(broken.models[0].missingParts))
+  const bad = await call('cad_studio_deps', { action: 'relink', assembly: asm.assembly, part: 'blk', path: `${dir}/nope.step` })
+  ok('deps: relink 到不存在的文件被拒', bad.ok === false && /不存在/.test(bad.error ?? ''), String(bad.error))
+  const out = await call('cad_studio_deps', { action: 'relink', assembly: asm.assembly, part: 'blk', path: moved })
+  ok('deps: relink 重新读到文件并原地重建', out.ok === true && out.assembly === asm.assembly && out.to === moved && out.volume === 8000,
+    JSON.stringify({ ok: out.ok, vol: out.volume, err: out.error }))
+  const after = await call('cad_studio_deps', { assembly: asm.assembly })
+  ok('deps: relink 后不再缺文件', after.missing === 0 && after.models[0].files[0].path === moved, JSON.stringify(after.models[0].files[0]))
+  // The panel route reports the same thing as the tool.
+  const route = JSON.parse((await hit('/cad-studio/deps')).body)
+  ok('deps: /deps 路由与工具一致', route.ok === true && route.models.some((m) => m.assembly === asm.assembly && m.missingParts.length === 0), JSON.stringify(route.models?.length))
 }
 
 // ---- 7c. sheet: 正式图纸（图框 + 三视图 + 尺寸） ----------------------

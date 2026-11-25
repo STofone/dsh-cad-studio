@@ -1571,6 +1571,11 @@ const FILE_EXTS = ['step', 'stp', 'iges', 'igs', 'brep', 'stl']
       // 'models' | 'info' | '' (closed). Same icon again closes it.
       const [panel, setPanel] = useState('')
       useEffect(() => { panelRef.current = panel }, [panel])
+      // Dependencies are only interesting while the info drawer is open, and
+      // they change only when a relink happens — so fetch on open, not on poll.
+      useEffect(() => {
+        if (panel === 'info') loadDeps()
+      }, [panel, payload?.docKey])
       const theme = useTheme()
       // Colour overrides picked by hand in the tree. Two levels, because an
       // assembly can show one part many times: `inst` is one row, `part` is
@@ -1711,6 +1716,11 @@ const FILE_EXTS = ['step', 'stp', 'iges', 'igs', 'brep', 'stl']
       const [featDraft, setFeatDraft] = useState({})
       const [featAdd, setFeatAdd] = useState(false)
       const [featError, setFeatError] = useState('')
+      // Which files the model is made of (assemblies only), fetched when the
+      // info drawer opens: a moved STEP is invisible until a rebuild fails.
+      const [deps, setDeps] = useState(null)
+      const [relinkFor, setRelinkFor] = useState({})
+      const [relinkNote, setRelinkNote] = useState('')
       // Which document sketch is expanded in the 草图 section.
       const [openSketch, setOpenSketch] = useState('')
       const featTimer = useRef(null)
@@ -1768,6 +1778,31 @@ const FILE_EXTS = ['step', 'stp', 'iges', 'igs', 'brep', 'stl']
         }
         rememberView(tabKey, payloadRef.current)
         showScene(scene, { keepView: true, tabKey })
+      }
+      const loadDeps = async () => {
+        try {
+          const res = await fetch(`${ROUTE}/deps`, { headers: { accept: 'application/json' } })
+          if (res.ok) setDeps(await res.json())
+        } catch {}
+      }
+      const doRelink = async (assembly, part) => {
+        const path = (relinkFor[part] ?? '').trim()
+        if (!path) return setRelinkNote('先填新的文件路径')
+        setRelinkNote(`重新读取 ${part}…`)
+        try {
+          const res = await fetch(`${ROUTE}/relink`, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ assembly, part, path }),
+          })
+          const out = await res.json()
+          if (!out || out.ok === false) return setRelinkNote(String((out && out.error) || `HTTP ${res.status}`))
+          setRelinkNote(`${part} 已指向 ${path}`)
+          await loadDeps()
+          if (out.sceneId) await applyScene(out.sceneId, out.at)
+        } catch (error) {
+          setRelinkNote(String(error?.message ?? error))
+        }
       }
       const postMotion = async (path, body) => {
         try {
@@ -2441,6 +2476,11 @@ const FILE_EXTS = ['step', 'stp', 'iges', 'igs', 'brep', 'stl']
         : []
 
       const panelTitle = { parts: '零件', features: '特征', props: '选中项', motion: '运动', view: '视图', models: '模型', info: '信息' }[panel] || ''
+      // The scene carries `asm:<id>` for an assembly, which is how the deps list
+      // is matched to what is on screen.
+      const depsModel = deps && payload && typeof payload.docKey === 'string' && payload.docKey.startsWith('asm:')
+        ? (deps.models || []).find((m) => `asm:${m.assembly}` === payload.docKey) || null
+        : null
       // --- inspector: the properties of the one selected instance ----------
       const pickedInst = payload ? (payload.instances || []).find((i) => i.name === picked) : null
       const pickedPart = pickedInst ? (payload.parts || []).find((p) => p.id === pickedInst.part) : null
@@ -2680,6 +2720,50 @@ const FILE_EXTS = ['step', 'stp', 'iges', 'igs', 'brep', 'stl']
                   h('span', { key: 'v', style: { ...styles.infoVal, maxWidth: '52%', whiteSpace: 'normal' }, title: chk.fix || chk.detail }, chk.ok ? chk.detail : (chk.fix || chk.detail)),
                 ])),
                 ...(installNode ? [installNode] : []),
+                ...(depsModel ? [
+                  h('div', { key: 'deps-head', style: { ...styles.infoRow, marginTop: 6 } }, [
+                    h('span', { key: 'k', style: styles.infoKey }, '来源文件'),
+                    h('span', { key: 'v', style: { ...styles.infoVal, color: depsModel.missingParts?.length ? '#d9534f' : undefined } },
+                      depsModel.missingParts?.length ? `缺 ${depsModel.missingParts.length}` : `${depsModel.files.length} 个`),
+                  ]),
+                  ...depsModel.files.map((f) => h('div', {
+                    key: `dep-${f.part}`,
+                    style: { display: 'flex', flexDirection: 'column', gap: 3, padding: '4px 0', borderTop: '1px solid rgba(127,127,127,.16)' },
+                    'data-cad-dep': f.part,
+                  }, [
+                    h('div', { key: 'row', style: { display: 'flex', alignItems: 'center', gap: 6 } }, [
+                      h('span', { key: 'dot', style: styles.guideDot(f.exists, true), 'data-cad-dep-state': f.exists ? 'ok' : 'missing' }),
+                      h('span', { key: 'n', style: { ...styles.infoKey, flex: '0 0 auto' } }, f.part),
+                      h('span', {
+                        key: 'p',
+                        style: { ...styles.infoVal, flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', opacity: 0.72, fontSize: 10.5 },
+                        title: f.path,
+                      }, f.path),
+                    ]),
+                    f.exists ? null : h('div', { key: 'fix', style: { display: 'flex', gap: 4 } }, [
+                      h('input', {
+                        key: 'in',
+                        type: 'text',
+                        placeholder: '新的文件路径…',
+                        value: relinkFor[f.part] ?? '',
+                        'data-cad-relink-input': f.part,
+                        style: { flex: 1, minWidth: 0, fontSize: 11, padding: '3px 5px', borderRadius: 4, border: '1px solid rgba(127,127,127,.35)', background: 'transparent', color: 'inherit' },
+                        onChange: (event) => setRelinkFor((prev) => ({ ...prev, [f.part]: event.target.value })),
+                        onKeyDown: (event) => { if (event.key === 'Enter') doRelink(depsModel.assembly, f.part) },
+                      }),
+                      h('button', {
+                        key: 'go',
+                        type: 'button',
+                        'data-cad-relink': f.part,
+                        style: { flex: '0 0 auto', padding: '2px 8px', fontSize: 11, cursor: 'pointer', borderRadius: 4, border: '1px solid rgba(77,107,254,.5)', background: 'rgba(77,107,254,.16)', color: 'inherit' },
+                        onClick: () => doRelink(depsModel.assembly, f.part),
+                      }, '重定位'),
+                    ]),
+                  ])),
+                  relinkNote ? h('div', { key: 'note', style: { ...styles.treeHint, whiteSpace: 'normal', paddingTop: 4 }, 'data-cad-relink-note': '1' }, relinkNote) : null,
+                ] : payload && payload.docKey && String(payload.docKey).startsWith('model:')
+                  ? [h('div', { key: 'deps-na', style: { ...styles.treeHint, whiteSpace: 'normal', paddingTop: 6 } }, '这个模型是特征建的，没有外部文件依赖')]
+                  : []),
               ]
               : null
 
