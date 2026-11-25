@@ -18,11 +18,11 @@
 - [x] 8. Mesh 修复与减面（`MeshPart.meshFromShape` + 去重/补洞/减面），导出前自检
 - [x] 9. 几何自检 `cad_studio_check`：isValid / 是否闭合 / 反向面 / 最小壁厚提示
 - [x] 10. 正式图纸 `cad_studio_sheet`（A4/A3/A2 图框 + 标题栏 + 三视图 + 尺寸 + 第一/三角法；`dxf:true` 走 `TechDraw.writeDXFPage`）。TechDraw 0.20 headless 没有 PDF/整页 SVG 导出，所以图框与标注自己拼。
-- [ ] 11. 展开图 DXF（钣金式平铺）
+- [x] 11. 展开图 DXF（钣金式平铺）——`cad_studio_unfold`，0.25.0：平面面片按共享边等距铺开（面积与模型一致），带孔件每个孔各自成环，曲面如实报 `curvedSkipped` 而不是瞎编
 
 ## P3 装配
 - [x] 12. mate 约束求解 `cad_studio_mate`（concentric 轴心+轴向距离 / flush 贴合 / distance 面距；按顺序解算，一次求解后固定，与关节驱动分开）
-- [ ] 13. 依赖 UI（Show dependencies 面板）与 relink
+- [x] 13. 依赖 UI 与 relink：`record.spec` 记「零件名 → 文件路径」并随指针落盘；`cad_studio_deps {action:'list'|'relink'}` + `GET /cad-studio/deps` + `POST /cad-studio/relink`；relink 用同一份 spec 重跑装配、`rebaseAssembly` 保住 id/关节/mate/外观，读不到文件则回滚路径；面板「信息」抽屉里的「来源文件」列出存在/缺失（`data-cad-dep`、`data-cad-dep-state`、`data-cad-relink-input`、`data-cad-relink`）；`hydrateAssemblies()` 修掉重启后依赖表空掉。
 
 ## P4 系统
 - [x] 14. journal 落盘：`<数据目录>/journal.json` 存最近 20 条可重放记录（`doc-create` / `doc-delete` 带 base64 字节 / `doc-rename`），插件启动时 `loadJournal` 重建；`undoSession` 先 `await bridge.journalReady` 再取栈（否则会误报「没有可撤销的操作」）。装配/视图类 journal 是活对象闭包，仍只在本会话有效——重启后没有这条记录，面板会说没有可撤销，而不是错撤别的东西。

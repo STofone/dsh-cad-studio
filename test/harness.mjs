@@ -1418,6 +1418,29 @@ endsolid t
   ok('deps: /deps 路由与工具一致', route.ok === true && route.models.some((m) => m.assembly === asm.assembly && m.missingParts.length === 0), JSON.stringify(route.models?.length))
 }
 
+// ---- 7n. unfold: flat net of a plate, holes included --------------------
+{
+  const dir = mkdtempSync(join(tmpdir(), 'cad-harness-unfold-'))
+  const dxf = `${dir}/net.dxf`
+  const svg = `${dir}/net.svg`
+  const box = await call('cad_studio_unfold', { code: 'scene = Part.makeBox(60, 40, 20)', target: dxf })
+  ok('unfold: 六个面全部摊平，面积与模型一致',
+    box.ok === true && box.unfolded === 6 && near(box.areaModel, 8800, 0.5) && near(box.areaFlat, 8800, 5),
+    JSON.stringify({ flat: box.areaFlat, model: box.areaModel, n: box.unfolded }))
+  ok('unfold: 写出 DXF', box.target === dxf && box.bytes > 500, `${box.bytes} bytes`)
+  // A bracket: the hole must come along as its own outline, or the blank is wrong.
+  const holed = await call('cad_studio_unfold', {
+    code: 'scene = Part.makeBox(40, 30, 2).cut(Part.makeCylinder(6, 10, FreeCAD.Vector(20, 15, -4)))',
+    target: svg,
+  })
+  ok('unfold: 板件带孔也能摊开', holed.ok === true && holed.unfolded === 6, JSON.stringify({ n: holed.unfolded, err: holed.error }))
+  ok('unfold: SVG 里有孔的轮廓', holed.bytes > 200 && holed.target === svg, `${holed.bytes} bytes`)
+  const png = readFileSync(svg, 'utf8')
+  ok('unfold: SVG 是闭合多边形', (png.match(/<polygon/g) || []).length >= 7, String((png.match(/<polygon/g) || []).length))
+  const tube = await call('cad_studio_unfold', { code: 'scene = Part.makeCylinder(10, 30)' })
+  ok('unfold: 曲面如实报告跳过，而不是瞎编', tube.curvedSkipped === 1, JSON.stringify({ skipped: tube.curvedSkipped }))
+}
+
 // ---- 7c. sheet: 正式图纸（图框 + 三视图 + 尺寸） ----------------------
 {
   const target = join(tmpdir(), 'sheet_box.svg')

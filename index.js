@@ -3154,6 +3154,242 @@ __out = {
   })
 
   tool({
+    name: 'cad_studio_unfold',
+    description: 'Unfold a solid made of flat faces into a 2D net (板金展开): every planar face is laid flat next to the one it shares an edge with, without stretching — a net you can cut and fold. Curved faces (cylinders, fillets, bends) are reported as skipped, not invented. Writes DXF (polylines, mm) or SVG; areas are reported so a net that came out wrong is visible.',
+    parameters: {
+      type: 'object',
+      properties: {
+        source: { type: 'string', description: 'Existing model file (STEP/IGES/BREP).' },
+        code: { type: 'string', description: 'FreeCAD Python that binds `scene` or `export_shapes`.' },
+        target: { type: 'string', description: 'Absolute path: .dxf (polylines) or .svg (outline).' },
+        deflection: { type: 'number', description: 'Curve sampling for the outline, mm (default 0.25).' },
+        holes: { type: 'boolean', description: 'Include inner wires (holes) as separate closed outlines (default true).' },
+      },
+      additionalProperties: false,
+    },
+    output: {
+      schema: { type: 'object', properties: { ok: { type: 'boolean' }, unfolded: { type: 'number' }, areaModel: { type: 'number' }, areaFlat: { type: 'number' }, curvedSkipped: { type: 'number' }, target: { type: 'string' } } },
+      render: (_a, v) => [{ type: 'text', text: JSON.stringify(v, null, 2) }],
+    },
+    execute: async ({ source, code, target, deflection = 0.25, holes = true }) => {
+      if (!source && !code) return { ok: false, error: 'pass either source (a model file) or code (FreeCAD Python)' }
+      const absTarget = target ? String(target) : ''
+      if (absTarget && !(absTarget.startsWith('/') || /^[A-Za-z]:[\\/]/.test(absTarget))) return { ok: false, error: 'target must be an absolute path' }
+      const src = shapesFrom({ source, code })
+      const py = `${PRELUDE}
+${src}
+_DEFL = float(${Number.isFinite(deflection) ? deflection : 0.25})
+_HOLES = ${holes === false ? 'False' : 'True'}
+_TARGET = ${absTarget ? JSON.stringify(absTarget) : 'None'}
+
+import math
+from FreeCAD import Vector as _V
+
+def _k(_p):
+    return (round(_p.x, 4), round(_p.y, 4), round(_p.z, 4))
+
+def _ordered(_wire):
+    """Vertices of a wire in traversal order (OuterWire.Vertexes is unordered)."""
+    _edges = _wire.Edges
+    if not _edges:
+        return []
+    _pts = [_edges[0].Vertexes[0].Point, _edges[0].Vertexes[-1].Point]
+    _used = {0}
+    while len(_used) < len(_edges):
+        _tail = _pts[-1]; _found = False
+        for _i, _e in enumerate(_edges):
+            if _i in _used: continue
+            _a, _b = _e.Vertexes[0].Point, _e.Vertexes[-1].Point
+            if _k(_a) == _k(_tail): _pts.append(_b); _used.add(_i); _found = True; break
+            if _k(_b) == _k(_tail): _pts.append(_a); _used.add(_i); _found = True; break
+        if not _found: break
+    if len(_pts) > 1 and _k(_pts[0]) == _k(_pts[-1]): _pts.pop()
+    return _pts
+
+def _ordered_edges(_wire):
+    """Edges of a wire in traversal order, each flagged when it runs backwards."""
+    _edges = list(_wire.Edges)
+    if not _edges:
+        return []
+    _out = [(_edges[0], False)]
+    _used = {0}
+    _tail = _edges[0].Vertexes[-1].Point
+    while len(_used) < len(_edges):
+        _found = False
+        for _i, _e in enumerate(_edges):
+            if _i in _used:
+                continue
+            _a, _b = _e.Vertexes[0].Point, _e.Vertexes[-1].Point
+            if _k(_a) == _k(_tail):
+                _out.append((_e, False)); _used.add(_i); _tail = _b; _found = True; break
+            if _k(_b) == _k(_tail):
+                _out.append((_e, True)); _used.add(_i); _tail = _a; _found = True; break
+        if not _found:
+            break
+    return _out
+
+def _sample(_wire):
+    """Outline points in traversal order: endpoints for lines, sampled arcs.
+
+    Wire.Edges comes back unordered, so walking them as given would splice the
+    outline out of order and the shoelace area would come out wrong.
+    """
+    _out = []
+    for _e, _rev in _ordered_edges(_wire):
+        _c = _e.Curve
+        _straight = isinstance(_c, Part.Line) or isinstance(_c, Part.LineSegment)
+        _pts = list(_e.discretize(Deflection=_DEFL)) if not _straight else [_e.Vertexes[0].Point, _e.Vertexes[-1].Point]
+        if _rev:
+            _pts.reverse()
+        for _p in _pts:
+            if not _out or _k(_out[-1]) != _k(_p):
+                _out.append(_p)
+    if len(_out) > 1 and _k(_out[0]) == _k(_out[-1]):
+        _out.pop()
+    return _out
+
+def _frame(_f):
+    _n = _f.Surface.Axis.normalize()
+    _c = _f.CenterOfMass
+    _pts = _ordered(_f.OuterWire)
+    if not _pts:
+        return None
+    _u = _pts[0] - _c
+    _u = _u - _n * _u.dot(_n)
+    if _u.Length < 1e-9:
+        return None
+    _u.normalize()
+    return _c, _u, _n.cross(_u)
+
+def _unfold(_shape):
+    _faces = [_f for _f in _shape.Faces if isinstance(_f.Surface, Part.Plane)]
+    _curved = len(_shape.Faces) - len(_faces)
+    if not _faces:
+        return {"ok": False, "error": "这个形状没有平面：展开只适用于板类零件"}
+    _owner = {}
+    for _fi, _f in enumerate(_faces):
+        for _e in _f.Edges:
+            _ka, _kb = _k(_e.Vertexes[0].Point), _k(_e.Vertexes[-1].Point)
+            _owner.setdefault((_ka, _kb) if _ka <= _kb else (_kb, _ka), []).append(_fi)
+    _root = max(range(len(_faces)), key=lambda i: _faces[i].Area)
+    _fr = _frame(_faces[_root])
+    if _fr is None:
+        return {"ok": False, "error": "最大平面没有可用的局部坐标系"}
+    _c, _u, _v = _fr
+    def _to2(_p):
+        _d = _p - _c
+        return (_d.dot(_u), _d.dot(_v))
+    _pos = {}
+    for _p in _ordered(_faces[_root].OuterWire):
+        _pos[_k(_p)] = _to2(_p)
+    _polys = []
+    def _rings(_f, _map3):
+        # Takes a 3D point to the flat layout: the root face projects with its
+        # own frame, every other face composes that with its hinge placement.
+        _rs = []
+        _wires = _f.Wires if _HOLES else [_f.OuterWire]
+        for _w in _wires:
+            _pts = _sample(_w)
+            if len(_pts) >= 3:
+                _rs.append([_map3(_p) for _p in _pts])
+        return _rs
+    _polys.extend(_rings(_faces[_root], _to2))
+    _seen, _queue, _worst = {_root}, [_root], 0.0
+    while _queue:
+        _cur = _queue.pop(0)
+        _cur2 = [_pos[_k(_p)] for _p in _ordered(_faces[_cur].OuterWire) if _k(_p) in _pos]
+        if not _cur2: continue
+        _cxc = sum(q[0] for q in _cur2) / len(_cur2); _cyc = sum(q[1] for q in _cur2) / len(_cur2)
+        for _e in _faces[_cur].Edges:
+            _a, _b = _e.Vertexes[0].Point, _e.Vertexes[-1].Point
+            _ka, _kb = _k(_a), _k(_b)
+            for _nb in _owner.get((_ka, _kb) if _ka <= _kb else (_kb, _ka), []):
+                if _nb in _seen: continue
+                _ag, _bg = _pos.get(_ka), _pos.get(_kb)
+                if _ag is None or _bg is None: continue
+                _fnb = _frame(_faces[_nb])
+                if _fnb is None: continue
+                _cn, _un, _vn = _fnb
+                def _local(_p, _cn=_cn, _un=_un, _vn=_vn):
+                    _d = _p - _cn
+                    return (_d.dot(_un), _d.dot(_vn))
+                _la, _lb = _local(_a), _local(_b)
+                _th = math.atan2(_bg[1] - _ag[1], _bg[0] - _ag[0]) - math.atan2(_lb[1] - _la[1], _lb[0] - _la[0])
+                _ct, _st = math.cos(_th), math.sin(_th)
+                def _place(q, _ag=_ag, _la=_la, _ct=_ct, _st=_st):
+                    _dx, _dy = q[0] - _la[0], q[1] - _la[1]
+                    return (_ag[0] + _ct * _dx - _st * _dy, _ag[1] + _st * _dx + _ct * _dy)
+                # A hinge has exactly two ways to fold flat: pick the one that
+                # puts the new face on the other side of the edge from the face
+                # we are folding from (same side = the two would overlap).
+                _out = _ordered(_faces[_nb].OuterWire)
+                _m = [_place(_local(_p)) for _p in _out]
+                _cx = sum(q[0] for q in _m) / len(_m); _cy = sum(q[1] for q in _m) / len(_m)
+                _sd = (_bg[0] - _ag[0]) * (_cy - _ag[1]) - (_bg[1] - _ag[1]) * (_cx - _ag[0])
+                _sc = (_bg[0] - _ag[0]) * (_cyc - _ag[1]) - (_bg[1] - _ag[1]) * (_cxc - _ag[0])
+                if (_sd > 0) == (_sc > 0):
+                    _dhx, _dhy = _bg[0] - _ag[0], _bg[1] - _ag[1]
+                    _L = math.hypot(_dhx, _dhy)
+                    if _L < 1e-9: continue
+                    _dhx, _dhy = _dhx / _L, _dhy / _L
+                    def _mirror(q, _ag=_ag, _dhx=_dhx, _dhy=_dhy):
+                        _vx, _vy = q[0] - _ag[0], q[1] - _ag[1]
+                        _dot = _vx * _dhx + _vy * _dhy
+                        return (_ag[0] + 2 * _dot * _dhx - _vx, _ag[1] + 2 * _dot * _dhy - _vy)
+                    _place_inner = lambda q: _mirror(_place(q))
+                else:
+                    _place_inner = _place
+                _polys.extend(_rings(_faces[_nb], lambda _p, _loc=_local, _pl=_place_inner: _pl(_loc(_p))))
+                _seen.add(_nb); _queue.append(_nb)
+                for _p, _q in zip(_out, [_place_inner(_local(_p)) for _p in _out]):
+                    if _k(_p) in _pos:
+                        _worst = max(_worst, math.hypot(_pos[_k(_p)][0] - _q[0], _pos[_k(_p)][1] - _q[1]))
+                    _pos[_k(_p)] = _q
+    def _area2(_m):
+        return abs(sum((_m[_i][0] * _m[(_i + 1) % len(_m)][1] - _m[(_i + 1) % len(_m)][0] * _m[_i][1]) for _i in range(len(_m)))) / 2.0
+    _flat = sum(_area2(_m) for _m in _polys)
+    _xs = [q[0] for _m in _polys for q in _m]
+    _ys = [q[1] for _m in _polys for q in _m]
+    _out = {"ok": True, "faces": len(_faces), "unfolded": len(_seen), "curvedSkipped": _curved,
+            "areaModel": round(_shape.Area, 3), "areaFlat": round(_flat, 3),
+            "bbox": [round(min(_xs), 3), round(min(_ys), 3), round(max(_xs), 3), round(max(_ys), 3)]}
+    if _TARGET:
+        os.makedirs(os.path.dirname(_TARGET) or ".", exist_ok=True)
+        if _TARGET.lower().endswith(".svg"):
+            _minx, _miny, _maxx, _maxy = _out["bbox"]
+            _w = _maxx - _minx + 10; _h = _maxy - _miny + 10
+            _parts = []
+            for _m in _polys:
+                _d = " ".join("%.3f,%.3f" % (q[0] - _minx + 5, _maxy - q[1] + 5) for q in _m)
+                _parts.append('<polygon points="%s" fill="none" stroke="#111" stroke-width="0.3"/>' % _d)
+            open(_TARGET, "w").write('<svg xmlns="http://www.w3.org/2000/svg" width="%.2fmm" height="%.2fmm" viewBox="0 0 %.2f %.2f">%s</svg>' % (_w, _h, _w, _h, "".join(_parts)))
+        else:
+            _wires = []
+            for _m in _polys:
+                _pts = [Vector(q[0], q[1], 0.0) for q in _m]
+                if len(_pts) >= 3:
+                    _pts.append(_pts[0])
+                    _wires.append(Part.makePolygon(_pts))
+            import importDXF
+            importDXF.export([Part.makeCompound(_wires)], _TARGET)
+        _out["target"] = _TARGET
+        _out["bytes"] = os.path.getsize(_TARGET)
+    return _out
+
+_out = None
+for _s in _shapes:
+    _r = _unfold(_s)
+    if _r.get("ok"):
+        _out = _r
+        break
+    _out = _r
+__out = _out
+`
+      return bridge.run(py, { title: 'unfold', publishHint: false })
+    },
+  })
+
+  tool({
     name: 'cad_studio_mesh',
     description: 'Turn a solid into a printable mesh and clean it up: dedupe coincident points/facets, fix deformations, harmonize normals, optionally fill small holes or decimate to a facet budget, then write an STL. Reports facets/points before and after so you can see what the repair actually changed.',
     parameters: {
