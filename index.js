@@ -1346,6 +1346,35 @@ def _prim(op, _cur=None):
         if abs(vec.Length) < 1e-9:
             raise RuntimeError("extrude 需要 h 或 dir（当前的挤出向量长度为 0）")
         return Part.Face(Part.makePolygon(ps + [ps[0]])).extrude(vec)
+    if k == "hole":
+        # Standard hole: simple through/blind, counterbore, or countersink.
+        # Returns the SOLID TO SUBTRACT, so callers write {kind:"cut", with:{kind:"hole",...}}.
+        d = float(op.get("d", op.get("diameter", 0)) or 0)
+        if d <= 0:
+            raise RuntimeError("hole 需要 d（直径，> 0）")
+        dep = float(op.get("depth", 0) or 0)
+        at = _v3(op.get("at"), (0.0, 0.0, 0.0))
+        direc = _dir(op.get("dir"), (0.0, 0.0, -1.0))
+        length = dep if dep > 0 else 200.0
+        start = at - direc * 0.01
+        body = Part.makeCylinder(d / 2.0, length + 0.02, start, direc)
+        t = str(op.get("type", "simple")).lower()
+        if t in ("counterbore", "cbore"):
+            cbd = float(op.get("cb_d", op.get("cb_diameter", 0)) or 0)
+            cbdep = float(op.get("cb_depth", 0) or 0)
+            if cbd <= d or cbdep <= 0:
+                raise RuntimeError("counterbore 需要 cb_d（> d）与 cb_depth（> 0）")
+            body = body.fuse(Part.makeCylinder(cbd / 2.0, cbdep + 0.01, start, direc))
+        elif t in ("countersink", "csink"):
+            csd = float(op.get("cs_d", op.get("cs_diameter", 0)) or 0)
+            ang = float(op.get("angle", 90.0))
+            if csd <= d or not (10.0 <= ang <= 170.0):
+                raise RuntimeError("countersink 需要 cs_d（> d）与 angle（10–170）")
+            depth = (csd - d) / 2.0 / math.tan(math.radians(ang) / 2.0)
+            body = body.fuse(Part.makeCone(d / 2.0, csd / 2.0, depth, start, direc))
+        elif t != "simple":
+            raise RuntimeError("hole 的 type 只能是 simple / counterbore / countersink：" + t)
+        return body
     if k == "revolve":
         if op.get("sketch"):
             face = Part.Face(_sketch(str(op["sketch"])))
@@ -1515,6 +1544,12 @@ for _idx, _op in enumerate(_OPS):
             if not isinstance(_ws, (list, tuple)):
                 _ws = [_ws]
             for _w in _ws:
+                # Nested tools inherit the step's identity so an error inside
+                # {kind:"cut", with:{...}} still says which feature failed.
+                if isinstance(_w, dict):
+                    _w = dict(_w)
+                    _w.setdefault("_id", _op.get("_id"))
+                    _w.setdefault("_label", _op.get("_label"))
                 _s = _prim(_w, _shape)
                 _shape = _shape.fuse(_s) if _k == "fuse" else (_shape.cut(_s) if _k == "cut" else _shape.common(_s))
         elif _k == "fillet":
@@ -2337,7 +2372,7 @@ ${pair ? `    __out["distance"] = round((FreeCAD.Vector(${JSON.stringify(from)})
   // A list of ops applied in order. `run` stays the escape hatch; this is the
   // path for "60×40×20 的盒子挖个 φ16 通孔、倒 2mm 圆角".
 
-  const FEATURE_KINDS = ['box', 'cylinder', 'sphere', 'cone', 'torus', 'extrude', 'revolve', 'fuse', 'cut', 'common', 'fillet', 'chamfer', 'shell', 'pattern_linear', 'pattern_circular', 'translate', 'rotate', 'mirror']
+  const FEATURE_KINDS = ['box', 'cylinder', 'sphere', 'cone', 'torus', 'hole', 'extrude', 'revolve', 'fuse', 'cut', 'common', 'fillet', 'chamfer', 'shell', 'pattern_linear', 'pattern_circular', 'translate', 'rotate', 'mirror']
 
   tool({
     name: 'cad_studio_feature',
@@ -2871,7 +2906,7 @@ if _TARGET:
     } else if (kind === 'fuse' || kind === 'cut' || kind === 'common') {
       const list = Array.isArray(withs) ? withs : withs ? [withs] : []
       need(list.length > 0, `需要 with 子图元（{kind:"box",size:[…]}，或用数组一次减/并多个）`)
-      need(list.every(tool), 'with 里的每一项都要是图元（box/cylinder/sphere/cone/torus/extrude/revolve），且带 kind')
+      need(list.every(tool), 'with 里的每一项都要是图元（box/cylinder/sphere/cone/torus/hole/extrude/revolve），且带 kind')
     } else if (kind === 'fillet') need(pos(probe.r), '需要 r>0')
     else if (kind === 'chamfer') need(pos(probe.d), '需要 d>0')
     else if (kind === 'shell') need(pos(probe.t), '需要 t>0（壁厚）')

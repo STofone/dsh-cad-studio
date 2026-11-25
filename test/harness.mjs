@@ -1003,6 +1003,27 @@ endsolid t
   ok('sketch: revolved shell is rejected loudly instead of volume 0', made.ok === false && /shell|闭合|sew/i.test(String(made.error ?? '')), `ok=${made.ok} err=${String(made.error ?? '').slice(0, 100)}`)
 }
 
+// ---- 7t. standard holes -------------------------------------------------
+{
+  const plate = { ops: [{ kind: 'box', size: [60, 40, 20] },
+    { kind: 'cut', with: { kind: 'hole', d: 10, at: [30, 20, 20] } }] }
+  const thru = await call('cad_studio_feature', plate)
+  // 48000 - pi*25*20 = 46429.20
+  ok('hole: simple through hole subtracts a cylinder', thru.ok === true && near(thru.volume ?? 0, 46429.2, 1), `vol=${Math.round((thru.volume ?? 0) * 100) / 100} err=${thru.error ?? ''}`)
+
+  const cb = { ops: [{ kind: 'box', size: [60, 40, 20] },
+    { kind: 'cut', with: { kind: 'hole', d: 10, type: 'counterbore', cb_d: 16, cb_depth: 6, at: [30, 20, 20] } }] }
+  const cbore = await call('cad_studio_feature', cb)
+  // 46429.20 - pi*(64-25)*6 = 45694.07
+  ok('hole: counterbore adds the wider seat', cbore.ok === true && near(cbore.volume ?? 0, 45694.07, 2), `vol=${Math.round((cbore.volume ?? 0) * 100) / 100} err=${cbore.error ?? ''}`)
+
+  const bad = await call('cad_studio_feature', { ops: [{ kind: 'box', size: [10, 10, 10] }, { kind: 'cut', with: { kind: 'hole', at: [5, 5, 10] } }] })
+  {
+    const text = JSON.stringify(bad.errors ?? bad.error ?? '')
+    ok('hole: missing diameter is refused with a readable message', (bad.ok === false || (bad.errors ?? []).length > 0) && /hole|直径|图元/.test(text), `ok=${bad.ok} errors=${text.slice(0, 120)}`)
+  }
+}
+
 // ---- 8. teardown --------------------------------------------------------
 for (const d of disposed.reverse()) { try { d() } catch (e) { console.log('  [dispose warn]', e.message) } }
 ok('all tools unregistered on dispose', tools.size === 0, [...tools.keys()].join(','))
