@@ -184,6 +184,15 @@ function diagnose(bridge, cfg = {}) {
   }
 }
 
+const renderUndo = (v) => {
+  if (!v || v.ok === false) return `✗ ${v?.error ?? '没有可撤销的操作'}`
+  if (v.scope === 'assembly') {
+    const head = v.undone !== undefined ? `↶ 撤销了装配改动（${v.undone}）` : `↷ 重做了装配改动（${v.redone}）`
+    return `${head}，还可撤销 ${v.remaining ?? 0} 步 / 可重做 ${v.redo ?? v.undo ?? 0} 步`
+  }
+  return `${v.undone !== undefined ? '↶ 撤销' : '↷ 重做'}：文档 ${v.model}${v.evaluated === false ? '（求值失败，见 graph）' : ''}`
+}
+
 const renderDoctor = (v) => {
   const lines = [`ready: ${v.ready ? 'yes' : 'no'}`]
   if (v.kernel) lines.push(`kernel: ${v.kernel}`)
@@ -531,6 +540,8 @@ class FreeCadBridge {
     this.touched = new Set()
     /** Assemblies keep their base placements so joints can re-place instances. */
     this.assemblies = new Map()
+    this.sessionUndo = []
+    this.sessionRedo = []
     this.assemblySeq = 0
     /**
      * Models live in the session's workspace, but the panel posts without a
@@ -853,6 +864,48 @@ class FreeCadBridge {
     if (!Number.isFinite(next)) return null
     record.explode = Math.max(0, Math.min(4, next))
     return record.explode
+  }
+
+  // ---- 装配层撤销：关节值 / 关节增删 / 爆炸系数 ----
+  snapshotAssembly(record) {
+    return { id: record.id, joints: JSON.parse(JSON.stringify(record.joints ?? [])), explode: record.explode ?? 0 }
+  }
+
+  beginAssemblyEdit(record, label) {
+    return { label, assembly: record.id, before: this.snapshotAssembly(record), after: null }
+  }
+
+  endAssemblyEdit(entry, record) {
+    if (!entry) return
+    entry.after = this.snapshotAssembly(record)
+    this.sessionUndo.push({ at: new Date().toISOString(), ...entry })
+    if (this.sessionUndo.length > 50) this.sessionUndo.shift()
+    this.sessionRedo = []
+  }
+
+  async applyAssemblySnapshot(snapshot) {
+    const record = await this.loadAssembly(snapshot.id)
+    if (!record) throw new Error(`没有这个装配：${snapshot.id}`)
+    record.joints = JSON.parse(JSON.stringify(snapshot.joints))
+    record.explode = Math.max(0, Math.min(4, Number(snapshot.explode) || 0))
+    const published = await this.republishAssembly(record)
+    return { record, published }
+  }
+
+  async undoSession() {
+    const entry = this.sessionUndo.pop()
+    if (!entry) return null
+    const applied = await this.applyAssemblySnapshot(entry.before)
+    this.sessionRedo.push(entry)
+    return { label: entry.label, assembly: entry.assembly, sceneId: applied.published.id }
+  }
+
+  async redoSession() {
+    const entry = this.sessionRedo.pop()
+    if (!entry || !entry.after) return null
+    const applied = await this.applyAssemblySnapshot(entry.after)
+    this.sessionUndo.push(entry)
+    return { label: entry.label, assembly: entry.assembly, sceneId: applied.published.id }
   }
 
   /** Recompute instance placements from base + joints + explode, then publish. */
@@ -1656,6 +1709,64 @@ __out = {
   })
 
   tool({
+    name: 'cad_studio_undo',
+    description: 'Undo the last change. scope=auto prefers the assembly stack (joint value, joint add/remove, explode factor), otherwise falls back to the model document stack; pass model for doc scope.',
+    parameters: {
+      type: 'object',
+      properties: {
+        scope: { type: 'string', enum: ['auto', 'assembly', 'doc'], description: 'default auto' },
+        model: { type: 'string', description: 'document name, for doc scope' },
+      },
+    },
+    output: { schema: { type: 'object' }, render: (args, value) => [{ type: 'text', text: renderUndo(value) }] },
+    async execute(args, exec) {
+      const scope = typeof args.scope === 'string' ? args.scope : 'auto'
+      if (scope !== 'doc' && bridge.sessionUndo.length) {
+        const undone = await bridge.undoSession()
+        return { ok: true, scope: 'assembly', undone: undone.label, assembly: undone.assembly, sceneId: undone.sceneId, remaining: bridge.sessionUndo.length, redo: bridge.sessionRedo.length }
+      }
+      if (scope === 'assembly') return { ok: false, error: '装配层没有可撤销的操作' }
+      const target = typeof args.model === 'string' && args.model ? args.model : ''
+      if (!target) return { ok: false, error: '文档撤销需要 model 名称（可用 cad_studio_doc list 查看）' }
+      try {
+        const out = await runFeatureAction({ model: target, action: 'undo' }, modelsDirFor(exec))
+        return { ok: out?.ok !== false, scope: 'doc', model: target, undone: 'doc', ...out }
+      } catch (error) {
+        return { ok: false, error: `文档撤销失败：${String(error?.message ?? error)}（脚本模型请用 cad_studio_doc revert）` }
+      }
+    },
+  })
+
+  tool({
+    name: 'cad_studio_redo',
+    description: 'Redo the last undone change, same scopes as cad_studio_undo.',
+    parameters: {
+      type: 'object',
+      properties: {
+        scope: { type: 'string', enum: ['auto', 'assembly', 'doc'], description: 'default auto' },
+        model: { type: 'string', description: 'document name, for doc scope' },
+      },
+    },
+    output: { schema: { type: 'object' }, render: (args, value) => [{ type: 'text', text: renderUndo(value) }] },
+    async execute(args, exec) {
+      const scope = typeof args.scope === 'string' ? args.scope : 'auto'
+      if (scope !== 'doc' && bridge.sessionRedo.length) {
+        const redone = await bridge.redoSession()
+        return { ok: true, scope: 'assembly', redone: redone.label, assembly: redone.assembly, sceneId: redone.sceneId, remaining: bridge.sessionRedo.length, undo: bridge.sessionUndo.length }
+      }
+      if (scope === 'assembly') return { ok: false, error: '装配层没有可重做的操作' }
+      const target = typeof args.model === 'string' && args.model ? args.model : ''
+      if (!target) return { ok: false, error: '文档重做需要 model 名称' }
+      try {
+        const out = await runFeatureAction({ model: target, action: 'redo' }, modelsDirFor(exec))
+        return { ok: out?.ok !== false, scope: 'doc', model: target, redone: 'doc', ...out }
+      } catch (error) {
+        return { ok: false, error: `文档重做失败：${String(error?.message ?? error)}（脚本模型请用 cad_studio_doc revert）` }
+      }
+    },
+  })
+
+  tool({
     name: 'cad_studio_scene',
     description: 'Maintain the model list the panel shows (the persisted scene history): action=list / delete / rename. Use delete to clear probe scenes that a measurement run left behind, and rename when a scene title is a file path or a part id.',
     parameters: {
@@ -2356,6 +2467,7 @@ if _TARGET:
         const published = await bridge.republishAssembly(record)
         return { ok: true, assembly: record.id, removed: joint, sceneId: published.id, joints: record.joints.length }
       }
+      const edit = bridge.beginAssemblyEdit(record, 'joint')
       let stored
       try {
         stored = bridge.setJoint(record, { ...spec, id: spec.id })
@@ -2363,6 +2475,7 @@ if _TARGET:
         return { ok: false, error: String(error?.message ?? error) }
       }
       const published = await bridge.republishAssembly(record)
+      bridge.endAssemblyEdit(edit, record)
       return {
         ok: true,
         assembly: record.id,
@@ -2399,9 +2512,11 @@ if _TARGET:
       }
       if (!record.joints.length) return { ok: false, error: '这个装配还没有关节：先 cad_studio_joint set 建一个' }
       const id = joint ?? record.joints[0].id
+      const edit = bridge.beginAssemblyEdit(record, 'drive')
       const moved = bridge.driveJoint(record, id, value)
       if (!moved) return { ok: false, error: `没有这个关节：${id}（现有 ${record.joints.map((j) => j.id).join(', ')}）` }
       const published = await bridge.republishAssembly(record)
+      bridge.endAssemblyEdit(edit, record)
       return {
         ok: true,
         assembly: record.id,
@@ -2437,9 +2552,11 @@ if _TARGET:
       } catch (error) {
         return { ok: false, error: String(error?.message ?? error) }
       }
+      const edit = bridge.beginAssemblyEdit(record, 'explode')
       const next = bridge.setExplode(record, factor ?? 1)
       if (next === null) return { ok: false, error: 'factor 必须是数字' }
       const published = await bridge.republishAssembly(record)
+      bridge.endAssemblyEdit(edit, record)
       return { ok: true, assembly: record.id, sceneId: published.id, explode: round6(next), instances: published.stats.instances }
     },
   })
@@ -3329,14 +3446,18 @@ __out = {"ok": True, "exported": ${JSON.stringify(target)}, "volume": round(scen
         if (!record) return send(404, JSON.stringify({ error: 'no assembly' }))
         if (url.pathname.endsWith('/drive')) {
           const jointId = typeof body?.joint === 'string' ? body.joint : record.joints[0]?.id
+          const editLive = live.beginAssemblyEdit(record, 'drive')
           const moved = live.driveJoint(record, jointId, body?.value)
           if (!moved) return send(400, JSON.stringify({ error: 'bad joint or value' }))
           const published = await live.republishAssembly(record)
+          live.endAssemblyEdit(editLive, record)
           return send(200, JSON.stringify({ ok: true, sceneId: published.id, at: published.stats.at, joint: moved.id, value: round6(moved.value) }))
         }
+        const editLive = live.beginAssemblyEdit(record, 'explode')
         const next = live.setExplode(record, body?.factor ?? 1)
         if (next === null) return send(400, JSON.stringify({ error: 'bad factor' }))
         const published = await live.republishAssembly(record)
+        live.endAssemblyEdit(editLive, record)
         return send(200, JSON.stringify({ ok: true, sceneId: published.id, at: published.stats.at, explode: round6(next) }))
       }
       if (url.pathname.startsWith(`${ROUTE_PREFIX}/scene/`)) {

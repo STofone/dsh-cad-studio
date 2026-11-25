@@ -4,7 +4,7 @@ DeepSeek Harness 的 CAD 插件：**把 FreeCAD 桥接成给 AI 用的工具**�
 
 ![CAD 工作室面板](https://raw.githubusercontent.com/STofone/dsh-cad-studio/main/docs/preview.png)
 
-- Host 侧（`index.js`）：16 个工具 + `/cad-studio/*` HTTP 路由 + `freecadcmd` 子进程桥
+- Host 侧（`index.js`）：18 个工具 + `/cad-studio/*` HTTP 路由 + `freecadcmd` 子进程桥
 - 客户端侧（`client.js`）：右栏页签「CAD 工作室」，three.js 视口 + 图标条浮层（零件 / 特征 / 选中项 / 运动 / 视图 / 模型 / 信息）
 - 数据：`<modelsDir>/<名字>.json` 存模型工程（脚本或声明式特征 + 参数 + 20 条历史）；场景网格落 `$TMPDIR/dsh-cad-studio/{state.json,scenes/*.json}`
 
@@ -137,6 +137,16 @@ npm 包：<https://www.npmjs.com/package/dsh-cad-studio>（`dsh plugin` / DSH �
 ```
 
 `rot` 是行主序 3×3，`translate` 是 mm。几何按**逐面三角化**，平面与孔壁不共享顶点（避免法线平均出暗色扇形）。
+
+### 撤销与重做
+
+| 层 | 覆盖 | 谁能用 |
+|---|---|---|
+| 文档 | 特征增删改、移动、抑制、回滚点、变量 | 面板 `Ctrl+Z` / 工具 `cad_studio_features {action:"undo"}` |
+| 装配 | 关节值、关节增删、爆炸系数 | 工具 `cad_studio_undo` / `cad_studio_redo`（`scope: auto｜assembly｜doc`） |
+| 外观 | 透明度、颜色、显隐、线框、隔离 | 面板 `Ctrl+Z` / 右下角 ↶↷（只活在这个浏览器页签里） |
+
+`scope:auto` 先看装配栈，空则退回文档栈（文档栈要求给 `model`）。导出写文件、出工程图、删模型属于不可逆动作，不进任何栈。
 
 ### 视图撤销
 
