@@ -1418,6 +1418,45 @@ endsolid t
   ok('deps: /deps 路由与工具一致', route.ok === true && route.models.some((m) => m.assembly === asm.assembly && m.missingParts.length === 0), JSON.stringify(route.models?.length))
 }
 
+// ---- 7o. draft: extruded wall leans by the requested angle ---------------
+{
+  const rect = (w, h) => ({
+    geometry: [
+      { id: 'g1', type: 'line', p1: [0, 0, 0], p2: [50, 0, 0] },
+      { id: 'g2', type: 'line', p1: [50, 0, 0], p2: [50, 30, 0] },
+      { id: 'g3', type: 'line', p1: [50, 30, 0], p2: [0, 30, 0] },
+      { id: 'g4', type: 'line', p1: [0, 30, 0], p2: [0, 0, 0] },
+    ],
+    constraints: [
+      { id: 'c1', type: 'coincident', a: 'g1', pa: 2, b: 'g2', pb: 1 },
+      { id: 'c2', type: 'coincident', a: 'g2', pa: 2, b: 'g3', pb: 1 },
+      { id: 'c3', type: 'coincident', a: 'g3', pa: 2, b: 'g4', pb: 1 },
+      { id: 'c4', type: 'coincident', a: 'g4', pa: 2, b: 'g1', pb: 1 },
+      { id: 'c5', type: 'horizontal', a: 'g1' }, { id: 'c6', type: 'vertical', a: 'g2' },
+      { id: 'c7', type: 'horizontal', a: 'g3' }, { id: 'c8', type: 'vertical', a: 'g4' },
+      { id: 'd1', type: 'distance', a: 'g1', pa: 1, b: 'g1', pb: 2, value: w },
+      { id: 'd2', type: 'distance', a: 'g2', pa: 1, b: 'g2', pb: 2, value: h },
+    ],
+  })
+  const drafted = await call('cad_studio_feature', {
+    ops: [{ kind: 'extrude', sketch: 'S1', h: 20, draft: 3 }], sketches: { S1: rect(60, 40) },
+  })
+  // 60x40 shrinks to (60-2d)x(40-2d) with d = 20*tan(3deg) = 1.0478.
+  const d = 20 * Math.tan((3 * Math.PI) / 180)
+  const a1 = (60 - 2 * d) * (40 - 2 * d)
+  const want = (20 * (2400 + a1 + Math.sqrt(2400 * a1))) / 3
+  ok('draft: 拔模挤出体积符合截锥公式', drafted.ok === true && near(drafted.volume ?? 0, want, 2),
+    `ok=${drafted.ok} got=${Math.round(drafted.volume ?? 0)} want=${Math.round(want)} err=${String(drafted.error ?? '').slice(0, 90)}`)
+  const straight = await call('cad_studio_feature', {
+    ops: [{ kind: 'extrude', sketch: 'S1', h: 20 }], sketches: { S1: rect(60, 40) },
+  })
+  ok('draft: 不给角度时仍是直壁', near(straight.volume ?? 0, 48000, 1), String(Math.round(straight.volume ?? 0)))
+  const tooMuch = await call('cad_studio_feature', {
+    ops: [{ kind: 'extrude', sketch: 'S1', h: 20, draft: 60 }], sketches: { S1: rect(60, 40) },
+  })
+  ok('draft: 缩到没有面积时大声失败', tooMuch.ok === false, String(tooMuch.error ?? '').slice(0, 90))
+}
+
 // ---- 7n. unfold: flat net of a plate, holes included --------------------
 {
   const dir = mkdtempSync(join(tmpdir(), 'cad-harness-unfold-'))

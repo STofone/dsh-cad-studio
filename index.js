@@ -1722,8 +1722,32 @@ def _prim(op, _cur=None):
         return Part.makeTorus(float(op["r1"]), float(op["r2"]), at, _dir(op.get("axis")))
     if k == "extrude":
         if op.get("sketch"):
-            face = Part.Face(_sketch(str(op["sketch"])))
-            return face.extrude(_dir(op.get("dir"), (0.0, 0.0, float(op.get("h") or 10.0))))
+            wire = _sketch(str(op["sketch"]))
+            vec = _dir(op.get("dir"), (0.0, 0.0, float(op.get("h") or 10.0)))
+            draft = float(op.get("draft", 0.0) or 0.0)
+            if abs(draft) < 1e-9:
+                return Part.Face(wire).extrude(vec)
+            # Draft: the section shrinks toward the far end, so the wall leans by
+            # the requested angle instead of going straight up. Offsetting the
+            # section in its own plane and lofting keeps the sides planar; a
+            # plain extrude plus a taper would need a real BRepOffsetAPI call
+            # that FreeCAD 0.20 does not expose to Python.
+            if abs(draft) >= 89.0:
+                raise RuntimeError("draft 需要 -89 到 89 度之间的角度")
+            drop = abs(vec.Length) * math.tan(math.radians(abs(draft)))
+            sign = -1.0 if draft > 0 else 1.0
+            try:
+                ring = wire.makeOffset2D(sign * drop, 0, False, False)
+            except Exception:
+                raise RuntimeError("draft 无法偏移这个截面：向内缩 %.3f mm 后没有面积了（减小角度或加大截面）" % drop)
+            if ring.ShapeType != "Wire":
+                raise RuntimeError("draft 无法偏移这个截面（可能是自交或太窄：需要向内缩 %.3f mm）" % drop)
+            ring = ring.copy()
+            ring.translate(vec)
+            solid = Part.makeLoft([wire, ring], True)
+            if abs(solid.Volume) < 1e-9:
+                raise RuntimeError("draft 得到零体积：截面缩 %.3f mm 后已经没有面积了，减小角度" % drop)
+            return solid
         base = float(op.get("base", 0.0))
         h = float(op.get("h", 0.0))
 # Points may be 2D (z = base) or 3D; dir replaces the +Z extrusion,

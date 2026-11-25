@@ -6,7 +6,7 @@
 ## P0 收口
 - [x] 1. 模型改名 / 复制（`cad_studio_doc {action:'rename'|'duplicate'}`），改名要改 `stats.sceneId` 行的标题与 docKey
 - [x] 2. 旋转出实体：定位 `revolve` 返回 volume 0 的原因（拿完整 traceback；试 `Part.makeRevolution` / `Wire.revolve` / `sewShape` 组合）
-- [ ] 3. 拔模（阻塞：0.20 的 makeLoft 从两个面宿出零体积壳，需要换构造方式） `draft`：从底面轮廓向内偏移 `h*tan(angle)` 再 makeLoft
+- [x] 3. 拔模 `draft`——`{kind:'extrude', sketch:'S1', h:20, draft:3}`：截面按 `h*tan(angle)` 在自身平面内偏移（`wire.makeOffset2D`，0.20 的 `makeLoft` 吃两条 **wire** 就正常出体，之前零体积是因为喂的是面），再平移到远端 `makeLoft` 成体；正角度向内收、负角度向外放；偏移后没有面积时给中文报错而不是 OCCT 原始 `CADKernelError`。实测 60×40×h20 draft3° → 45933（截锥公式 45932）
 - [x] 4. 旋转切除（= cut + revolve，已由 harness 钉住） `groove`（依赖 #2）
 
 ## P1 草图

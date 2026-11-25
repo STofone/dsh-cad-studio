@@ -24,6 +24,7 @@ DeepSeek Harness 的 CAD 插件：**把 FreeCAD 桥接成给 AI 用的工具**�
 | 模型清单 | `cad_studio_scene`（`action: list / delete / rename`）——面板里那条列表就是它；探查脚本留下的卡片可以直接删 |
 | 模型改名 / 复制 | `cad_studio_doc {action:"rename", name, to}` 与 `{action:"duplicate", name, to}`：改名会同步列表里的标题与 `docKey`，复制会得到一条独立的新场景（副本不继承运行历史与撤销栈）；两者都可 `cad_studio_undo` 回退 |
 | 几何自检 | `cad_studio_check {source}` 在导出/打印前问一次：是否有效实体、外壳是否闭合、每个实体体积多少，返回中文问题清单（零体积 / 外壳未闭合 / 几何无效 / 没有实体） |
+| 拔模挤出 | `{kind:"extrude", sketch:"S1", h:20, draft:3}` 按 3° 拔模：截面按 `h*tan(3°)` 偏移后 loft 成体，正角度内收、负角度外放 |
 | 展开图 | `cad_studio_unfold {source, target:"…/net.dxf"}` 把板类零件按共享边摊平成下料图（面片等距铺开，面积与模型一致；孔各自成环；圆柱/圆角等曲面报 `curvedSkipped` 而不是瞎编），可写 DXF 或 SVG |
 | 打印网格 | `cad_studio_mesh {source, target:"…/x.stl"}` 三角化 + 去重合并点/面、修形变、统一法向，可选 `fillHoles`、`targetSize`（减面）；回报修复前后的 facets/points，避免「导出成功但网格是碎的」 |
 | 旋转体与凹槽 | `revolve` 的 `axis` 取草图平面内的轴（`"Y"` 或 `[0,1,0]`）才是实体；垂直轴（XY 草图的 Z）只会扫出零厚度圆环，插件会直接报错。凹槽＝`{kind:"cut", with:{kind:"revolve", …}}`，不需要单独 op |
