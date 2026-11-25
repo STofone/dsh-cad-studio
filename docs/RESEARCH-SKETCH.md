@@ -126,3 +126,23 @@ sketch: {
 处理方式：**不把 0 体积的壳体交给下游**，直接抛
 「草图旋转得到的是壳体、没有闭合（需要 sewShape 缝合）」。
 下一步要接 `Shape.sewShape()` + 闭合检查，再放行。
+
+### 9.1 为什么旋转出不了实体（0.9.1 实测，未解）
+
+用最朴素的 `Part.Face(wire).revolve(O, Z, 360)` 试了三种截面（离轴的方环、贴轴的圆柱、圆锥），
+结果一致：`ShapeType=Solid`、`isValid=True`、`isClosed=True`，但 **`Volume` 恒为 0**。
+
+排除过的路径：
+
+| 尝试 | 结果 |
+|---|---|
+| `revolve(O, Z, 360)` | Solid，vol 0，area 正常 |
+| `revolve(..., isSolid=True)` | `TypeError: function takes at most 3 arguments (4 given)` |
+| `wire.revolve(..., True)` | 同上 |
+| `Part.makeRevolution(wire, O, Z, 360)` | `TypeError: Expected arguments are: Curve or Edge, [float, float, float, Vector, Vector, ShapeType]` |
+| `Part.Solid(shell)` / `fuse(self)` / `removeSplitter()` | 仍 vol 0 |
+| `Part.BRepGProp.VolumeProperties` | 本 build **没有** `GProp` 模块（`hasattr(Part,'GProp_GProps')` 为 False） |
+
+结论：这是 0.20 这条构造路径上的报告/几何缺陷，不是我们的选择器或草图数据错。
+当前行为是**显式拒绝**（报「草图旋转得到的是壳体、没有闭合」），不把 0 体积交给下游。
+下一步要试：`Part.makeRevolution` 的正确签名（6 参）、或先 `Part.makeCylinder` 之类已知可用路径做布尔构造。
