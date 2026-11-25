@@ -113,7 +113,7 @@ npm 包：<https://www.npmjs.com/package/dsh-cad-studio>（`dsh plugin` / DSH �
 
 ![装配与视口](https://raw.githubusercontent.com/STofone/dsh-cad-studio/main/docs/preview.png)
 
-**选中项**：视口点选 ↔ 列表联动；改色、显隐、透明度、隔离、线框、副本同透明度、重置。
+**选中项**：视口点选 ↔ 列表联动；点颜色方块直接换色（色块旁显示当前 hex）、显隐、透明度、隔离、线框、副本同透明度、重置。
 
 ![选中项](https://raw.githubusercontent.com/STofone/dsh-cad-studio/main/docs/props.png)
 

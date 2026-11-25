@@ -163,6 +163,12 @@ window.__ModuleLoader__.load({
       // twice is how the swatches once rendered pure white.
       swatch: (color) => ({ width: 10, height: 10, borderRadius: 2, flex: 'none', background: color }),
       swatchButton: { padding: 2, margin: 0, border: 0, background: 'transparent', cursor: 'pointer', display: 'inline-flex', borderRadius: 3, flex: 'none' },
+      swatchPick: {
+        padding: '2px 5px', margin: 0, border: '1px solid rgba(140,150,165,.34)', background: 'transparent',
+        cursor: 'pointer', display: 'inline-flex', alignItems: 'center', gap: 5, borderRadius: 4,
+        font: 'inherit', fontSize: 9.5, color: 'inherit', fontVariantNumeric: 'tabular-nums',
+      },
+      swatchHex: { opacity: 0.7, letterSpacing: '.02em' },
       eyeButton: { marginLeft: 'auto', padding: 2, border: 0, background: 'transparent', cursor: 'pointer', display: 'inline-flex', opacity: 0.85, flex: 'none' },
       colorPop: { position: 'absolute', top: '100%', left: 4, zIndex: 40, padding: 6, borderRadius: 6, border: '1px solid', boxShadow: '0 10px 26px rgba(0,0,0,.3)', display: 'flex', flexDirection: 'column', gap: 5 },
       colorRow: { display: 'grid', gridTemplateColumns: 'repeat(6, 14px)', gap: 4 },
@@ -2716,14 +2722,21 @@ const FILE_EXTS = ['step', 'stp', 'iges', 'igs', 'brep', 'stl']
           h('div', { key: 'sub', style: styles.propSub }, `${pickedInst.part}${pickedCopies > 1 ? ` · 共 ${pickedCopies} 个副本` : ''}${pickedTris ? ` · ${pickedTris.toLocaleString()} 三角面` : ''}${pickedSize ? ` · ${pickedSize} mm` : ''}`),
           h('div', { key: 'color', style: { ...styles.propRow, position: 'relative' } }, [
             h('span', { key: 'l', style: styles.propLabel }, '颜色'),
-            h('span', { key: 's', style: styles.swatch(pickedHex) }),
+            // The swatch IS the button: a separate 「换色」按钮 was one click of
+            // ceremony for something a colour chip already promises.
             h('button', {
               key: 'b',
               type: 'button',
               'data-cad-prop-color': pickedInst.name,
-              style: { ...styles.propBtn, marginLeft: 'auto' },
+              'data-cad-prop-swatch': pickedHex,
+              style: { ...styles.swatchPick, marginLeft: 'auto' },
+              title: '点这个色块换色',
+              'aria-label': `换色：${displayName(pickedInst.name, pickedInst.part)}（当前 ${pickedHex}）`,
               onClick: () => setPropColorOpen((open) => !open),
-            }, '换色'),
+            }, [
+              h('span', { key: 's', style: { ...styles.swatch(pickedHex), width: 14, height: 14, borderRadius: 3, boxShadow: 'inset 0 0 0 1px rgba(16,24,40,.22)' } }),
+              h('span', { key: 'h', style: styles.swatchHex }, pickedHex),
+            ]),
             propColorOpen ? h(ColorPopover, {
               key: 'pop',
               theme,
