@@ -1202,6 +1202,7 @@ const featuresScript = (ops, exportPath, opts = {}) => `${PRELUDE}
 import os
 _OPS = json.loads(${JSON.stringify(JSON.stringify(Array.isArray(ops) ? ops : []))})
 _EXPORT = ${exportPath ? JSON.stringify(exportPath) : 'None'}
+_SKETCHES = json.loads(${JSON.stringify(JSON.stringify(opts.sketches && typeof opts.sketches === 'object' ? opts.sketches : {}))})
 _CACHE = json.loads(${JSON.stringify(JSON.stringify(opts.cache && opts.cache.hashes ? { dir: opts.cache.dir, hashes: opts.cache.hashes } : null))})
 _RESUME = json.loads(${JSON.stringify(JSON.stringify(opts.resume && opts.resume.brep ? { index: opts.resume.index, brep: opts.resume.brep } : null))})
 
@@ -1231,6 +1232,90 @@ def _anchor(_spec, _cur):
     _off = _spec.get("offset")
     return _center_of(_hits[0]) + (_v3(_off) if _off else Vector(0.0, 0.0, 0.0))
 
+
+_SK_CONSTRAINT = {
+    "coincident": ("Coincident", "ab2"), "concentric": ("Coincident", "circles"),
+    "horizontal": ("Horizontal", "one"), "vertical": ("Vertical", "one"),
+    "parallel": ("Parallel", "pair"), "perpendicular": ("Perpendicular", "pair"),
+    "tangent": ("Tangent", "pair"), "distance_x": ("DistanceX", "size"),
+    "distance_y": ("DistanceY", "size"), "radius": ("Radius", "size_one"),
+    "angle": ("Angle", "size_pair"), "distance": ("Distance", "ab2v"),
+}
+
+def _sketch(name):
+    import Sketcher
+    spec = _SKETCHES.get(name)
+    if not spec:
+        raise RuntimeError("no such sketch: %s" % name)
+    doc = FreeCAD.newDocument("sk_" + name)
+    sk = doc.addObject("Sketcher::SketchObject", "K")
+    ids = []
+    for g in spec.get("geometry") or []:
+        t = g.get("type")
+        if t == "line":
+            sk.addGeometry(Part.LineSegment(_v3(g["p1"]), _v3(g["p2"])), False)
+        elif t == "circle":
+            sk.addGeometry(Part.Circle(_v3(g["c"]), Vector(0, 0, 1), float(g["r"])), False)
+        else:
+            raise RuntimeError("sketch %s: unknown geometry %s" % (name, t))
+        ids.append(g.get("id"))
+    ix = dict((gid, i) for i, gid in enumerate(ids))
+    def gi(ref):
+        if ref not in ix:
+            raise RuntimeError("sketch %s: constraint refers to missing geometry %s" % (name, ref))
+        return ix[ref]
+    dims = []
+    for c in spec.get("constraints") or []:
+        t = c.get("type")
+        row = _SK_CONSTRAINT.get(t)
+        if not row:
+            raise RuntimeError("sketch %s: unknown constraint %s" % (name, t))
+        fc, form = row
+        v = c.get("value")
+        if form == "one":
+            sk.addConstraint(Sketcher.Constraint(fc, gi(c["a"])))
+        elif form == "ab2":
+            sk.addConstraint(Sketcher.Constraint(fc, gi(c["a"]), int(c.get("pa", 1)), gi(c["b"]), int(c.get("pb", 1))))
+        elif form == "circles":
+            sk.addConstraint(Sketcher.Constraint(fc, gi(c["a"]), 3, gi(c["b"]), 3))
+        elif form == "pair":
+            sk.addConstraint(Sketcher.Constraint(fc, gi(c["a"]), gi(c["b"])))
+        elif form == "size":
+            sk.addConstraint(Sketcher.Constraint(fc, gi(c["a"]), int(c.get("pa", 2)), float(v)))
+            dims.append((c, fc, (gi(c["a"]), int(c.get("pa", 2))), None, float(v)))
+        elif form == "size_one":
+            sk.addConstraint(Sketcher.Constraint(fc, gi(c["a"]), float(v)))
+            dims.append((c, fc, (gi(c["a"]), None), None, float(v)))
+        elif form == "ab2v":
+            sk.addConstraint(Sketcher.Constraint(fc, gi(c["a"]), int(c.get("pa", 1)), gi(c["b"]), int(c.get("pb", 2)), float(v)))
+            dims.append((c, fc, (gi(c["a"]), int(c.get("pa", 1))), (gi(c["b"]), int(c.get("pb", 2))), float(v)))
+        else:
+            sk.addConstraint(Sketcher.Constraint(fc, gi(c["a"]), gi(c["b"]), float(v)))
+            dims.append((c, fc, (gi(c["a"]), None), (gi(c["b"]), None), float(v)))
+    rc = sk.solve()
+    if rc < 0:
+        raise RuntimeError("sketch %s: solver failed (rc=%s), constraints conflict" % (name, rc))
+    doc.recompute()
+    for c, fc, ref1, ref2, want in dims:
+        def _pt(ref):
+            seg = sk.Geometry[ref[0]]
+            return seg.StartPoint if ref[1] == 1 else seg.EndPoint
+        if fc == "Radius":
+            got = sk.Geometry[ref1[0]].Radius
+        elif fc == "Distance":
+            got = (_pt(ref2) - _pt(ref1)).Length
+        elif fc in ("DistanceX", "DistanceY"):
+            p = _pt(ref1)
+            got = p.x if fc == "DistanceX" else p.y
+        else:
+            continue
+        if abs(got - want) > 1e-6:
+            raise RuntimeError("sketch %s: constraint %s not satisfied: want %s got %.4f" % (name, c.get("id"), want, got))
+    wires = sk.Shape.Wires
+    if not wires:
+        raise RuntimeError("sketch %s: not a closed contour (%d curves)" % (name, len(ids)))
+    return wires[0]
+
 def _prim(op, _cur=None):
     k = op.get("kind")
     _at_spec = op.get("at")
@@ -1248,6 +1333,9 @@ def _prim(op, _cur=None):
     if k == "torus":
         return Part.makeTorus(float(op["r1"]), float(op["r2"]), at, _dir(op.get("axis")))
     if k == "extrude":
+        if op.get("sketch"):
+            face = Part.Face(_sketch(str(op["sketch"])))
+            return face.extrude(_dir(op.get("dir"), (0.0, 0.0, float(op.get("h") or 10.0))))
         base = float(op.get("base", 0.0))
         h = float(op.get("h", 0.0))
 # Points may be 2D (z = base) or 3D; dir replaces the +Z extrusion,
@@ -2250,6 +2338,7 @@ ${pair ? `    __out["distance"] = round((FreeCAD.Vector(${JSON.stringify(from)})
         },
         title: { type: 'string', description: 'Panel title for the published scene.' },
         export: { type: 'string', description: 'Optional .step/.stp path to also write the result.' },
+        sketches: { type: 'object', description: 'Sketches by name: {S1:{geometry:[{id,type,...}],constraints:[{id,type,...}]}}. A feature extrudes one with {kind:"extrude",sketch:"S1"}.' },
       },
       required: ['ops'],
       additionalProperties: false,
@@ -2258,11 +2347,11 @@ ${pair ? `    __out["distance"] = round((FreeCAD.Vector(${JSON.stringify(from)})
       schema: { type: 'object', properties: { ok: { type: 'boolean' }, sceneId: { type: 'string' }, volume: { type: 'number' }, features: { type: 'number' } } },
       render: (_a, v) => [{ type: 'text', text: JSON.stringify(v, null, 2) }],
     },
-    execute: async ({ ops, title, export: exportPath }) => {
+    execute: async ({ ops, title, sketches, export: exportPath }) => {
       if (!Array.isArray(ops) || !ops.length) return { ok: false, error: 'ops 不能为空：至少给一个图元' }
       const unknown = ops.find((op) => !op || !FEATURE_KINDS.includes(op.kind))
       if (unknown) return { ok: false, error: `不支持的特征：${unknown?.kind ?? '(空)'}（可用 ${FEATURE_KINDS.join(' / ')}）` }
-      const py = featuresScript(ops, exportPath)
+      const py = featuresScript(ops, exportPath, { sketches })
       return bridge.run(py, { title: title ?? 'feature' })
     },
   })

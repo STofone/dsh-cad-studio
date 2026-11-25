@@ -95,3 +95,26 @@ sketch: {
   `solve` / `setDatum` / `getDatum` / `FullyConstrained`）
 - SolveSpace / planegcs：FreeCAD 求解器来源，约束语义的权威定义
 - 我们的 `docs/DESIGN.md` §5（历史模型）与 §11（落地记录）
+
+## 8. 实测补充：0.20 上真正能用的尺寸签名（2026-11-25）
+
+| 写法 | 返回 | 实际效果 |
+|---|---|---|
+| `('DistanceX', geo, pos, value)` | 0 | ✅ 把该点的**绝对 X 坐标**设为 value |
+| `('DistanceX', geo1, pos1, geo2, pos2, value)` | 0 | ❌ 值被忽略（几何走到 58.56 这种位置） |
+| `('Distance', geoA, posA, geoB, posB, value)` | 0 | ✅ **两点距离** = value（我们用它做宽度/高度） |
+| `setDatum(idx, Quantity('80 mm'))` | 0 | ✅ 但需先有该约束，且 idx 要拿对 |
+
+结论：**宽度/高度这类「两点距离」必须用 `Distance`，不能用 `DistanceX`**；
+`DistanceX/Y` 是绝对坐标约束。我们的自检函数按语义分别测量：
+`Distance` → 两点欧氏距离；`DistanceX/Y` → 该点坐标；`Radius` → 半径。
+
+### 已完成的最小闭环（0.9.0）
+
+- 数据模型：`sketches: {S1: {geometry:[{id,type,line|circle}], constraints:[{id,type,...}]}}`，
+  特征写 `{kind:"extrude", sketch:"S1", h:10}`。
+- 发射器：JSON → `Sketcher` 调用 → `solve()`（rc<0 直接失败）→ **逐条尺寸自检** →
+  `sk.Wires[0]` → `Part.Face().extrude()`。
+- 实测：80×40 矩形挤出 h10 = **32000 mm³**；改宽度 120 → **48000 mm³**（尺寸驱动成立）；
+  加一条矛盾尺寸 → `solve()=-3`，工具返回 `ok:false` 且文案点明冲突（不静默）。
+- 回归：**213 passed / 0 failed**（新增 3 条草图用例）。

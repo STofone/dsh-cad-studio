@@ -949,6 +949,36 @@ endsolid t
 }
 
 
+// ---- 7r. sketches: geometry + constraints, solved by FreeCAD -----------
+{
+  const rect = (w, h) => ({
+    geometry: [
+      { id: 'g1', type: 'line', p1: [0, 0, 0], p2: [50, 0, 0] },
+      { id: 'g2', type: 'line', p1: [50, 0, 0], p2: [50, 30, 0] },
+      { id: 'g3', type: 'line', p1: [50, 30, 0], p2: [0, 30, 0] },
+      { id: 'g4', type: 'line', p1: [0, 30, 0], p2: [0, 0, 0] },
+    ],
+    constraints: [
+      { id: 'c1', type: 'coincident', a: 'g1', pa: 2, b: 'g2', pb: 1 },
+      { id: 'c2', type: 'coincident', a: 'g2', pa: 2, b: 'g3', pb: 1 },
+      { id: 'c3', type: 'coincident', a: 'g3', pa: 2, b: 'g4', pb: 1 },
+      { id: 'c4', type: 'coincident', a: 'g4', pa: 2, b: 'g1', pb: 1 },
+      { id: 'c5', type: 'horizontal', a: 'g1' }, { id: 'c6', type: 'vertical', a: 'g2' },
+      { id: 'c7', type: 'horizontal', a: 'g3' }, { id: 'c8', type: 'vertical', a: 'g4' },
+      { id: 'd1', type: 'distance', a: 'g1', pa: 1, b: 'g1', pb: 2, value: w },
+      { id: 'd2', type: 'distance', a: 'g2', pa: 1, b: 'g2', pb: 2, value: h },
+    ],
+  })
+  const box = await call('cad_studio_feature', { ops: [{ kind: 'extrude', sketch: 'S1', h: 10 }], sketches: { S1: rect(80, 40) } })
+  ok('sketch: a constrained rectangle extrudes to w*h*h', box.ok === true && near(box.volume ?? 0, 32000, 1), `ok=${box.ok} volume=${Math.round(box.volume ?? 0)} err=${box.error ?? ''}`)
+  const wide = await call('cad_studio_feature', { ops: [{ kind: 'extrude', sketch: 'S1', h: 10 }], sketches: { S1: rect(120, 40) } })
+  ok('sketch: changing one dimension drives the shape', wide.ok === true && near(wide.volume ?? 0, 48000, 1), `volume=${Math.round(wide.volume ?? 0)}`)
+  const clash = rect(80, 40)
+  clash.constraints.push({ id: 'd3', type: 'distance', a: 'g1', pa: 1, b: 'g1', pb: 2, value: 20 })
+  const bad = await call('cad_studio_feature', { ops: [{ kind: 'extrude', sketch: 'S1', h: 10 }], sketches: { S1: clash } })
+  ok('sketch: contradictory dimensions fail loudly', bad.ok === false && /conflict|failed/i.test(String(bad.error ?? '')), String(bad.error ?? '').slice(0, 120))
+}
+
 // ---- 8. teardown --------------------------------------------------------
 for (const d of disposed.reverse()) { try { d() } catch (e) { console.log('  [dispose warn]', e.message) } }
 ok('all tools unregistered on dispose', tools.size === 0, [...tools.keys()].join(','))
