@@ -4208,6 +4208,34 @@ else:
     return (doc.changes || []).filter((c) => c.rev > seen && c.by !== by)
   }
 
+  /**
+   * Read-before-write. A digest attached to the result arrives too late when the
+   * very next call is a write — the damage is done before the agent reads it. So
+   * a write from one side is refused once when the other side changed the model
+   * since that side last looked. The agent re-issues with ifRev (the revision it
+   * just saw) or force, which is the explicit "yes, overwrite that".
+   */
+  const foreignWriteGuard = (doc, by, args) => {
+    const pending = pendingChanges(doc, by)
+    if (!pending.length) return null
+    if (args && args.force === true) return { ok: true, rows: changeRows(pending) }
+    const ifRev = Number(args && args.ifRev)
+    if (Number.isFinite(ifRev) && ifRev === Number(doc.rev)) return { ok: true, rows: changeRows(pending) }
+    return { ok: false, rows: changeRows(pending) }
+  }
+
+  /** The refusal a guarded write returns: no file touched, rows in hand. */
+  const guardRefusal = (doc, guard, by) => {
+    const latest = guard.rows[guard.rows.length - 1]
+    return {
+      ok: false,
+      needsReview: true,
+      model: doc.name,
+      conflict: { rev: Number(doc.rev) || 0, rows: guard.rows },
+      hint: `${latest.by}刚在这个模型上改了 ${guard.rows.length} 处（最新一条：${latest.detail}），这次改动没有执行。看清楚了再重发：带 ifRev=${Number(doc.rev) || 0} 表示在最新版上改，或 force=true 表示认可覆盖。`,
+    }
+  }
+
   /** One line a human can read, so the digest means something without a lookup. */
   const changeRows = (rows) => rows.map((c) => ({
     rev: c.rev,
@@ -4557,6 +4585,8 @@ else:
         to: { type: 'string', description: 'For action=rename / duplicate: the new model name.' },
         sketches: { type: 'object', description: 'For kind="features": named sketches stored in the document, e.g. {S1:{geometry:[{id:"g1",type:"line",p1:[0,0,0],p2:[80,0,0]}, …],constraints:[…]}}. A feature extrudes/revolves/lofts one with {kind:"extrude",sketch:"S1"}.' },
         export: { type: 'string', description: 'Also write the model out as STEP at this path (create / update / show). Saves the caller from re-implementing the feature emitter.' },
+        ifRev: { type: 'number', description: 'Write guard. If someone edited this model in the panel since you last saw it, the write is refused once and tells you the revision; re-issue with ifRev=<that revision> to say "I saw those edits, write on top of them".' },
+        force: { type: 'boolean', description: 'Write guard escape hatch: true means "I accept overwriting the panel edits I was just told about". Prefer ifRev — force skips the review.' },
       },
       required: ['action'],
       additionalProperties: false,
@@ -4710,6 +4740,10 @@ else:
     if (action === 'list') {
       return { ok: true, model: doc.name, kind: doc.kind, features: publicFeatures(doc), sketches: doc.sketches ?? {}, graph: graphView(doc, { errors: [], executed: null }), stats: doc.stats ?? null }
     }
+    // Every other action writes — including undo/redo, which can undo a human's
+    // edit as easily as the agent's own. Same read-before-write rule as above.
+    const guard = by === 'agent' ? foreignWriteGuard(doc, by, args) : null
+    if (guard && guard.ok === false) return guardRefusal(doc, guard, by)
     if (action === 'sketch') {
       // Sketches are document data (geometry + constraints), so editing one is
       // a document edit: same rollback rule as a feature edit, and the sketch
@@ -4854,7 +4888,7 @@ else:
     doc.history = doc.history.slice(-20)
     recordChange(doc, { by, kind: `feature.${action}`, detail: label })
     await writeModel(doc, dir)
-    return await withChanges(doc, by, {
+    const out = await withChanges(doc, by, {
       ok: true,
       evaluated: result.ok !== false && (result.errors ?? []).length === 0,
       model: doc.name,
@@ -4875,6 +4909,8 @@ else:
       computed: result.computed ?? null,
       revalidated: result.revalidated === true,
     }, dir)
+    if (guard && guard.rows.length) out.overwrote = guard.rows
+    return out
   }
 
   tool({
@@ -4894,6 +4930,8 @@ else:
         feature: { type: 'object', description: 'add: the feature to append. update/toggle: {id, ...fields to change}. remove/move: {id}.' },
         id: { type: 'string', description: 'Feature id (f1, f2 …); alternative to feature.id.' },
         to: { type: 'integer', description: 'move: target index (0-based). Default: to the end.' },
+        ifRev: { type: 'number', description: 'Write guard: if the panel edited this model since you last saw it, the write is refused once with the revision; re-issue with ifRev=<that revision> to write on top of those edits.' },
+        force: { type: 'boolean', description: 'Write guard escape hatch (accepts overwriting the panel edits you were just told about). Prefer ifRev.' },
       },
       required: ['model', 'action'],
       additionalProperties: false,
@@ -5058,6 +5096,8 @@ __out = {"ok": True, "exported": ${JSON.stringify(target)}, "volume": round(scen
 
       if (action === 'update') {
         const doc = await readModel(args.name, dir)
+        const guard = by === 'agent' ? foreignWriteGuard(doc, by, args) : null
+        if (guard && guard.ok === false) return guardRefusal(doc, guard, by)
         if (args.vars !== undefined) doc.vars = normalizeVars(args.vars, doc.vars)
         if (args.sketches !== undefined) doc.sketches = normalizeSketches(args.sketches, doc.sketches)
         const before = {
@@ -5091,11 +5131,15 @@ __out = {"ok": True, "exported": ${JSON.stringify(target)}, "volume": round(scen
         doc.history = doc.history.slice(-20)
         recordChange(doc, { by, kind: 'doc.update', detail: describeDocUpdate(args, doc) })
         await writeModel(doc, dir)
-        return await withChanges(doc, by, { ...result, kind: doc.kind, ...(doc.kind === 'features' ? { features: publicFeatures(doc) } : {}) }, dir)
+        const out = await withChanges(doc, by, { ...result, kind: doc.kind, ...(doc.kind === 'features' ? { features: publicFeatures(doc) } : {}) }, dir)
+        if (guard && guard.rows.length) out.overwrote = guard.rows
+        return out
       }
 
       if (action === 'revert') {
         const doc = await readModel(args.name, dir)
+        const guard = by === 'agent' ? foreignWriteGuard(doc, by, args) : null
+        if (guard && guard.ok === false) return guardRefusal(doc, guard, by)
         const last = doc.history.pop()
         if (!last) throw new Error(`${doc.name} 没有可回退的历史`)
         if (last.prev) {

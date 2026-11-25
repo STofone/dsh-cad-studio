@@ -1525,6 +1525,9 @@ endsolid t
 // ---- 8. change ledger: the panel's edits reach the agent ----------------
 {
   const name = 'harness-ledger'
+  // The ledger test asserts revisions from 1, so start from no document at all
+  // (an earlier run in the same models directory would leave one behind).
+  try { await call('cad_studio_doc', { action: 'delete', name }) } catch (e) { /* not there */ }
   await call('cad_studio_doc', {
     action: 'create',
     kind: 'features',
@@ -1561,6 +1564,51 @@ endsolid t
   const again = await call('cad_studio_doc', { action: 'show', name })
   ok('ledger: the digest is delivered once, not every call', again.changes && again.changes.pending === 0,
     JSON.stringify(again.changes))
+
+  // --- write guard: the human's edit reaches the agent BEFORE its write ---
+  const rev1 = (await call('cad_studio_changes', { model: name })).rev
+  const panelEdit = await post('/cad-studio/feature', {
+    model: name, action: 'update', id: baseId, feature: { kind: 'box', params: { size: [80, 40, 30] } },
+  })
+  const panelVolume = JSON.parse(panelEdit.body).volume
+  const rev2 = (await call('cad_studio_changes', { model: name })).rev
+  ok('guard: the panel edit bumped the revision', rev2 > rev1, JSON.stringify({ rev1, rev2 }))
+
+  const refused = await call('cad_studio_features', {
+    model: name, action: 'update', id: baseId, feature: { kind: 'box', params: { size: [50, 40, 20] } },
+  })
+  ok('guard: an unconfirmed write is refused instead of overwriting the human',
+    refused.ok === false && refused.needsReview === true && refused.conflict && refused.conflict.rev === rev2 && refused.conflict.rows.length === 1,
+    JSON.stringify(refused).slice(0, 400))
+  const untouched = await call('cad_studio_features', { model: name, action: 'list' })
+  ok('guard: the refusal wrote nothing - the human geometry is still there',
+    near(untouched.stats.volume, panelVolume, 1), JSON.stringify({ want: panelVolume, got: untouched.stats.volume }))
+
+  const allowed = await call('cad_studio_features', {
+    model: name, action: 'update', ifRev: rev2, id: baseId, feature: { kind: 'box', params: { size: [50, 40, 20] } },
+  })
+  ok('guard: ifRev=<the revision just seen> lets the write through',
+    allowed.ok === true && near(allowed.volume, 40000, 1), JSON.stringify({ ok: allowed.ok, v: allowed.volume }))
+  ok('guard: the accepted overwrite is reported back', Array.isArray(allowed.overwrote) && allowed.overwrote.length === 1,
+    JSON.stringify(allowed.overwrote))
+
+  // force is the escape hatch: same write, no second look.
+  await post('/cad-studio/feature', {
+    model: name, action: 'update', id: baseId, feature: { kind: 'box', params: { size: [90, 40, 20] } },
+  })
+  const forced = await call('cad_studio_features', {
+    model: name, action: 'update', force: true, id: baseId, feature: { kind: 'box', params: { size: [70, 40, 20] } },
+  })
+  ok('guard: force=true skips the review and says what it replaced',
+    forced.ok === true && near(forced.volume, 56000, 1) && Array.isArray(forced.overwrote) && forced.overwrote.length >= 1,
+    JSON.stringify({ ok: forced.ok, v: forced.volume, n: (forced.overwrote || []).length }))
+
+  // A panel write is never blocked: the human is the authority here.
+  const panelAgain = JSON.parse((await post('/cad-studio/feature', {
+    model: name, action: 'update', id: baseId, feature: { kind: 'box', params: { size: [60, 40, 20] } },
+  })).body)
+  ok('guard: panel writes are never blocked by the agent pending edit',
+    panelAgain.ok === true && near(panelAgain.volume, 48000, 1), JSON.stringify({ ok: panelAgain.ok, v: panelAgain.volume }))
 }
 
 // ---- 8. teardown --------------------------------------------------------
