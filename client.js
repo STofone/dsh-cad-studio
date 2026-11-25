@@ -61,6 +61,13 @@ window.__ModuleLoader__.load({
         boxShadow: '6px 0 18px rgba(0,0,0,.16)',
       },
       headBtn: { font: 'inherit', fontSize: 11, padding: '2px 7px', borderRadius: 5, border: '1px solid rgba(120,130,145,.45)', background: 'transparent', cursor: 'pointer', flex: 'none', lineHeight: 1.5 },
+      undoPair: { position: 'absolute', right: 8, bottom: 8, display: 'flex', gap: 4, zIndex: 12 },
+      undoBtn: (active) => ({
+        width: 24, height: 24, borderRadius: 6, border: '1px solid rgba(140,150,165,.34)',
+        background: active ? 'rgba(120,130,145,.16)' : 'transparent', color: 'inherit',
+        opacity: active ? 0.9 : 0.28, cursor: active ? 'pointer' : 'default',
+        fontSize: 14, padding: 0, display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
+      }),
       stats: { position: 'absolute', left: 8, bottom: 6, zIndex: 10, fontSize: 10, opacity: 0.62, pointerEvents: 'none', whiteSpace: 'nowrap', fontVariantNumeric: 'tabular-nums' },
       menu: { position: 'absolute', right: 6, top: 30, zIndex: 40, minWidth: 132, padding: 4, borderRadius: 6, border: '1px solid', boxShadow: '0 10px 26px rgba(0,0,0,.3)' },
       menuRow: { display: 'flex', gap: 4, padding: '3px 4px', flexWrap: 'wrap' },
@@ -1553,6 +1560,7 @@ const FILE_EXTS = ['step', 'stp', 'iges', 'igs', 'brep', 'stl']
       // One floating panel at a time, opened from the rail: 'parts' | 'view' |
       // 'models' | 'info' | '' (closed). Same icon again closes it.
       const [panel, setPanel] = useState('')
+      useEffect(() => { panelRef.current = panel }, [panel])
       const theme = useTheme()
       // Colour overrides picked by hand in the tree. Two levels, because an
       // assembly can show one part many times: `inst` is one row, `part` is
@@ -1565,11 +1573,94 @@ const FILE_EXTS = ['step', 'stp', 'iges', 'igs', 'brep', 'stl']
       const [opacities, setOpacities] = useState({})
       const [wireframes, setWireframes] = useState({})
 
+      // ---- 视图撤销：透明度 / 颜色 / 显隐 / 线框 ----
+      // 这些是纯客户端的外观改动，服务端的 doc.undo 管不到。用快照栈记录整组
+      // 外观状态（JSON 串比较），同一目标 700 ms 内连续变动合并成一条，切场景清空。
+      const panelRootRef = useRef(null)
+      const panelRef = useRef('')
+      const panelTouchRef = useRef(0)
+      const lookSnap = JSON.stringify({ v: visibility, o: overrides, a: opacities, w: wireframes })
+      const histRef = useRef({ undo: [], redo: [], last: lookSnap, scene: '', quiet: false, at: 0 })
+      const [histTick, setHistTick] = useState(0)
+      const applyLook = (snap) => {
+        try {
+          const parsed = JSON.parse(snap)
+          histRef.current.quiet = true
+          setVisibility(parsed.v || {})
+          setOverrides(parsed.o || { inst: {}, part: {} })
+          setOpacities(parsed.a || {})
+          setWireframes(parsed.w || {})
+        } catch (err) { /* 坏快照不该拖垮面板 */ }
+      }
+      const doUndo = () => {
+        const h = histRef.current
+        const entry = h.undo.pop()
+        if (!entry) return
+        h.redo.push(entry)
+        applyLook(entry.before)
+        setHistTick((t) => t + 1)
+      }
+      const doRedo = () => {
+        const h = histRef.current
+        const entry = h.redo.pop()
+        if (!entry) return
+        h.undo.push(entry)
+        applyLook(entry.after)
+        setHistTick((t) => t + 1)
+      }
+
       // Async callbacks (the 1.5 s poller) close over the render they were
       // created in, so the live look has to be read from a ref, not from state.
       // Declared after the states it mirrors: reading them earlier would put
       // `overrides` in its temporal dead zone during the first render.
       const visibleIdRef = useRef('')
+      useEffect(() => {
+        const h = histRef.current
+        const now = Date.now()
+        if (h.scene !== sceneKey) {
+          h.scene = sceneKey
+          h.undo = []
+          h.redo = []
+          h.last = lookSnap
+          h.at = 0
+          setHistTick((t) => t + 1)
+          return
+        }
+        if (h.quiet) { h.quiet = false; h.last = lookSnap; return }
+        if (lookSnap === h.last) return
+        const top = h.undo[h.undo.length - 1]
+        if (top && now - h.at < 1500) top.after = lookSnap
+        else {
+          h.undo.push({ before: h.last, after: lookSnap })
+          if (h.undo.length > 40) h.undo.shift()
+        }
+        h.redo = []
+        h.last = lookSnap
+        h.at = now
+        setHistTick((t) => t + 1)
+      }, [lookSnap, sceneKey])
+
+      useEffect(() => {
+        const onKey = (event) => {
+          const key = String(event.key || '').toLowerCase()
+          if (!(event.ctrlKey || event.metaKey)) return
+          if (key !== 'z' && key !== 'y') return
+          const target = event.target
+          const tag = target && target.tagName ? target.tagName.toLowerCase() : ''
+          if (tag === 'input' || tag === 'textarea' || tag === 'select' || (target && target.isContentEditable)) return
+          if (panelRef.current === 'features') return
+          const host = panelRootRef.current
+          const focused = document.activeElement
+          const touched = Date.now() - panelTouchRef.current < 8000
+          const inPanel = touched || Boolean(host && (host.contains(focused) || host.contains(target)))
+          if (!inPanel) return
+          event.preventDefault()
+          if (key === 'y' || event.shiftKey) doRedo()
+          else doUndo()
+        }
+        window.addEventListener('keydown', onKey)
+        return () => window.removeEventListener('keydown', onKey)
+      }, [])
       const lookRef = useRef({ visibility: {}, overrides: { inst: {}, part: {} }, opacities: {}, wireframes: {} })
       useEffect(() => { visibleIdRef.current = visibleId }, [visibleId])
       useEffect(() => {
@@ -2511,7 +2602,7 @@ const FILE_EXTS = ['step', 'stp', 'iges', 'igs', 'brep', 'stl']
         { id: 'info', label: '模型信息' },
       ]
 
-      return h('div', { style: styles.root, 'data-cad-panel-root': '1' }, [
+      return h('div', { style: styles.root, 'data-cad-panel-root': '1', onMouseDown: () => { panelTouchRef.current = Date.now() } }, [
         h('div', {
           key: 'head',
           style: styles.head,
@@ -2626,7 +2717,22 @@ const FILE_EXTS = ['step', 'stp', 'iges', 'igs', 'brep', 'stl']
             !runtime.available
               ? guideNode
               : payload
-              ? h('div', { key: 'stage', style: styles.stage }, h(Viewport, { payload, visibility, options: { ...display, overrides, opacities, wireframes, restoreCamera: pendingCameraRef.current, onPick: pickInViewport }, handleRef: viewportRef }))
+              ? h('div', { key: 'stage', style: styles.stage }, [
+                h(Viewport, { payload, visibility, options: { ...display, overrides, opacities, wireframes, restoreCamera: pendingCameraRef.current, onPick: pickInViewport }, handleRef: viewportRef }),
+                h('div', { key: 'undo', style: styles.undoPair, ref: panelRootRef }, [
+                  h('button', {
+                    key: 'u', type: 'button', style: styles.undoBtn(histRef.current.undo.length > 0),
+                    title: histRef.current.undo.length ? '撤销上一次外观改动' : '没有可撤销的改动',
+                    'aria-label': '撤销外观改动', 'data-cad-undo': histRef.current.undo.length,
+                    onClick: doUndo,
+                  }, '↶'),
+                  h('button', {
+                    key: 'r', type: 'button', style: styles.undoBtn(histRef.current.redo.length > 0),
+                    title: '重做外观改动', 'aria-label': '重做外观改动', 'data-cad-redo': histRef.current.redo.length,
+                    onClick: doRedo,
+                  }, '↷'),
+                ]),
+              ])
               : h('div', { key: 'empty', style: styles.empty }, '还没有模型。让 AI 跑一次 FreeCAD 脚本或打开一个 STEP 文件，这里会自动显示。'),
             picked && panel !== 'parts'
               ? h('button', {
