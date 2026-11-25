@@ -25,7 +25,7 @@
 - [ ] 13. 依赖 UI（Show dependencies 面板）与 relink
 
 ## P4 系统
-- [ ] 14. journal 落盘（重启后撤销栈还在）
+- [x] 14. journal 落盘：`<数据目录>/journal.json` 存最近 20 条可重放记录（`doc-create` / `doc-delete` 带 base64 字节 / `doc-rename`），插件启动时 `loadJournal` 重建；`undoSession` 先 `await bridge.journalReady` 再取栈（否则会误报「没有可撤销的操作」）。装配/视图类 journal 是活对象闭包，仍只在本会话有效——重启后没有这条记录，面板会说没有可撤销，而不是错撤别的东西。
 - [ ] 15. P5 外观持久化（视图状态进文档，与文档撤销统一时序）
 
 ## 明确不做

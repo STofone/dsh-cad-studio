@@ -1238,6 +1238,32 @@ endsolid t
   ok('sketch angle: 60 deg constraint solves and passes its own re-measure', ang.ok === true && (ang.volume ?? 0) > 0, `ok=${ang.ok} vol=${ang.volume} err=${String(ang.error ?? '').slice(0, 100)}`)
 }
 
+// ---- 7ab. the journal survives a restart ---------------------------------
+{
+  const { execFileSync } = await import('node:child_process')
+  const worker = '/workspace/cad-studio/test/journal-worker.mjs'
+  const stamp = Date.now().toString(36)
+  const name = `jr_${stamp}`
+  const runWorker = (mode) => {
+    const raw = execFileSync(process.execPath, [worker, mode, name], { encoding: 'utf8', env: { ...process.env } })
+    const line = raw.trim().split('\n').pop() || '{}'
+    return JSON.parse(line)
+  }
+  const pluginDataDir = join(tmpdir(), 'dsh-cad-studio')
+  const seeded = runWorker('seed')
+  ok('journal: a document create writes a replayable journal entry', seeded.ok === true, `seed=${JSON.stringify(seeded)}`)
+  let entries = []
+  try {
+    const raw = JSON.parse(readFileSync(`${pluginDataDir}/journal.json`, 'utf8'))
+    entries = Array.isArray(raw.entries) ? raw.entries : []
+  } catch { entries = [] }
+  ok('journal: journal.json holds the doc-create record', entries.some((e) => e.record && e.record.op === 'doc-create' && e.record.model === name), `entries=${entries.map((e) => e.record && e.record.op).join(',')}`)
+  // A second process has no in-memory stack: only the file can make undo work.
+  const undone = runWorker('undo')
+  ok('journal: undo still works in a fresh process (restored from disk)', undone.ok === true && String(undone.undone || '').includes(name), `undo=${JSON.stringify(undone)}`)
+  ok('journal: undoing the restored create removed the model file', !existsSync(`/workspace/cad-models/${name}.json`), 'dir=/workspace/cad-models')
+}
+
 // ---- 8. teardown --------------------------------------------------------
 for (const d of disposed.reverse()) { try { d() } catch (e) { console.log('  [dispose warn]', e.message) } }
 ok('all tools unregistered on dispose', tools.size === 0, [...tools.keys()].join(','))

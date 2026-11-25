@@ -919,6 +919,39 @@ class FreeCadBridge {
     this.sessionUndo.push({ at: new Date().toISOString(), ...entry })
     if (this.sessionUndo.length > 50) this.sessionUndo.shift()
     this.sessionRedo = []
+    // Only entries carrying a serialisable `record` survive a restart: a raw
+    // closure cannot be written to disk, so those stay session-only.
+    if (entry && entry.record) this.persistJournal()
+  }
+
+  /** Write the replayable slice of the undo stack (newest 20) to journal.json. */
+  persistJournal() {
+    const rows = this.sessionUndo
+      .filter((e) => e && e.record)
+      .slice(-20)
+      .map((e) => ({ at: e.at, kind: e.kind, label: e.label, record: e.record }))
+    writeFile(join(FreeCadBridge.dataDir, 'journal.json'), JSON.stringify({ version: 1, entries: rows }, null, 2)).catch(() => {})
+  }
+
+  /**
+   * Rebuild undo entries from journal.json. `makeEntry(record)` supplies the
+   * closures (it needs the document helpers, which live in the plugin scope),
+   * so the bridge itself stays free of FreeCAD knowledge.
+   */
+  async loadJournal(makeEntry) {
+    let raw = null
+    try { raw = JSON.parse(await readFile(join(FreeCadBridge.dataDir, 'journal.json'), 'utf8')) } catch { return 0 }
+    const rows = Array.isArray(raw && raw.entries) ? raw.entries : []
+    let restored = 0
+    for (const row of rows) {
+      let built = null
+      try { built = makeEntry(row.record) } catch { built = null }
+      if (!built) continue
+      this.sessionUndo.push({ at: row.at, kind: row.kind, label: row.label, ...built, restored: true })
+      restored += 1
+    }
+    if (restored) this.sessionUndo = this.sessionUndo.slice(-50)
+    return restored
   }
 
   async applyAssemblySnapshot(snapshot) {
@@ -931,6 +964,7 @@ class FreeCadBridge {
   }
 
   async undoSession(kind) {
+    if (this.journalReady) { try { await this.journalReady } catch {} }
     const stack = kind ? this.sessionUndo.filter((e) => e.kind === kind) : this.sessionUndo
     const entry = stack[stack.length - 1]
     if (!entry) return null
@@ -3483,6 +3517,7 @@ if _TARGET:
     bridge.journal({
       kind: 'doc',
       label: `create ${key}`,
+      record: { op: 'doc-create', model: key, dir, sceneId: sceneRow ? sceneRow.id : '' },
       undo: async () => {
         await unlink(file).catch(() => {})
         if (sceneRow) { try { await bridge.removeScene(sceneRow.id, { journal: false }) } catch {} }
@@ -3495,6 +3530,83 @@ if _TARGET:
         return { model: key }
       },
     })
+  }
+
+  /**
+   * Rebuild one undo entry from a persisted journal record. Only document-level
+   * operations are replayable: they are data (a name, a file, bytes). Assembly
+   * and view journal entries are closures over live objects and stay
+   * session-only — after a restart they are not in the stack at all, which is
+   * honest: the panel then says there is nothing to undo instead of undoing
+   * something else.
+   */
+  const restoredEntry = (record) => {
+    const r = record || {}
+    const retitle = async (target, other) => {
+      const row = bridge.history.find((h) => h.docKey === `model:${other}` || h.title === other)
+      if (row) {
+        row.title = target
+        if (row.docKey) row.docKey = `model:${target}`
+        await bridge.persist()
+      }
+    }
+    if (r.op === 'doc-create') {
+      const file = modelFile(r.model, r.dir)
+      return {
+        undo: async () => {
+          await unlink(file).catch(() => {})
+          if (r.sceneId) { try { await bridge.removeScene(r.sceneId, { journal: false }) } catch {} }
+          return { model: r.model }
+        },
+        redo: async () => {
+          // Re-creating needs the emitter to publish again; let the caller do it.
+          throw new Error('重启后不能「重做创建」：请用 cad_studio_doc create 重新发布')
+        },
+      }
+    }
+    if (r.op === 'doc-delete') {
+      const file = modelFile(r.model, r.dir)
+      const bytes = Buffer.from(String(r.b64 || ''), 'base64')
+      return {
+        undo: async () => {
+          await writeFile(file, bytes)
+          try {
+            const doc = await readModel(r.model, r.dir)
+            await rebuild(doc, r.dir, { note: 'undo delete (restored journal)' })
+          } catch {}
+          return { model: r.model }
+        },
+        redo: async () => {
+          await unlink(file).catch(() => {})
+          return { model: r.model }
+        },
+      }
+    }
+    if (r.op === 'doc-rename') {
+      const from = modelFile(r.from, r.dir)
+      const to = modelFile(r.to, r.dir)
+      const move = async (src, dst, name) => {
+        const doc = JSON.parse(await readFile(src, 'utf8'))
+        doc.name = name
+        await writeModel(doc, r.dir)
+        await unlink(dst).catch(() => {})
+        return { model: name }
+      }
+      return {
+        undo: async () => { const out = await move(to, from, r.from); await retitle(r.from, r.to); return out },
+        redo: async () => { const out = await move(from, to, r.to); await retitle(r.to, r.from); return out },
+      }
+    }
+    return null
+  }
+
+  // Restore the replayable journal once per plugin start (a hot reload keeps the
+  // same bridge, so guard against stacking duplicates).
+  if (bridge && !bridge.journalLoaded) {
+    bridge.journalLoaded = true
+    // Keep the promise: an undo issued before the file has been read would
+    // otherwise see an empty stack and report "nothing to undo".
+    bridge.journalReady = bridge.loadJournal(restoredEntry).catch(() => 0)
   }
 
   const runFeatureAction = async (args, dir) => {
@@ -3879,6 +3991,9 @@ __out = {"ok": True, "exported": ${JSON.stringify(target)}, "volume": round(scen
         bridge.journal({
           kind: 'doc',
           label: `delete ${key}`,
+          // The bytes live in journal.json so "undo delete" still works after a
+          // restart; models are small JSON documents.
+          record: { op: 'doc-delete', model: key, dir, b64: bytes.toString('base64') },
           undo: async () => {
             await writeFile(file, bytes)
             const doc = await readModel(key, dir)
@@ -3924,6 +4039,7 @@ __out = {"ok": True, "exported": ${JSON.stringify(target)}, "volume": round(scen
         bridge.journal({
           kind: 'doc',
           label: `rename ${key} → ${to}`,
+          record: { op: 'doc-rename', dir, from: key, to },
           undo: async () => {
             const back = await readModel(to, dir)
             back.name = key
