@@ -702,6 +702,10 @@ endsolid t
   ok('scene delete works', dropped.ok === true && dropped.removed === published.sceneId, JSON.stringify(dropped))
   const gone = (await call('cad_studio_scene', { action: 'list' })).items.some((r) => r.id === published.sceneId)
   ok('deleted scene leaves the list', gone === false, '')
+  const afterDrop = await call('cad_studio_scene', { action: 'list' })
+  ok('deleting the newest scene hands the pointer to the next row',
+    afterDrop.latest !== '' && afterDrop.items.some((r) => r.id === afterDrop.latest),
+    JSON.stringify({ latest: afterDrop.latest }))
 
   // assembly measurements: two 20mm cubes, the second offset by 10mm in X
   const cubeA = await call('cad_studio_export', { target: `${dir}/cube.step`, code: 'import Part\nscene = Part.makeBox(20,20,20)' })

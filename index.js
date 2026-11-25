@@ -1047,7 +1047,11 @@ class FreeCadBridge {
     this.scenes.delete(key)
     for (const [asmId, rec] of [...this.assemblies]) if (rec.sceneId === key) this.assemblies.delete(asmId)
     try { await rm(join(FreeCadBridge.dataDir, 'scenes', `${key}.json`), { force: true }) } catch {}
-    if (this.latest && this.latest.id === key) {
+    // Re-point the "latest" pointer whenever it went stale: the deleted row may
+    // be it, and after a fresh process it may be null while the rows still say
+    // otherwise — either way the panel's live tab must not end up pointing at
+    // nothing (it renders an empty viewport and looks like the tool broke).
+    if (!this.latest || this.latest.id === key) {
       const next = this.history[0]
       this.latest = next ? { id: next.id, title: next.title, at: next.at, scene: this.scenes.get(next.id) ?? null } : null
     }
