@@ -14,7 +14,8 @@
  *   GET /cad-studio/client.js    the panel bundle (dev-mode serving)
  */
 import { spawn, spawnSync } from 'node:child_process'
-import { existsSync } from 'node:fs'
+import { existsSync, readdirSync, statSync, rmSync } from 'node:fs'
+import crypto from 'node:crypto'
 import { mkdtemp, mkdir, readdir, readFile, rm, stat, unlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { fileURLToPath } from 'node:url'
@@ -855,10 +856,58 @@ def describe(path):
  * `kind:'features'` model document — so a typed list and an edited-and-rebuilt
  * one cannot drift apart.
  */
-const featuresScript = (ops, exportPath) => `${PRELUDE}
+/**
+ * Bump whenever the emitter's meaning changes: the BREP cache is keyed by
+ * (version, op-chain), so a stale entry from an older emitter would silently
+ * resurrect wrong geometry.
+ */
+const EMITTER_VERSION = 'e1'
+
+/** One hash per prefix: hashes[i] = ops[0..i] applied. Skip markers reuse the
+ *  previous hash, so toggling a suppressed feature does not invalidate
+ *  anything upstream of it. */
+function chainHashes(ops) {
+  const out = []
+  let h = crypto.createHash('sha1').update(`cad-studio:${EMITTER_VERSION}`).digest('hex').slice(0, 16)
+  for (const op of Array.isArray(ops) ? ops : []) {
+    if (op && op.kind === '__skip__') { out.push(h); continue }
+    const bare = { ...op }
+    delete bare._id
+    delete bare._label
+    h = crypto.createHash('sha1').update(h).update(JSON.stringify(bare)).digest('hex').slice(0, 16)
+    out.push(h)
+  }
+  return out
+}
+
+function brepCacheDir() { return join(FreeCadBridge.dataDir, 'cache') }
+
+/** Content-addressed BREP snapshots are cheap to keep and cheap to prune:
+ *  drop them oldest-first once the directory grows past a cap. */
+function pruneBrepCache(dir, { maxFiles = 400, maxAgeDays = 14 } = {}) {
+  let names = []
+  try { names = readdirSync(dir).filter((n) => /^f_[0-9a-f]{16}\.brep$/.test(n)) } catch { return 0 }
+  const now = Date.now()
+  const kept = []
+  for (const n of names) {
+    try {
+      const st = statSync(join(dir, n))
+      if (now - st.mtimeMs > maxAgeDays * 86400_000) rmSync(join(dir, n), { force: true })
+      else kept.push({ n, at: st.mtimeMs })
+    } catch {}
+  }
+  kept.sort((a, b) => b.at - a.at)
+  let dropped = 0
+  for (const { n } of kept.slice(maxFiles)) { try { rmSync(join(dir, n), { force: true }); dropped += 1 } catch {} }
+  return dropped
+}
+
+const featuresScript = (ops, exportPath, opts = {}) => `${PRELUDE}
 import os
 _OPS = json.loads(${JSON.stringify(JSON.stringify(Array.isArray(ops) ? ops : []))})
 _EXPORT = ${exportPath ? JSON.stringify(exportPath) : 'None'}
+_CACHE = json.loads(${JSON.stringify(JSON.stringify(opts.cache && opts.cache.hashes ? { dir: opts.cache.dir, hashes: opts.cache.hashes } : null))})
+_RESUME = json.loads(${JSON.stringify(JSON.stringify(opts.resume && opts.resume.brep ? { index: opts.resume.index, brep: opts.resume.brep } : null))})
 
 def _v3(x, d=(0.0, 0.0, 0.0)):
     if not x:
@@ -936,6 +985,20 @@ def _match_dir(_d, _ax, _mode, _sign):
     return _c > 0.999 if _sign != "-" else _c < -0.999
 
 
+def _core_of(s):
+    # A shape read back from a BREP cache is a Compound, and Compound has no
+    # CenterOfMass (only Solid does) — use the lone solid when there is one and
+    # the bounding box otherwise. It only has to be a point *inside* the body.
+    try:
+        if len(s.Solids) == 1:
+            return s.Solids[0].CenterOfMass
+    except Exception:
+        pass
+    try:
+        return s.BoundBox.Center
+    except Exception:
+        return Vector(0.0, 0.0, 0.0)
+
 def _center_of(_it):
     _b = _it.BoundBox
     return Vector((_b.XMin + _b.XMax) / 2.0, (_b.YMin + _b.YMax) / 2.0, (_b.ZMin + _b.ZMax) / 2.0)
@@ -1002,7 +1065,24 @@ def _sel(_shape, _kind, _spec):
 _shape = None
 _errors = []
 _executed = 0
+_start = 0
+# Incremental recompute: resume from the deepest cached prefix instead of
+# replaying the whole chain. The cache is content-addressed by the op chain,
+# so an entry is only used when every upstream feature is byte-identical.
+if _RESUME and os.path.exists(_RESUME["brep"]):
+    try:
+        _cached = Part.Shape()
+        _cached.read(_RESUME["brep"])
+        if _cached.isValid() and not _cached.isNull():
+            _shape = _cached
+            _start = int(_RESUME["index"])
+            _executed = _start
+    except Exception as _e:
+        _shape = None
+        _start = 0
 for _idx, _op in enumerate(_OPS):
+    if _idx < _start:
+        continue
     _k = _op.get("kind")
     if _k == "__skip__":
         continue
@@ -1047,7 +1127,7 @@ for _idx, _op in enumerate(_OPS):
                     # stored orientation can point inward; cutting inward would
                     # remove nothing (the interior is already hollow), and
                     # cutting both ways would punch a hole clean through.
-                    _away = _center_of(_f) - _shape.CenterOfMass
+                    _away = _center_of(_f) - _core_of(_shape)
                     if _dot(_nrm, _away) < 0:
                         _nrm = Vector(0.0 - _nrm.x, 0.0 - _nrm.y, 0.0 - _nrm.z)
                     # Cut the wall itself: start a hair outside the plane and go
@@ -1106,6 +1186,15 @@ for _idx, _op in enumerate(_OPS):
         })
         break
     _executed = _idx + 1
+    if _CACHE and _idx < len(_CACHE.get("hashes") or []):
+        try:
+            _p = os.path.join(_CACHE["dir"], "f_%s.brep" % _CACHE["hashes"][_idx])
+            if not os.path.exists(_p):
+                _tmp = "%s.tmp%d" % (_p, os.getpid())
+                _shape.exportBrep(_tmp)
+                os.replace(_tmp, _p)
+        except Exception:
+            pass
 
 if _shape is None:
     raise RuntimeError(_errors[0]["message"] if _errors else "ops 为空：至少给一个图元")
@@ -1114,6 +1203,8 @@ scene = _shape
 __out = {
     "ok": True,
     "features": len(_OPS),
+    "cached": _start,
+    "computed": max(0, _executed - _start),
     "volume": round(_shape.Volume, 3),
     "area": round(_shape.Area, 3),
     "faces": len(_shape.Faces),
@@ -2152,7 +2243,13 @@ if _TARGET:
     doc.tip = typeof doc.tip === 'string' && doc.tip ? doc.tip : null
     doc.undo = Array.isArray(doc.undo) ? doc.undo : []
     doc.redo = Array.isArray(doc.redo) ? doc.redo : []
-    for (const f of doc.features) if (f && typeof f === 'object' && typeof f.suppressed === 'boolean') f.enabled = f.suppressed !== true
+    for (const f of doc.features) {
+      if (!f || typeof f !== 'object') continue
+      if (typeof f.suppressed === 'boolean') f.enabled = f.suppressed !== true
+      // Older docs picked up a stray params.suppressed from a normalizer bug;
+      // it changed the op hash for no geometric reason, so drop it on read.
+      if (f.params && typeof f.params === 'object' && 'suppressed' in f.params) delete f.params.suppressed
+    }
     return doc
   }
 
@@ -2211,7 +2308,7 @@ if _TARGET:
     return ops
   }
 
-  const FEATURE_FIELDS = ['id', 'kind', 'label', 'params', 'enabled']
+  const FEATURE_FIELDS = ['id', 'kind', 'label', 'params', 'enabled', 'suppressed']
 
   /**
    * Accept both shapes: `{kind:'box', params:{size:…}}` and the flatter
@@ -2310,8 +2407,37 @@ if _TARGET:
 
   const rebuild = async (doc, dir, { note } = {}) => {
     const isFeatures = doc.kind === 'features'
+    // Incremental recompute (DESIGN §5.3): hash the op chain once, find the
+    // deepest BREP prefix already on disk, and let the kernel start there.
+    // A rebuild of an unchanged document skips the kernel entirely.
+    let cache = null
+    let resume = null
+    let hashes = []
+    if (isFeatures) {
+      const ops = featureOps(doc)
+      hashes = chainHashes(ops)
+      const cacheDir = brepCacheDir()
+      try { await mkdir(cacheDir, { recursive: true }) } catch {}
+      cache = { dir: cacheDir, hashes }
+      for (let k = hashes.length - 1; k >= 0; k -= 1) {
+        const candidate = join(cacheDir, `f_${hashes[k]}.brep`)
+        if (existsSync(candidate)) { resume = { index: k + 1, brep: candidate }; break }
+      }
+      const fullHash = hashes[hashes.length - 1] ?? ''
+      const keep = doc.stats?.sceneId && bridge.scenes?.has(doc.stats.sceneId)
+      if (fullHash && keep && doc.stats?.hash === fullHash) {
+        // Nothing changed and the scene is still live: no kernel run at all.
+        return {
+          ok: true, evaluated: true, cached: hashes.length, computed: 0, name: doc.name, dir,
+          graph: graphView(doc, { errors: [], executed: hashes.length }),
+          errors: [], run: doc.run, params: doc.params, volume: doc.stats.volume,
+          triangles: doc.stats.triangles, sceneId: doc.stats.sceneId, bounds: doc.stats.bounds,
+          note: doc.note, revalidated: true,
+        }
+      }
+    }
     const code = isFeatures
-      ? featuresScript(featureOps(doc))
+      ? featuresScript(featureOps(doc), null, { cache, resume })
       : `${PRELUDE}\nP = ${JSON.stringify(doc.params ?? {})}\n${doc.script}`
     const meta = isFeatures ? { model: doc.name, features: publicFeatures(doc), tip: doc.tip ?? null } : { model: doc.name, params: doc.params ?? {} }
     doc.run = (doc.run ?? 0) + 1
@@ -2334,6 +2460,8 @@ if _TARGET:
       bounds: out.bounds ?? null,
       sceneId,
       at: doc.updatedAt,
+      hash: hashes[hashes.length - 1] ?? '',
+      cached: out.cached ?? 0,
     }
     if (note) doc.note = note
     // The scene was published before the kernel reported which nodes failed, so
@@ -2342,15 +2470,23 @@ if _TARGET:
     const scene = sceneId ? bridge.scenes?.get(sceneId) : null
     if (scene) {
       scene.graph = graph
+      scene.cache = { cached: out.cached ?? 0, computed: out.computed ?? null, of: hashes.length }
       try { await bridge.persist() } catch {}
     }
     await writeModel(doc, dir)
+    if (isFeatures && hashes.length) {
+      // Cheap housekeeping, off the hot path: a 400-file / 14-day cap keeps the
+      // cache from growing without bound in a long-lived install.
+      try { pruneBrepCache(brepCacheDir()) } catch {}
+    }
     return {
       ok: true,
       evaluated: !(Array.isArray(out.errors) && out.errors.length > 0),
       name: doc.name,
       dir,
       graph,
+      cached: out.cached ?? 0,
+      computed: out.computed ?? null,
       errors: Array.isArray(out.errors) ? out.errors : [],
       run: doc.run,
       params: doc.params,
@@ -2530,6 +2666,10 @@ if _TARGET:
       triangles: doc.stats?.triangles ?? null,
       sceneId: doc.stats?.sceneId ?? '',
       run: doc.run,
+      // How much of the chain came from the BREP cache vs the kernel this time.
+      cached: result.cached ?? doc.stats?.cached ?? 0,
+      computed: result.computed ?? null,
+      revalidated: result.revalidated === true,
     }
   }
 

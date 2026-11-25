@@ -69,6 +69,18 @@ npm 包：<https://www.npmjs.com/package/dsh-cad-studio>（`dsh plugin` / DSH �
 
 选不中会**报错并在面板标红**：`选择器没有选中任何边：{"axis":"Z","type":"circle"}（当前形状有 12 条边）`。设计取舍见 `docs/RESEARCH-SELECTORS.md`。
 
+## 增量重算
+
+改一条特征不需要重跑整条链：每一步的 BREP 快照按「前缀哈希」缓存在 `$TMPDIR/dsh-cad-studio/cache/`，重算从最深命中的前缀恢复。
+
+```
+首次 17 条特征        354 ms
+无改动的重建            1 ms   （完全不起内核进程，revalidated: true）
+只改最后一条          264 ms   （16/17 来自缓存）
+```
+
+面板的特征页头会显示 `· 缓存 16/17`。缓存按 400 文件 / 14 天淘汰；`EMITTER_VERSION` 一变即整体失效（防止旧快照复活错误几何）。
+
 ## 接口约定与踩过的坑
 
 - **导出只走 `cad_studio_export`**。在 `cad_studio_run` 里直接 `Part.export([compound], path)` 会写出一个 1.6 KB 的 STEP 壳子，读回来是空形状，而脚本本身不报错。要么用 `cad_studio_export`，要么给 `cad_studio_run` 传 `check: ["/path/out.step"]`——它会在跑完后把这个文件读回来，回报 `{bytes, solids, volume, valid}`，壳子会显示 `valid:false`。

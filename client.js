@@ -1749,6 +1749,7 @@ const FILE_EXTS = ['step', 'stp', 'iges', 'igs', 'brep', 'stl']
       // the new scene replaces the old one in the tab being looked at.
       const featureList = payload && Array.isArray(payload.features) ? payload.features : []
       const featureModel = (payload && payload.model) || ''
+      const cacheChip = payload && payload.cache && payload.cache.cached > 0 ? payload.cache : null
       // A script model publishes its params (no feature list); they are editable
       // the same way — one number, one rebuild of the same document.
       const modelParams = payload && payload.params && typeof payload.params === 'object' ? payload.params : {}
@@ -1930,7 +1931,7 @@ const FILE_EXTS = ['step', 'stp', 'iges', 'igs', 'brep', 'stl']
             : '当前场景不是特征模型。用 cad_studio_doc create kind="features" 建一个（features 里每个 {kind,params}），就能在这里逐条改数值。')]
         : [
           h('div', { key: 'h', style: { ...styles.treeHint, display: 'flex', gap: 6, alignItems: 'center' } }, [
-            h('span', { key: 'm', style: { flex: '1 1 auto', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, `${featureModel} · ${featureList.length} 特征`),
+            h('span', { key: 'm', style: { flex: '1 1 auto', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', title: cacheChip ? `本次重算：${cacheChip.cached}/${cacheChip.of} 步来自缓存` : undefined } }, `${featureModel} · ${featureList.length} 特征${cacheChip ? ` · 缓存 ${cacheChip.cached}/${cacheChip.of}` : ''}`),
             h('button', {
               key: 'a',
               type: 'button',

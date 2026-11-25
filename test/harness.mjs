@@ -801,6 +801,33 @@ endsolid t
   ok('shell opens exactly the selected face', sShell.volume < sClosed.volume && sShell.volume > 0,
     JSON.stringify({ open: sShell.volume, closed: sClosed.volume }))
   await call('cad_studio_doc', { action: 'delete', name: sModel }).catch(() => {})
+
+  // ---- 7p. incremental recompute (Phase 2) ------------------------------
+  // BREP prefixes are content-addressed by the op chain, so an edit only
+  // recomputes from the first changed feature onward.
+  const iModel = 'harness_增量'
+  const iFeats = [{ kind: 'box', size: [120, 80, 16] }, { kind: 'cut', with: { kind: 'cylinder', r: 8, h: 40, at: [30, 30, -5] } }, { kind: 'fillet', r: 2, edges: { axis: 'Z', mode: 'parallel' } }]
+  await call('cad_studio_doc', { action: 'delete', name: iModel })
+  const i0 = await call('cad_studio_doc', { action: 'create', name: iModel, kind: 'features', features: iFeats })
+  ok('a fresh build computes every step', i0.cached === 0 && i0.computed === 3, JSON.stringify({ cached: i0.cached, computed: i0.computed }))
+
+  const iNoop = await call('cad_studio_features', { model: iModel, action: 'update', id: 'f1', feature: { params: { size: [120, 80, 16] } } })
+  ok('an unchanged rebuild does not run the kernel', iNoop.revalidated === true && iNoop.computed === 0 && near(iNoop.volume, i0.volume, 0.001),
+    JSON.stringify({ revalidated: iNoop.revalidated, computed: iNoop.computed }))
+
+  const iLast = await call('cad_studio_features', { model: iModel, action: 'update', id: 'f3', feature: { params: { r: 4 } } })
+  ok('editing the last feature resumes from a 2-step prefix', iLast.cached === 2 && iLast.computed === 1 && iLast.volume < i0.volume,
+    JSON.stringify({ cached: iLast.cached, computed: iLast.computed, before: i0.volume, after: iLast.volume }))
+
+  const iFirst = await call('cad_studio_features', { model: iModel, action: 'update', id: 'f1', feature: { params: { size: [140, 80, 16] } } })
+  ok('editing the first feature recomputes everything', iFirst.cached === 0 && iFirst.computed === 3 && iFirst.volume > iLast.volume,
+    JSON.stringify({ cached: iFirst.cached, computed: iFirst.computed }))
+
+  const iHash = await call('cad_studio_doc', { action: 'show', name: iModel })
+  ok('the doc remembers the chain hash for the next no-op', typeof iHash.stats?.hash === 'string' && iHash.stats.hash.length === 16, String(iHash.stats?.hash))
+  const iAgain = await call('cad_studio_features', { model: iModel, action: 'update', id: 'f1', feature: { params: { size: [140, 80, 16] } } })
+  ok('suppressing nothing still short-circuits', iAgain.revalidated === true, JSON.stringify({ revalidated: iAgain.revalidated }))
+  await call('cad_studio_doc', { action: 'delete', name: iModel }).catch(() => {})
 }
 
 // ---- 8. teardown --------------------------------------------------------
