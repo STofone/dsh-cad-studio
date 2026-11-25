@@ -146,3 +146,20 @@ sketch: {
 结论：这是 0.20 这条构造路径上的报告/几何缺陷，不是我们的选择器或草图数据错。
 当前行为是**显式拒绝**（报「草图旋转得到的是壳体、没有闭合」），不把 0 体积交给下游。
 下一步要试：`Part.makeRevolution` 的正确签名（6 参）、或先 `Part.makeCylinder` 之类已知可用路径做布尔构造。
+
+### 9.2 试过 `makeRevolution`（0.9.1 复核）
+
+`Part.makeRevolution` 的报错签名是
+`Curve or Edge, [float, float, float, Vector, Vector, ShapeType]`，
+我按 5 种参数组合试过（单 edge、整条 wire、face；base 用 3 个 float / 用 Vector；末尾补 `Part.Solid`）：
+
+| 调用 | 结果 |
+|---|---|
+| `makeRevolution(wire, 0,0,0, Z, Part.Solid)` | `TypeError: Expected arguments are: …` |
+| `makeRevolution(wire, 0,0,0, O, Z, Part.Solid)` | `OCCError: shape is not an edge`（说明它确实要 **Edge**，且 6 参形式被接受） |
+| `makeRevolution(edge, 0,0,0, Z, 360.0)` / 补 `Part.Solid` | 仍 `TypeError` |
+
+即：它要 edge + 一串参数，但官方文档没写清顺序，0.20 的 Python 包装又不报「第几个参数错」。
+这条路需要一次交互式调试（`freecadcmd` 里逐参试 + 看 OCC 报错），不适合盲试。
+暂定：**草图旋转搁置**，先把不依赖它的面板草图页签与 PartDesign 三件套做完，再回来用
+「已知可用图元 + 布尔」重建旋转（例如把环形截面拆成若干扇形块再 fuse），绕开这条 API。
