@@ -1024,6 +1024,18 @@ endsolid t
   }
 }
 
+// ---- 7u. mass from density ----------------------------------------------
+{
+  const massDir = mkdtempSync(join(tmpdir(), 'cad-harness-mass-'))
+  const path = join(massDir, 'mass.step')
+  await call('cad_studio_feature', { ops: [{ kind: 'box', size: [60, 40, 20] }], export: path })
+  const m = await call('cad_studio_measure', { source: path, density: 2.7 })
+  // 48000 mm3 = 48 cm3, x2.7 g/cm3 = 129.6 g
+  ok('measure: density turns volume into grams', m.ok === true && near(m.mass_g ?? 0, 129.6, 0.01), `mass=${m.mass_g} vol=${m.volume}`)
+  const noRho = await call('cad_studio_measure', { source: path })
+  ok('measure: no density means no mass field', noRho.mass_g === undefined, `mass=${noRho.mass_g}`)
+}
+
 // ---- 8. teardown --------------------------------------------------------
 for (const d of disposed.reverse()) { try { d() } catch (e) { console.log('  [dispose warn]', e.message) } }
 ok('all tools unregistered on dispose', tools.size === 0, [...tools.keys()].join(','))

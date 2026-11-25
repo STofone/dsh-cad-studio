@@ -2333,6 +2333,7 @@ else:
         code: { type: 'string', description: 'FreeCAD Python that binds `scene` or `export_shapes`.' },
         from: { type: 'array', items: { type: 'number' }, description: 'First point [x,y,z] for a distance measurement.' },
         to: { type: 'array', items: { type: 'number' }, description: 'Second point [x,y,z].' },
+        density: { type: 'number', description: 'Material density in g/cm3 (e.g. 2.70 aluminium, 1.24 PLA, 7.85 steel) — adds mass in grams.' },
       },
       additionalProperties: false,
     },
@@ -2340,7 +2341,7 @@ else:
       schema: { type: 'object', properties: { ok: { type: 'boolean' }, volume: { type: 'number' }, area: { type: 'number' } } },
       render: (_a, v) => [{ type: 'text', text: JSON.stringify(v, null, 2) }],
     },
-    execute: async ({ source, code, from, to }) => {
+    execute: async ({ source, code, from, to, density }) => {
       if (!source && !code) return { ok: false, error: 'pass either source (a model file) or code (FreeCAD Python)' }
       const src = shapesFrom({ source, code })
       const pair = Array.isArray(from) && Array.isArray(to) && from.length === 3 && to.length === 3
@@ -2362,6 +2363,11 @@ else:
         "faces": sum(len(x.Faces) for x in _shapes),
         "edges": sum(len(x.Edges) for x in _shapes),
     }
+    _rho = float(${Number.isFinite(density) ? density : 0})
+    if _rho > 0:
+        # volume is mm3; 1000 mm3 = 1 cm3, density is g/cm3
+        __out["density_g_cm3"] = _rho
+        __out["mass_g"] = round(sum(x.Volume for x in _shapes) / 1000.0 * _rho, 3)
 ${pair ? `    __out["distance"] = round((FreeCAD.Vector(${JSON.stringify(from)}) - FreeCAD.Vector(${JSON.stringify(to)})).Length, 3)` : ''}
 `
       return bridge.run(py, { title: 'measure', publishHint: false })
