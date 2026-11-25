@@ -783,10 +783,27 @@ class FreeCadBridge {
    * otherwise only removable by editing state.json by hand — which is exactly
    * how a 28-row list happened in the first place.
    */
-  async removeScene(id) {
+  async removeScene(id, opts = {}) {
     const key = String(id ?? '')
     const row = this.history.find((h) => h.id === key)
     if (!row) throw new Error(`没有这个场景：${key}（可用 ${this.history.map((h) => h.id).join(', ') || '（无）'}）`)
+    const snapshot = JSON.parse(JSON.stringify(row))
+    let bytes = null
+    if (opts.journal !== false) {
+      try { bytes = await readFile(join(FreeCadBridge.dataDir, 'scenes', `${key}.json`)) } catch {}
+      this.journal({
+        kind: 'scene',
+        label: `delete ${key}`,
+        undo: async () => {
+          this.history = [snapshot, ...this.history.filter((h) => h.id !== key)]
+          if (bytes) await writeFile(join(FreeCadBridge.dataDir, 'scenes', `${key}.json`), bytes)
+          this.latest = { id: snapshot.id, title: snapshot.title, at: snapshot.at, scene: this.scenes.get(key) ?? null }
+          await this.persist()
+          return { scene: key }
+        },
+        redo: async () => { await this.removeScene(key, { journal: false }); return { scene: key } },
+      })
+    }
     this.history = this.history.filter((h) => h.id !== key)
     this.scenes.delete(key)
     for (const [asmId, rec] of [...this.assemblies]) if (rec.sceneId === key) this.assemblies.delete(asmId)
@@ -799,12 +816,21 @@ class FreeCadBridge {
     return { ok: true, removed: key, scenes: this.history.length, latest: this.latest ? this.latest.id : '' }
   }
 
-  async renameScene(id, title) {
+  async renameScene(id, title, opts = {}) {
     const key = String(id ?? '')
     const row = this.history.find((h) => h.id === key)
     if (!row) throw new Error(`没有这个场景：${key}`)
     const name = String(title ?? '').trim()
     if (!name) throw new Error('新名字不能为空')
+    const old = row.title
+    if (opts.journal !== false && old !== name) {
+      this.journal({
+        kind: 'scene',
+        label: `rename ${key}`,
+        undo: async () => { await this.renameScene(key, old, { journal: false }); return { scene: key, title: old } },
+        redo: async () => { await this.renameScene(key, name, { journal: false }); return { scene: key, title: name } },
+      })
+    }
     row.title = name
     if (this.latest && this.latest.id === key) this.latest = { ...this.latest, title: name }
     await this.persist()
@@ -877,7 +903,18 @@ class FreeCadBridge {
 
   endAssemblyEdit(entry, record) {
     if (!entry) return
-    entry.after = this.snapshotAssembly(record)
+    const before = entry.before
+    const after = this.snapshotAssembly(record)
+    this.journal({
+      kind: 'assembly',
+      label: entry.label,
+      undo: async () => this.applyAssemblySnapshot(before),
+      redo: async () => this.applyAssemblySnapshot(after),
+    })
+  }
+
+  /** One stack for every undoable mutation, in the order it happened. */
+  journal(entry) {
     this.sessionUndo.push({ at: new Date().toISOString(), ...entry })
     if (this.sessionUndo.length > 50) this.sessionUndo.shift()
     this.sessionRedo = []
@@ -892,20 +929,24 @@ class FreeCadBridge {
     return { record, published }
   }
 
-  async undoSession() {
-    const entry = this.sessionUndo.pop()
+  async undoSession(kind) {
+    const stack = kind ? this.sessionUndo.filter((e) => e.kind === kind) : this.sessionUndo
+    const entry = stack[stack.length - 1]
     if (!entry) return null
-    const applied = await this.applyAssemblySnapshot(entry.before)
+    this.sessionUndo = this.sessionUndo.filter((e) => e !== entry)
+    const out = await entry.undo()
     this.sessionRedo.push(entry)
-    return { label: entry.label, assembly: entry.assembly, sceneId: applied.published.id }
+    return { label: entry.label, kind: entry.kind, ...(out ?? {}) }
   }
 
-  async redoSession() {
-    const entry = this.sessionRedo.pop()
-    if (!entry || !entry.after) return null
-    const applied = await this.applyAssemblySnapshot(entry.after)
+  async redoSession(kind) {
+    const stack = kind ? this.sessionRedo.filter((e) => e.kind === kind) : this.sessionRedo
+    const entry = stack[stack.length - 1]
+    if (!entry) return null
+    this.sessionRedo = this.sessionRedo.filter((e) => e !== entry)
+    const out = await entry.redo()
     this.sessionUndo.push(entry)
-    return { label: entry.label, assembly: entry.assembly, sceneId: applied.published.id }
+    return { label: entry.label, kind: entry.kind, ...(out ?? {}) }
   }
 
   /** Recompute instance placements from base + joints + explode, then publish. */
@@ -1714,18 +1755,17 @@ __out = {
     parameters: {
       type: 'object',
       properties: {
-        scope: { type: 'string', enum: ['auto', 'assembly', 'doc'], description: 'default auto' },
+        scope: { type: 'string', enum: ['auto', 'assembly', 'scene', 'doc'], description: 'default auto' },
         model: { type: 'string', description: 'document name, for doc scope' },
       },
     },
     output: { schema: { type: 'object' }, render: (args, value) => [{ type: 'text', text: renderUndo(value) }] },
     async execute(args, exec) {
       const scope = typeof args.scope === 'string' ? args.scope : 'auto'
-      if (scope !== 'doc' && bridge.sessionUndo.length) {
-        const undone = await bridge.undoSession()
-        return { ok: true, scope: 'assembly', undone: undone.label, assembly: undone.assembly, sceneId: undone.sceneId, remaining: bridge.sessionUndo.length, redo: bridge.sessionRedo.length }
-      }
-      if (scope === 'assembly') return { ok: false, error: '装配层没有可撤销的操作' }
+      const kind = scope === 'auto' ? undefined : scope
+      const undone = await bridge.undoSession(kind)
+      if (undone) return { ok: true, scope: undone.kind, undone: undone.label, assembly: undone.assembly, scene: undone.scene, model: undone.model, remaining: bridge.sessionUndo.length, redo: bridge.sessionRedo.length }
+      if (scope !== 'doc') return { ok: false, error: scope === 'assembly' ? '装配层没有可撤销的操作' : scope === 'scene' ? '场景列表没有可撤销的操作' : '没有可撤销的操作' }
       const target = typeof args.model === 'string' && args.model ? args.model : ''
       if (!target) return { ok: false, error: '文档撤销需要 model 名称（可用 cad_studio_doc list 查看）' }
       try {
@@ -1743,18 +1783,17 @@ __out = {
     parameters: {
       type: 'object',
       properties: {
-        scope: { type: 'string', enum: ['auto', 'assembly', 'doc'], description: 'default auto' },
+        scope: { type: 'string', enum: ['auto', 'assembly', 'scene', 'doc'], description: 'default auto' },
         model: { type: 'string', description: 'document name, for doc scope' },
       },
     },
     output: { schema: { type: 'object' }, render: (args, value) => [{ type: 'text', text: renderUndo(value) }] },
     async execute(args, exec) {
       const scope = typeof args.scope === 'string' ? args.scope : 'auto'
-      if (scope !== 'doc' && bridge.sessionRedo.length) {
-        const redone = await bridge.redoSession()
-        return { ok: true, scope: 'assembly', redone: redone.label, assembly: redone.assembly, sceneId: redone.sceneId, remaining: bridge.sessionRedo.length, undo: bridge.sessionUndo.length }
-      }
-      if (scope === 'assembly') return { ok: false, error: '装配层没有可重做的操作' }
+      const kindR = scope === 'auto' ? undefined : scope
+      const redone = await bridge.redoSession(kindR)
+      if (redone) return { ok: true, scope: redone.kind, redone: redone.label, assembly: redone.assembly, scene: redone.scene, model: redone.model, remaining: bridge.sessionRedo.length, undo: bridge.sessionUndo.length }
+      if (scope !== 'doc') return { ok: false, error: scope === 'assembly' ? '装配层没有可重做的操作' : '没有可重做的操作' }
       const target = typeof args.model === 'string' && args.model ? args.model : ''
       if (!target) return { ok: false, error: '文档重做需要 model 名称' }
       try {
@@ -3256,7 +3295,26 @@ __out = {"ok": True, "exported": ${JSON.stringify(target)}, "volume": round(scen
 
       if (action === 'delete') {
         const key = checkName(args.name)
-        await unlink(modelFile(key, dir)).catch(() => { throw new Error(`没有这个模型：${key}`) })
+        const file = modelFile(key, dir)
+        let bytes = null
+        try { bytes = await readFile(file) } catch { throw new Error(`没有这个模型：${key}`) }
+        const sceneRow = bridge.history.find((h) => h.title === key || (h.docKey === `model:${key}`))
+        bridge.journal({
+          kind: 'doc',
+          label: `delete ${key}`,
+          undo: async () => {
+            await writeFile(file, bytes)
+            const doc = await readModel(key, dir)
+            try { await rebuild(doc, dir, { note: 'undo delete' }) } catch {}
+            return { model: key }
+          },
+          redo: async () => {
+            await unlink(file).catch(() => {})
+            if (sceneRow) { try { await bridge.removeScene(sceneRow.id, { journal: false }) } catch {} }
+            return { model: key }
+          },
+        })
+        await unlink(file).catch(() => { throw new Error(`没有这个模型：${key}`) })
         return { ok: true, name: key, deleted: true, dir }
       }
 
