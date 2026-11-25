@@ -616,6 +616,42 @@ function assembleScene(record) {
   }
 }
 
+/**
+ * The saved look of one model: which instances are hidden, their hand-picked
+ * colours, per-instance opacity and wireframe. Validated here because the panel
+ * posts it straight from the browser — anything malformed is dropped, never
+ * stored, so a bad value cannot poison every later load.
+ */
+const LOOK_HEX = /^#[0-9a-f]{6}$/i
+function normalizeLook(raw) {
+  const src = raw && typeof raw === 'object' ? raw : {}
+  const pick = (obj, test, fix) => {
+    const out = {}
+    let n = 0
+    for (const [k, v] of Object.entries(obj && typeof obj === 'object' ? obj : {})) {
+      if (n >= 400) break
+      const key = String(k).slice(0, 120)
+      if (!key || !test(v)) continue
+      out[key] = fix(v)
+      n += 1
+    }
+    return out
+  }
+  const isBool = (v) => typeof v === 'boolean'
+  const isHex = (v) => typeof v === 'string' && LOOK_HEX.test(v)
+  const isNum = (v) => Number.isFinite(Number(v))
+  const ov = src.overrides && typeof src.overrides === 'object' ? src.overrides : {}
+  return {
+    visibility: pick(src.visibility, isBool, (v) => v),
+    overrides: {
+      inst: pick(ov.inst, isHex, (v) => v.toLowerCase()),
+      part: pick(ov.part, isHex, (v) => v.toLowerCase()),
+    },
+    opacities: pick(src.opacities, isNum, (v) => Math.min(1, Math.max(0, Number(v)))),
+    wireframes: pick(src.wireframes, isBool, (v) => v),
+  }
+}
+
 class FreeCadBridge {
   constructor(getConfig, log) {
     this.getConfig = getConfig
@@ -641,6 +677,10 @@ class FreeCadBridge {
     this.modelsDir = ''
     /** Every models dir a tool has used (panel posts carry no session). */
     this.modelsSeen = []
+    /** Saved look per model key (`asm:asm-3`, `model:名字`): colours,
+     * visibility, opacity, wireframe. Keyed by the model, not the scene id,
+     * because every republish makes a fresh scene. */
+    this.appearances = {}
   }
 
   /** Remember a models dir: newest first, deduped, bounded. */
@@ -696,9 +736,11 @@ class FreeCadBridge {
     await mkdir(join(dir, 'scenes'), { recursive: true })
     // Whatever an earlier process registered stays registered.
     let prevAssemblies = []
+    let prevAppearances = {}
     try {
       const prev = JSON.parse(await readFile(join(dir, 'state.json'), 'utf8'))
       prevAssemblies = Array.isArray(prev.assemblies) ? prev.assemblies : []
+      if (prev.appearances && typeof prev.appearances === 'object') prevAppearances = prev.appearances
     } catch {}
     // Keep new ids clear of the ones already in use.
     for (const rec of this.assembleRecords(prevAssemblies).values()) {
@@ -731,6 +773,9 @@ class FreeCadBridge {
       // Base placements ride along so a restarted process can still drive them
       // (the meshes stay in the scene file; only placements are small).
       modelsDir: this.modelsDir ?? '',
+      // The saved look outlives the process: merged, so a fresh process that
+      // only knows about the models it touched does not wipe the others.
+      appearances: { ...prevAppearances, ...this.appearances },
       modelsDirs: this.modelsSeen.slice(0, 12),
       // Which session last published: the panel only places its tab in the
       // sidebar for that session (or one that owns older scenes), so unrelated
@@ -767,6 +812,9 @@ class FreeCadBridge {
       if (!this.modelsDir && typeof pointer.modelsDir === 'string') this.modelsDir = pointer.modelsDir
       if (Array.isArray(pointer.modelsDirs)) this.modelsSeen = [...new Set([...this.modelsSeen, ...pointer.modelsDirs.filter((d) => typeof d === 'string' && d)])].slice(0, 12)
       if (!this.lastSession && typeof pointer.lastSession === 'string') this.lastSession = pointer.lastSession
+      if (pointer.appearances && typeof pointer.appearances === 'object') {
+        this.appearances = { ...pointer.appearances, ...this.appearances }
+      }
       const disk = Array.isArray(pointer.history) ? pointer.history : []
       const asmTitles = new Map()
       for (const a of Array.isArray(pointer.assemblies) ? pointer.assemblies : []) {
@@ -820,6 +868,10 @@ class FreeCadBridge {
     if (!id && typeof opts.id === 'string' && /^scene-\d+$/.test(opts.id)) id = opts.id
     if (!id) id = `scene-${++this.seq}`
     else this.seq = Math.max(this.seq, Number(id.slice('scene-'.length)))
+    if (docKey) {
+      scene.docKey = docKey
+      scene.appearance = this.appearances[docKey] ?? null
+    }
     this.scenes.set(id, scene)
     // Count what the viewport shows: per-instance totals and only the parts an
     // instance actually references (a scene may carry unreferenced parts).
@@ -928,6 +980,30 @@ class FreeCadBridge {
     return { ok: true, id: key, title: name }
   }
 
+  /** Save the look of one model and mirror it into that model's scene file. */
+  async setAppearance(docKey, look) {
+    const key = String(docKey ?? '').trim()
+    if (!key) throw new Error('docKey 必填')
+    const clean = normalizeLook(look)
+    this.appearances[key] = clean
+    const dir = FreeCadBridge.dataDir
+    await mkdir(join(dir, 'scenes'), { recursive: true })
+    for (const row of this.history) {
+      if (row.docKey !== key) continue
+      const file = join(dir, 'scenes', `${row.id}.json`)
+      let scene = this.scenes.get(row.id)
+      if (!scene) {
+        try { scene = JSON.parse(await readFile(file, 'utf8')) } catch { continue }
+        this.scenes.set(row.id, scene)
+      }
+      scene.docKey = key
+      scene.appearance = clean
+      try { await writeFile(file, JSON.stringify(scene), 'utf8') } catch {}
+    }
+    await this.persist()
+    return clean
+  }
+
   /** Reserve the id before publishing, so the scene can carry `asm:<id>`. */
   reserveAssemblyId() {
     return `asm-${++this.assemblySeq}`
@@ -956,6 +1032,29 @@ class FreeCadBridge {
       explode: 0,
     }
     this.assemblies.set(id, record)
+    return record
+  }
+
+  /** Replace the parts/placements of an existing assembly, keeping its joints,
+   * mates and saved look. Re-running `cad_studio_assembly` with `assembly` uses
+   * this: the model keeps its identity while its geometry changes. */
+  rebaseAssembly(record, { title, sceneId, scene }) {
+    record.title = title ?? record.title
+    record.sceneId = sceneId
+    record.parts = scene.parts
+    record.base = scene.instances.map((inst) => ({
+      name: inst.name,
+      part: inst.part,
+      rot: inst.rot.slice(),
+      translate: inst.translate.slice(),
+      center: instanceCenter(scene.parts, inst),
+    }))
+    record.center = bboxCenterOfInstances(scene.parts, scene.instances)
+    // A mate or joint naming an instance that no longer exists would silently
+    // do nothing, so drop those rather than keep dead rows in the panel.
+    const names = new Set(record.base.map((b) => b.name))
+    record.joints = (record.joints ?? []).filter((j) => names.has(j.instance))
+    record.mates = (record.mates ?? []).filter((m) => names.has(m.a) && names.has(m.b))
     return record
   }
 
@@ -3289,13 +3388,24 @@ if _TARGET:
 `
       // Allocate the assembly id before publishing: the scene carries `asm:<id>`
       // so later joint moves rewrite this same entry instead of adding one.
-      const asmId = bridge.reserveAssemblyId()
+      // Re-running with `assembly` rebuilds THAT assembly in place: same id, so
+      // its joints, mates and saved look survive a change to the parts.
+      // `assembly` is an id when it looks like one (`asm-3`) and a display name
+      // otherwise — older callers passed a title here.
+      let reuse = null
+      if (assembly && /^asm-\d+$/.test(String(assembly))) {
+        try { reuse = await bridge.loadAssembly(String(assembly)) } catch {}
+        if (!reuse) return { ok: false, error: `没有这个装配：${assembly}` }
+      }
+      const asmId = reuse ? reuse.id : bridge.reserveAssemblyId()
       const out = await bridge.run(py, { title: title ?? 'assembly', docKey: `asm:${asmId}` })
       if (!out.ok || !out.sceneId) return out
       // Keep the base placements: without them a joint has nothing to move.
       const scene = bridge.scenes.get(out.sceneId)
       if (!scene) return out
-      const record = bridge.registerAssembly({ id: asmId, title: assembly || title || 'assembly', sceneId: out.sceneId, scene, joints: [] })
+      const record = reuse
+        ? bridge.rebaseAssembly(reuse, { title: title || reuse.title, sceneId: out.sceneId, scene })
+        : bridge.registerAssembly({ id: asmId, title: assembly || title || 'assembly', sceneId: out.sceneId, scene, joints: [] })
       for (const spec of joints ?? []) {
         try {
           bridge.setJoint(record, spec)
@@ -4622,6 +4732,18 @@ __out = {"ok": True, "exported": ${JSON.stringify(target)}, "volume": round(scen
         try { return JSON.parse(raw) } catch { return null }
       }
 
+      if (url.pathname === `${ROUTE_PREFIX}/appearance` && req.method === 'POST') {
+        // Colours / visibility picked by hand in the panel: stored per model so
+        // a reload or a restart shows the same look.
+        const body = await bodyOf()
+        if (!body || typeof body.docKey !== 'string' || !body.docKey) return send(400, JSON.stringify({ error: 'bad request' }))
+        try {
+          const saved = await bridge.setAppearance(body.docKey, body.look ?? body.appearance ?? {})
+          return send(200, JSON.stringify({ ok: true, docKey: body.docKey, appearance: saved }))
+        } catch (error) {
+          return send(200, JSON.stringify({ ok: false, error: String(error?.message ?? error) }))
+        }
+      }
       if (url.pathname === `${ROUTE_PREFIX}/doctor`) {
         bridge.refresh()
         return send(200, JSON.stringify(diagnose(bridge, resolved)))

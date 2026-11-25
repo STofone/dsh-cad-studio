@@ -121,9 +121,21 @@ const mkRes = () => {
   }
   return { res, out }
 }
-const hit = async (url, host = '127.0.0.1:3180') => {
+const hit = async (url, host = '127.0.0.1:3180', post = null) => {
   const { res, out } = mkRes()
-  await handler({ url, method: 'GET', headers: { host } }, res)
+  const req = { url, method: post ? 'POST' : 'GET', headers: { host } }
+  if (post) {
+    const raw = JSON.stringify(post)
+    // Minimal request stream: the route reads the body through 'data'/'end'.
+    req.on = (name, fn) => {
+      if (name === 'data') fn(Buffer.from(raw))
+      if (name === 'end') fn()
+      if (name === 'error') { /* never fires for an in-memory body */ }
+      return req
+    }
+    req.destroy = () => {}
+  }
+  await handler(req, res)
   return out
 }
 
@@ -1326,6 +1338,50 @@ endsolid t
   ok('mate: 未知实例被拒绝', bad.ok === false && /没有这个实例/.test(String(bad.error)), String(bad.error))
   const badFlush = await call('cad_studio_mate', { assembly: asm.assembly, a: 'a', b: 'base', type: 'flush', offset: 3 })
   ok('mate: flush 带 offset 被拒绝（要留缝用 distance）', badFlush.ok === false && /flush/.test(String(badFlush.error)), String(badFlush.error))
+}
+
+// ---- 7l. appearance: 外观随模型保存 -------------------------------------
+{
+  const dir = tmpdir()
+  const part = `${dir}/look_box.step`
+  await call('cad_studio_export', { target: part, code: 'scene = Part.makeBox(10, 10, 10)' })
+  const asm = await call('cad_studio_assembly', {
+    parts: [{ name: 'cube', path: part }],
+    instances: [{ name: 'base', part: 'cube', at: [0, 0, 0] }],
+    title: 'harness_look',
+  })
+  const docKey = `asm:${asm.assembly}`
+  const res = await hit('/cad-studio/appearance', '127.0.0.1:3180', {
+    docKey,
+    look: {
+      visibility: { base: false, junk: 'yes' },
+      overrides: { inst: { base: '#FF8800' }, part: { cube: 'red' } },
+      opacities: { base: 0.42, bad: 'x' },
+      wireframes: { base: true },
+    },
+  })
+  const saved = JSON.parse(res.body)
+  ok('appearance: 保存成功并回读归一化结果', res.status === 200 && saved.ok === true, res.body.slice(0, 200))
+  ok('appearance: 颜色小写化、非法值被丢弃',
+    saved.appearance.overrides.inst.base === '#ff8800' && !('cube' in saved.appearance.overrides.part)
+    && saved.appearance.visibility.base === false && !('junk' in saved.appearance.visibility)
+    && saved.appearance.opacities.base === 0.42 && !('bad' in saved.appearance.opacities),
+    JSON.stringify(saved.appearance))
+  // The scene file itself must carry it: a reload fetches /scene/<id>, not /state.
+  const scene = JSON.parse((await hit(`/cad-studio/scene/${asm.sceneId}`)).body)
+  ok('appearance: 场景文件里带着保存的外观', scene.docKey === docKey && scene.appearance && scene.appearance.overrides.inst.base === '#ff8800', JSON.stringify(scene.appearance))
+  // A republish of the same model keeps the look: it is keyed by the model, not
+  // by the scene id that changes on every rebuild.
+  const again = await call('cad_studio_assembly', {
+    parts: [{ name: 'cube', path: part }],
+    instances: [{ name: 'base', part: 'cube', at: [5, 0, 0] }],
+    title: 'harness_look',
+    assembly: asm.assembly,
+  })
+  const scene2 = JSON.parse((await hit(`/cad-studio/scene/${again.sceneId}`)).body)
+  ok('appearance: 重新发布同一模型仍带着外观', scene2.appearance && scene2.appearance.wireframes.base === true, JSON.stringify(scene2.appearance))
+  const empty = await hit('/cad-studio/appearance', '127.0.0.1:3180', { look: {} })
+  ok('appearance: 缺 docKey 被拒', empty.status === 400, String(empty.status))
 }
 
 // ---- 7c. sheet: 正式图纸（图框 + 三视图 + 尺寸） ----------------------

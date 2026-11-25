@@ -1309,12 +1309,22 @@ const FILE_EXTS = ['step', 'stp', 'iges', 'igs', 'brep', 'stl']
           pendingCameraRef.current = saved.camera || null
           return
         }
-        const nextVisibility = {}
-        for (const inst of scene.instances || []) nextVisibility[inst.name] = true
-        setVisibility(nextVisibility)
-        setOverrides({ inst: {}, part: {} })
-        setOpacities({})
-        setWireframes({})
+        // No local memory for this tab: start from whatever the model itself
+        // remembers. Colours and hidden parts are the model's, not the tab's.
+        const savedLook = scene.appearance
+        if (savedLook) {
+          setVisibility(savedLook.visibility || {})
+          setOverrides(savedLook.overrides || { inst: {}, part: {} })
+          setOpacities(savedLook.opacities || {})
+          setWireframes(savedLook.wireframes || {})
+        } else {
+          const nextVisibility = {}
+          for (const inst of scene.instances || []) nextVisibility[inst.name] = true
+          setVisibility(nextVisibility)
+          setOverrides({ inst: {}, part: {} })
+          setOpacities({})
+          setWireframes({})
+        }
         pendingCameraRef.current = null
       }
 
@@ -1639,6 +1649,30 @@ const FILE_EXTS = ['step', 'stp', 'iges', 'igs', 'brep', 'stl']
         h.at = now
         setHistTick((t) => t + 1)
       }, [lookSnap, sceneKey])
+
+      // ---- 外观落盘：颜色 / 显隐 / 透明度 / 线框存回模型 --------------------
+      // The look belongs to the model, not to this tab or this browser session:
+      // a reload, a restart, or another tab on the same model all show the same
+      // colours. Debounced because dragging an opacity slider fires per pixel.
+      const lookSaveTimer = useRef(null)
+      const lookSaveRef = useRef('')
+      useEffect(() => {
+        const key = (payload && (payload.docKey || (payload.assembly && payload.assembly.id ? `asm:${payload.assembly.id}` : ''))) || ''
+        if (!key) return
+        const snap = lookSnap
+        if (snap === lookSaveRef.current) return
+        if (lookSaveTimer.current) clearTimeout(lookSaveTimer.current)
+        lookSaveTimer.current = setTimeout(() => {
+          lookSaveRef.current = snap
+          try {
+            fetch('/cad-studio/appearance', {
+              method: 'POST',
+              headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({ docKey: key, look: JSON.parse(snap) }),
+            }).catch(() => {})
+          } catch (err) { /* a failed save must not break the panel */ }
+        }, 700)
+      }, [lookSnap, payload])
 
       useEffect(() => {
         const onKey = (event) => {

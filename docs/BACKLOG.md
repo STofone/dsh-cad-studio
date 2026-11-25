@@ -26,7 +26,8 @@
 
 ## P4 系统
 - [x] 14. journal 落盘：`<数据目录>/journal.json` 存最近 20 条可重放记录（`doc-create` / `doc-delete` 带 base64 字节 / `doc-rename`），插件启动时 `loadJournal` 重建；`undoSession` 先 `await bridge.journalReady` 再取栈（否则会误报「没有可撤销的操作」）。装配/视图类 journal 是活对象闭包，仍只在本会话有效——重启后没有这条记录，面板会说没有可撤销，而不是错撤别的东西。
-- [ ] 15. P5 外观持久化（视图状态进文档，与文档撤销统一时序）
+- [x] 15. P5 外观持久化：外观（颜色/显隐/透明度/线框）按**模型**存（`docKey` 如 `asm:asm-3`），`POST /cad-studio/appearance` 校验后写进 `state.json.appearances` 并镜像进该模型的每个场景文件；面板载入时先取服务端外观，改动用 700 ms 防抖回写。撤销仍是纯客户端快照栈（服务端 doc.undo 管不到外观），两者时序各自独立但互不覆盖。
+- 装配改为可原地重建：`cad_studio_assembly {assembly:'asm-3'}` 复用同一 id（保留关节/mate/外观），只有形如 `asm-N` 才当 id，其它字符串仍当显示名。
 
 ## 明确不做
 - 旧 op 日志重放导入（静默算错几何的风险不可接受）
