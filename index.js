@@ -2374,6 +2374,94 @@ ${pair ? `    __out["distance"] = round((FreeCAD.Vector(${JSON.stringify(from)})
     },
   })
 
+  tool({
+    name: 'cad_studio_section',
+    description: `Cross-section of a solid: slice it with a plane and report closed loops, area and perimeter; optionally write the outline as SVG (for laser/CNC nesting). Axis is X/Y/Z, at is the plane offset in mm.`,
+    parameters: {
+      type: 'object',
+      properties: {
+        source: { type: 'string', description: 'Existing model file (STEP/IGES/BREP/STL).' },
+        code: { type: 'string', description: 'FreeCAD Python that binds `scene` or `export_shapes`.' },
+        axis: { type: 'string', enum: ['X', 'Y', 'Z'], description: 'Plane normal axis (default Z).' },
+        at: { type: 'number', description: 'Plane offset along that axis, mm (default 0).' },
+        target: { type: 'string', description: 'Write an SVG outline here (absolute path).' },
+      },
+      additionalProperties: false,
+    },
+    output: {
+      schema: { type: 'object', properties: { ok: { type: 'boolean' }, loops: { type: 'number' }, area: { type: 'number' }, perimeter: { type: 'number' } } },
+      render: (_a, v) => [{ type: 'text', text: JSON.stringify(v, null, 2) }],
+    },
+    execute: async ({ source, code, axis = 'Z', at = 0, target }) => {
+      if (!source && !code) return { ok: false, error: 'pass either source (a model file) or code (FreeCAD Python)' }
+      const absTarget = target ? String(target) : ''
+      if (absTarget && !(absTarget.startsWith('/') || /^[A-Za-z]:[\\/]/.test(absTarget))) return { ok: false, error: 'target must be an absolute path' }
+      const src = shapesFrom({ source, code })
+      const py = `${PRELUDE}
+${src}
+_AX = ${JSON.stringify(String(axis || 'Z').toUpperCase())}
+_N = {"X": Vector(1.0, 0.0, 0.0), "Y": Vector(0.0, 1.0, 0.0), "Z": Vector(0.0, 0.0, 1.0)}[_AX]
+_AT = float(${Number.isFinite(at) ? at : 0})
+if not _shapes:
+    __out = {"ok": False, "error": "nothing to section"}
+else:
+    _loops = []
+    _area = 0.0
+    _per = 0.0
+    for _s in _shapes:
+        try:
+            _ws = _s.slice(_N, _AT)
+        except Exception as _e:
+            _ws = []
+        for _w in _ws:
+            _pts = _w.discretize(Deflection=0.15)
+            if len(_pts) < 3:
+                continue
+            _loops.append(_pts)
+            try:
+                _per += _w.Length
+            except Exception:
+                pass
+            try:
+                _area += Part.Face(Part.makePolygon(_pts + [_pts[0]])).Area
+            except Exception:
+                pass
+    __out = {"ok": True, "axis": _AX, "at": _AT, "loops": len(_loops),
+             "area": round(_area, 3), "perimeter": round(_per, 3)}
+    _svg = ${target ? JSON.stringify(String(target)) : 'None'}
+    if _svg and _loops:
+        # Project the 3D loop points to the plane's 2D coordinates.
+        def _uv(_p, _ax):
+            return (_p.y, _p.z) if _ax == "X" else ((_p.x, _p.z) if _ax == "Y" else (_p.x, _p.y))
+        _flat = []
+        _minx = _miny = 1e18; _maxx = _maxy = -1e18
+        for _l in _loops:
+            _uvs = [_uv(_p, _AX) for _p in _l]
+            for _u, _v in _uvs:
+                _minx = min(_minx, _u); _maxx = max(_maxx, _u)
+                _miny = min(_miny, _v); _maxy = max(_maxy, _v)
+            _flat.append(_uvs)
+        _pad = 2.0
+        _w = (_maxx - _minx) + 2 * _pad or 1.0
+        _h = (_maxy - _miny) + 2 * _pad or 1.0
+        _parts = ["<svg xmlns='http://www.w3.org/2000/svg' width='%.2fmm' height='%.2fmm' viewBox='0 0 %.2f %.2f'>" % (_w, _h, _w, _h)]
+        _parts.append("<g fill='none' stroke='black' stroke-width='0.2'>")
+        for _uvs in _flat:
+            _d = " ".join("%.3f,%.3f" % (_u - _minx + _pad, (_maxy - _v) + _pad) for _u, _v in _uvs)
+            _parts.append("<polygon points='%s'/>" % _d)
+        _parts.append("</g></svg>")
+        _dir = os.path.dirname(_svg)
+        if _dir:
+            os.makedirs(_dir, exist_ok=True)
+        with open(_svg, "w") as _f:
+            _f.write("\\n".join(_parts))
+        __out["svg"] = _svg
+        __out["svg_size"] = [round(_w, 2), round(_h, 2)]
+`
+      return bridge.run(py, { title: 'section', publishHint: false })
+    },
+  })
+
   // ---- Declarative features: the common jobs without writing Python ------
   // A list of ops applied in order. `run` stays the escape hatch; this is the
   // path for "60×40×20 的盒子挖个 φ16 通孔、倒 2mm 圆角".

@@ -1036,6 +1036,20 @@ endsolid t
   ok('measure: no density means no mass field', noRho.mass_g === undefined, `mass=${noRho.mass_g}`)
 }
 
+// ---- 7v. cross-section -------------------------------------------------
+{
+  const secDir = mkdtempSync(join(tmpdir(), 'cad-harness-sec-'))
+  const blk = join(secDir, 'blk.step')
+  await call('cad_studio_feature', { ops: [{ kind: 'box', size: [60, 40, 20] }], export: blk })
+  const svg = join(secDir, 'cut.svg')
+  const mid = await call('cad_studio_section', { source: blk, axis: 'Z', at: 10, target: svg })
+  ok('section: area and perimeter of a 60x40 box', mid.ok === true && near(mid.area ?? 0, 2400, 0.5) && near(mid.perimeter ?? 0, 200, 0.5), `area=${mid.area} per=${mid.perimeter}`)
+  ok('section: writes an SVG outline', mid.ok === true && existsSync(svg) && readFileSync(svg, 'utf8').includes('<svg'), `svg=${mid.svg}`)
+
+  const miss = await call('cad_studio_section', { source: blk, axis: 'Z', at: 500 })
+  ok('section: a plane outside the solid yields zero loops', miss.ok === true && miss.loops === 0 && miss.area === 0, `loops=${miss.loops} area=${miss.area}`)
+}
+
 // ---- 8. teardown --------------------------------------------------------
 for (const d of disposed.reverse()) { try { d() } catch (e) { console.log('  [dispose warn]', e.message) } }
 ok('all tools unregistered on dispose', tools.size === 0, [...tools.keys()].join(','))
