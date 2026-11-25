@@ -979,6 +979,30 @@ endsolid t
   ok('sketch: contradictory dimensions fail loudly', bad.ok === false && /conflict|failed/i.test(String(bad.error ?? '')), String(bad.error ?? '').slice(0, 120))
 }
 
+// ---- 7s. sketches drive revolve too -------------------------------------
+{
+  const ring = {
+    geometry: [
+      { id: 'g1', type: 'line', p1: [20, 0, 0], p2: [30, 0, 0] },
+      { id: 'g2', type: 'line', p1: [30, 0, 0], p2: [30, 10, 0] },
+      { id: 'g3', type: 'line', p1: [30, 10, 0], p2: [20, 10, 0] },
+      { id: 'g4', type: 'line', p1: [20, 10, 0], p2: [20, 0, 0] },
+    ],
+    constraints: [
+      { id: 'c1', type: 'coincident', a: 'g1', pa: 2, b: 'g2', pb: 1 },
+      { id: 'c2', type: 'coincident', a: 'g2', pa: 2, b: 'g3', pb: 1 },
+      { id: 'c3', type: 'coincident', a: 'g3', pa: 2, b: 'g4', pb: 1 },
+      { id: 'c4', type: 'coincident', a: 'g4', pa: 2, b: 'g1', pb: 1 },
+      { id: 'c5', type: 'horizontal', a: 'g1' }, { id: 'c6', type: 'vertical', a: 'g2' },
+      { id: 'c7', type: 'horizontal', a: 'g3' }, { id: 'c8', type: 'vertical', a: 'g4' },
+    ],
+  }
+  const made = await call('cad_studio_feature', { ops: [{ kind: 'revolve', sketch: 'R1', origin: [0, 0, 0], axis: [0, 0, 1], angle: 360 }], sketches: { R1: ring } })
+  // annulus r=20..30, height 10 -> pi*(30^2-20^2)*10 = 15707.96
+  // 0.20 returns an open shell for this profile; we refuse to pass it on.
+  ok('sketch: revolved shell is rejected loudly instead of volume 0', made.ok === false && /shell|闭合|sew/i.test(String(made.error ?? '')), `ok=${made.ok} err=${String(made.error ?? '').slice(0, 100)}`)
+}
+
 // ---- 8. teardown --------------------------------------------------------
 for (const d of disposed.reverse()) { try { d() } catch (e) { console.log('  [dispose warn]', e.message) } }
 ok('all tools unregistered on dispose', tools.size === 0, [...tools.keys()].join(','))

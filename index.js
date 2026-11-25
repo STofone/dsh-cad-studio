@@ -1347,6 +1347,20 @@ def _prim(op, _cur=None):
             raise RuntimeError("extrude 需要 h 或 dir（当前的挤出向量长度为 0）")
         return Part.Face(Part.makePolygon(ps + [ps[0]])).extrude(vec)
     if k == "revolve":
+        if op.get("sketch"):
+            face = Part.Face(_sketch(str(op["sketch"])))
+            rev = face.revolve(_v3(op.get("origin")), _dir(op.get("axis"), (0.0, 0.0, 1.0)), float(op.get("angle", 360.0)))
+            # A revolve of a face yields a shell; a full turn closes it, but only
+            # becomes a solid after we say so. Volume 0 means "still a shell".
+            if abs(rev.Volume) < 1e-9 and rev.Shells:
+                try:
+                    rev = Part.makeSolid(rev.Shells[0])
+                except Exception:
+                    pass
+            if abs(rev.Volume) < 1e-9:
+                # Do not hand a zero-volume shell downstream: say it out loud.
+                raise RuntimeError("草图旋转得到的是壳体、没有闭合（需要 sewShape 缝合）；先用挤出，或把草图轮廓贴住旋转轴")
+            return rev
         ps = [Vector(float(p[0]), 0.0, float(p[1])) for p in op["points"]]
         ang = float(op.get("angle", 360.0))
         return Part.Face(Part.makePolygon(ps + [ps[0]])).revolve(Vector(0.0, 0.0, 0.0), Vector(0.0, 0.0, 1.0), ang)
