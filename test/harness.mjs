@@ -1132,6 +1132,20 @@ endsolid t
   ok('check: a lone face is flagged as not a solid', face.ok === false && /没有实体/.test(faceText), `ok=${face.ok} p=${faceText.slice(0, 140)}`)
 }
 
+// ---- 7y. mesh repair / decimate -----------------------------------------
+{
+  const mDir = mkdtempSync(join(tmpdir(), 'cad-harness-mesh-'))
+  const src = join(mDir, 'box.step')
+  await call('cad_studio_feature', { ops: [{ kind: 'box', size: [60, 40, 20] }], export: src })
+  const stl = join(mDir, 'box.stl')
+  const m = await call('cad_studio_mesh', { source: src, target: stl })
+  ok('mesh: box meshes to 12 facets and writes an STL', m.ok === true && m.facets === 12 && existsSync(stl) && (m.bytes ?? 0) > 0, `facets=${m.facets} pts=${m.points} bytes=${m.bytes}`)
+
+  const small = join(mDir, 'small.stl')
+  const d = await call('cad_studio_mesh', { source: src, target: small, targetSize: 6 })
+  ok('mesh: targetSize decimates instead of ignoring the budget', d.ok === true && (d.facets ?? 99) <= 12 && d.decimated === true, `facets=${d.facets} dec=${d.decimated}`)
+}
+
 // ---- 8. teardown --------------------------------------------------------
 for (const d of disposed.reverse()) { try { d() } catch (e) { console.log('  [dispose warn]', e.message) } }
 ok('all tools unregistered on dispose', tools.size === 0, [...tools.keys()].join(','))

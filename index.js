@@ -1093,6 +1093,7 @@ print("${BEGIN}" + __json.dumps(_safe(_payload)) + "${END}", flush=True)\n`
 const PRELUDE = `
 import json, math
 import Part, Import, FreeCAD
+import Mesh, MeshPart  # only used by cad_studio_mesh, but a missing import here fails the whole job
 Vector = FreeCAD.Vector
 
 def _safe(v):
@@ -2447,6 +2448,81 @@ __out = {
 }
 `
       return bridge.run(py, { title: 'check', publishHint: false })
+    },
+  })
+
+  tool({
+    name: 'cad_studio_mesh',
+    description: 'Turn a solid into a printable mesh and clean it up: dedupe coincident points/facets, fix deformations, harmonize normals, optionally fill small holes or decimate to a facet budget, then write an STL. Reports facets/points before and after so you can see what the repair actually changed.',
+    parameters: {
+      type: 'object',
+      properties: {
+        source: { type: 'string', description: 'Existing model file (STEP/IGES/BREP/STL).' },
+        code: { type: 'string', description: 'FreeCAD Python that binds `scene` or `export_shapes`.' },
+        target: { type: 'string', description: 'Write the STL here (absolute path).' },
+        deflection: { type: 'number', description: 'Linear deflection in mm (smaller = finer, default 0.2).' },
+        angular: { type: 'number', description: 'Angular deflection in radians (default 0.5).' },
+        targetSize: { type: 'integer', description: 'Decimate down to at most this many facets (optional).' },
+        fillHoles: { type: 'number', description: 'Fill holes whose edges are shorter than this many mm (0 = skip, default 0).' },
+        repair: { type: 'boolean', description: 'Dedupe points/facets, fix deformations, harmonize normals (default true).' },
+      },
+      additionalProperties: false,
+    },
+    output: {
+      schema: { type: 'object', properties: { ok: { type: 'boolean' }, facets: { type: 'number' }, points: { type: 'number' }, bytes: { type: 'number' } } },
+      render: (_a, v) => [{ type: 'text', text: JSON.stringify(v, null, 2) }],
+    },
+    execute: async ({ source, code, target, deflection, angular, targetSize, fillHoles, repair }) => {
+      if (!source && !code) return { ok: false, error: 'pass either source (a model file) or code (FreeCAD Python)' }
+      if (!target) return { ok: false, error: 'target 是必填的：STL 写到哪里' }
+      const defl = Number.isFinite(deflection) ? Number(deflection) : 0.2
+      const ang = Number.isFinite(angular) ? Number(angular) : 0.5
+      const size = Number.isInteger(targetSize) && targetSize > 0 ? targetSize : 0
+      const hole = Number.isFinite(fillHoles) ? Number(fillHoles) : 0
+      const doRepair = repair !== false
+      const src = shapesFrom({ source, code })
+      // Meshing is a different pipeline from the BRep checks: a shape can be a
+      // valid solid and still mesh into duplicated points / flipped normals.
+      const py = `${PRELUDE}
+${src}
+if not _shapes:
+    __out = {"ok": False, "error": "nothing to mesh"}
+else:
+    _body = _shapes[0] if len(_shapes) == 1 else Part.makeCompound(_shapes)
+    _m = MeshPart.meshFromShape(Shape=_body, LinearDeflection=${JSON.stringify(defl)}, AngularDeflection=${JSON.stringify(ang)}, Relative=False)
+    _before = {"facets": int(_m.CountFacets), "points": int(_m.CountPoints)}
+    if ${doRepair ? 'True' : 'False'}:
+        _m.removeDuplicatedPoints()
+        _m.removeDuplicatedFacets()
+        try:
+            _m.fixDeformations()
+        except Exception:
+            pass
+        _m.harmonizeNormals()
+        if ${JSON.stringify(hole)} > 0:
+            _m.fillupHoles(${JSON.stringify(hole)})
+    _mid = {"facets": int(_m.CountFacets), "points": int(_m.CountPoints)}
+    _decimated = False
+    if ${JSON.stringify(size)} and _m.CountFacets > ${JSON.stringify(size)}:
+        _m.decimate(${JSON.stringify(size)})
+        _decimated = True
+    _m.write(${JSON.stringify(String(target))})
+    import os
+    _bb = _body.BoundBox
+    __out = {
+        "ok": True,
+        "target": ${JSON.stringify(String(target))},
+        "bytes": int(os.path.getsize(${JSON.stringify(String(target))})),
+        "facets": int(_m.CountFacets),
+        "points": int(_m.CountPoints),
+        "before": _before,
+        "afterRepair": _mid,
+        "decimated": _decimated,
+        "repaired": ${doRepair ? 'True' : 'False'},
+        "bbox": [round(_bb.XLength, 2), round(_bb.YLength, 2), round(_bb.ZLength, 2)],
+    }
+`
+      return bridge.run(py, { title: 'mesh', publishHint: false })
     },
   })
 

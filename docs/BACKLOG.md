@@ -15,7 +15,7 @@
 - [ ] 7. 草图约束补全：angle / tangent / symmetric / equal
 
 ## P2 交付链
-- [ ] 8. Mesh 修复与减面（`MeshPart.meshFromShape` + 去重/补洞/减面），导出前自检
+- [x] 8. Mesh 修复与减面（`MeshPart.meshFromShape` + 去重/补洞/减面），导出前自检
 - [x] 9. 几何自检 `cad_studio_check`：isValid / 是否闭合 / 反向面 / 最小壁厚提示
 - [ ] 10. TechDraw 正式图纸（多视图 + 尺寸标注 + 图框）——HLR SVG 已有，缺标注
 - [ ] 11. 展开图 DXF（钣金式平铺）
