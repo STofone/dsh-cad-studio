@@ -900,6 +900,105 @@ def _prim(op):
         return Part.Face(Part.makePolygon(ps + [ps[0]])).revolve(Vector(0.0, 0.0, 0.0), Vector(0.0, 0.0, 1.0), ang)
     raise RuntimeError("未知图元：" + str(k))
 
+# ---- sub-shape selectors -------------------------------------------------
+# Predicates over geometry, re-evaluated on every rebuild. No persistent ids:
+# OCCT regenerates topology on each operation, so "the 7th face" is not a name.
+# Failure is loud: an empty match raises with the spec and the item counts.
+def _axis_of(_spec):
+    _a = _spec.get("axis", "Z")
+    if isinstance(_a, (list, tuple)):
+        return Vector(float(_a[0]), float(_a[1]), float(_a[2]))
+    _v = {"X": Vector(1.0, 0.0, 0.0), "Y": Vector(0.0, 1.0, 0.0), "Z": Vector(0.0, 0.0, 1.0)}.get(str(_a).upper())
+    if _v is None:
+        raise RuntimeError("选择器的 axis 只能是 X/Y/Z 或 [x,y,z]：%s" % str(_a))
+    return _v
+
+
+def _unit(_v):
+    _n = (_v.x * _v.x + _v.y * _v.y + _v.z * _v.z) ** 0.5
+    if _n < 1e-12:
+        raise RuntimeError("选择器的方向长度为 0")
+    return Vector(_v.x / _n, _v.y / _n, _v.z / _n)
+
+
+def _dot(_a, _b):
+    return float(_a.x * _b.x + _a.y * _b.y + _a.z * _b.z)
+
+
+def _match_dir(_d, _ax, _mode, _sign):
+    _u = _unit(_d)
+    _a = _unit(_ax)
+    _c = _dot(_u, _a)
+    if _mode == "parallel":
+        return abs(abs(_c) - 1.0) < 1e-3
+    if _mode == "perpendicular":
+        return abs(_c) < 1e-3
+    return _c > 0.999 if _sign != "-" else _c < -0.999
+
+
+def _center_of(_it):
+    _b = _it.BoundBox
+    return Vector((_b.XMin + _b.XMax) / 2.0, (_b.YMin + _b.YMax) / 2.0, (_b.ZMin + _b.ZMax) / 2.0)
+
+
+def _sel(_shape, _kind, _spec):
+    if not _spec:
+        return []
+    if not isinstance(_spec, dict):
+        raise RuntimeError("选择器必须是对象：%s" % str(_spec))
+    _ax = _axis_of(_spec)
+    _mode = _spec.get("mode", "parallel")
+    _sign = _spec.get("dir", "+")
+    _tol = float(_spec.get("tol", 0.5))
+    _want = _spec.get("type")
+    _items = list(_shape.Edges) if _kind == "edge" else list(_shape.Faces)
+    _word = "条边" if _kind == "edge" else "个面"
+    _out = []
+    for _it in _items:
+        if _want:
+            _cls = (_it.Curve.__class__.__name__ if _kind == "edge" else _it.Surface.__class__.__name__).lower()
+            if str(_want).lower() not in _cls:
+                continue
+        if _kind == "edge":
+            try:
+                _d = _it.tangentAt(_it.FirstParameter)
+            except Exception:
+                _d = getattr(_it.Curve, "Direction", None)
+                if _d is None:
+                    continue
+        else:
+            try:
+                _d = _it.normalAt(0.5, 0.5)
+            except Exception:
+                continue
+        if not _match_dir(_d, _ax, _mode, _sign):
+            continue
+        if _spec.get("radius") is not None and _kind == "edge":
+            _r = getattr(_it.Curve, "Radius", None)
+            if _r is None or abs(float(_r) - float(_spec["radius"])) > _tol:
+                continue
+        _out.append(_it)
+    if not _out:
+        raise RuntimeError("选择器没有选中任何%s：%s（当前形状有 %d %s）" % (
+            "边" if _kind == "edge" else "面", json.dumps(_spec, ensure_ascii=False), len(_items), _word))
+    if _spec.get("near") is not None:
+        _p = _v3(_spec["near"])
+        _out.sort(key=lambda _it: (_center_of(_it) - _p).Length)
+    elif _spec.get("pick") in ("max", "min"):
+        _a = _unit(_ax)
+        _rev = _spec["pick"] == "max"
+        _out.sort(key=lambda _it: _dot(_center_of(_it), _a), reverse=_rev)
+    if _spec.get("nth") is not None:
+        _i = int(_spec["nth"])
+        _out = _out[_i:_i + 1]
+    elif _spec.get("pick") in ("max", "min", "near"):
+        _out = _out[:1]
+    if _spec.get("one") and len(_out) != 1:
+        raise RuntimeError("选择器命中了 %d %s，但要求恰好 1 个：%s" % (
+            len(_out), _word, json.dumps(_spec, ensure_ascii=False)))
+    return _out
+
+
 _shape = None
 _errors = []
 _executed = 0
@@ -922,12 +1021,44 @@ for _idx, _op in enumerate(_OPS):
                 _s = _prim(_w)
                 _shape = _shape.fuse(_s) if _k == "fuse" else (_shape.cut(_s) if _k == "cut" else _shape.common(_s))
         elif _k == "fillet":
-            _shape = _shape.makeFillet(float(_op["r"]), _shape.Edges)
+            _eds = _sel(_shape, "edge", _op.get("edges")) or list(_shape.Edges)
+            _shape = _shape.makeFillet(float(_op["r"]), _eds)
         elif _k == "chamfer":
-            _shape = _shape.makeChamfer(float(_op["d"]), _shape.Edges)
+            _eds = _sel(_shape, "edge", _op.get("edges")) or list(_shape.Edges)
+            _shape = _shape.makeChamfer(float(_op["d"]), _eds)
         elif _k == "shell":
             _t = float(_op["t"])
             _open = _op.get("open", "none")
+            _open_faces = _sel(_shape, "face", _op.get("faces"))
+            if _open_faces:
+                # Hollow, then cut a prism outward from each chosen face. FreeCAD
+                # 0.20's Part module has no makeThickSolid*; extruding the face
+                # along its own normal is the portable equivalent and keeps the
+                # opening exactly where the selector pointed.
+                _hollow = _shape.makeOffsetShape(-_t, 1e-6)
+                _shell = _shape.cut(_hollow)
+                _far = (_shape.BoundBox.DiagonalLength or 100.0) * 2.0
+                for _f in _open_faces:
+                    _cls = _f.Surface.__class__.__name__
+                    if _cls != "Plane":
+                        raise RuntimeError("shell 的 faces 选择器目前只支持平面（收到 %s）" % _cls)
+                    _nrm = _unit(_f.normalAt(0.5, 0.5))
+                    # Outward = away from the solid's centre of mass. A face's
+                    # stored orientation can point inward; cutting inward would
+                    # remove nothing (the interior is already hollow), and
+                    # cutting both ways would punch a hole clean through.
+                    _away = _center_of(_f) - _shape.CenterOfMass
+                    if _dot(_nrm, _away) < 0:
+                        _nrm = Vector(0.0 - _nrm.x, 0.0 - _nrm.y, 0.0 - _nrm.z)
+                    # Cut the wall itself: start a hair outside the plane and go
+                    # inward by exactly the wall thickness. Extruding *outward*
+                    # would graze the face and remove nothing.
+                    _inn = Vector(0.0 - _nrm.x, 0.0 - _nrm.y, 0.0 - _nrm.z)
+                    _pr = _f.translated(_nrm * 0.01).extrude(_inn * (_t + 0.02))
+                    _shell = _shell.cut(_pr)
+                _shape = _shell
+                _executed = _idx + 1
+                continue
             _inner = _shape.makeOffsetShape(-_t, 1e-6)
             _shell = _shape.cut(_inner)
             if _open in ("top", "bottom"):
@@ -2216,6 +2347,7 @@ if _TARGET:
     await writeModel(doc, dir)
     return {
       ok: true,
+      evaluated: !(Array.isArray(out.errors) && out.errors.length > 0),
       name: doc.name,
       dir,
       graph,

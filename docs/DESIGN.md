@@ -474,9 +474,18 @@ publish(sceneFrom(tip 的有效节点))
 - `test/harness.mjs`：165 → **176 条**（新增 11 条覆盖 schema 2 落盘、失败节点命名与滞留、undo/redo、tip 截断、suppress 别名与 skipped 状态、`evaluated` 语义）。
 - 测试基座须 `TMPDIR=/tmp/h-xxx` 隔离（否则会清掉 `state.json` 与 `scenes/`）。
 
-### 11.4 仍是 Phase 2+
+### 11.4 Phase 2a 已落地：子形状选择器
 
-- 类型化选择器（`face:<ref>` / `edge:` / `vertex:`，含容忍度与"失效可见"）——当前 `with` 只认整个图元，任何面级引用都还在"按索引猜"的死路上。
+- 语法与语义见 `docs/RESEARCH-SELECTORS.md`（CadQuery 一手对照 + 我们的取舍）。
+- `fillet` / `chamfer` 支持 `edges`、`shell` 支持 `faces`，全部是**谓词**：`{axis, mode, dir, type, radius, pick, nth, near, one, tol}`。
+- 失败可见：空命中 → `选择器没有选中任何边：{spec}（当前形状有 N 条边）`；`one:true` 多变 → `命中了 N 条边，但要求恰好 1 个`。
+- 实测（box 60×40×20 + `fillet r2`）：全边 47,598.678 → Z 向平行边 47,931.327 → 单条 47,982.832；`shell t2` + 顶面选择器 10,940.16（全封闭 15,744）。
+- 面板：选择器的字符串字段（`axis/mode/dir/type`）也可直接编辑，改完 260 ms 合并重建。
+
+### 11.5 仍是 Phase 3+
+
+- 选择器布尔组合（`and/or/not/except`）与拓扑关系（`ancestors/siblings`）——先看真实用法。
+- 输入哈希缓存与增量重算（当前一次改动 = 一次全量进程，0.3–0.6 s）。
 - 输入哈希缓存与增量重算——现在一次改动 = 一次全量 freecadcmd 进程（0.3–0.6 s）。
 - 装配的 `ref = model@version`（当前是 `asm:N` 指针 + 快照）。
 - 草图/约束求解。

@@ -56,6 +56,19 @@ npm 包：<https://www.npmjs.com/package/dsh-cad-studio>（`dsh plugin` / DSH �
 
 `autoOpen: 'session'` 的判据是宿主侧的两个信号：这个会话最近一次发布过场景（`lastSession`），或它拥有更早发布过的场景。也就是说——只有真正在这里建过模的对话，右栏才会自动让出位置；别的对话不受打扰。
 
+## 子形状选择器
+
+`fillet` / `chamfer` 的 `edges`、`shell` 的 `faces` 接受**谓词**（不存 id，每次重建重新选）：
+
+```json
+{"kind": "fillet", "r": 3, "edges": {"axis": "Z", "mode": "parallel", "type": "line"}}
+{"kind": "shell", "t": 2, "faces": {"axis": "Z", "mode": "aligned", "dir": "+", "type": "plane"}}
+```
+
+字段：`axis`（X/Y/Z 或 [x,y,z]）、`mode`（`parallel` / `aligned` / `perpendicular`）、`dir`（`+`/`-`）、`type`（边 `line`/`circle`，面 `plane`/`cylinder`）、`radius`、`pick`（`max`/`min`）、`nth`、`near`（点）、`one`（要求恰好一个）、`tol`（默认 0.5 mm）。
+
+选不中会**报错并在面板标红**：`选择器没有选中任何边：{"axis":"Z","type":"circle"}（当前形状有 12 条边）`。设计取舍见 `docs/RESEARCH-SELECTORS.md`。
+
 ## 接口约定与踩过的坑
 
 - **导出只走 `cad_studio_export`**。在 `cad_studio_run` 里直接 `Part.export([compound], path)` 会写出一个 1.6 KB 的 STEP 壳子，读回来是空形状，而脚本本身不报错。要么用 `cad_studio_export`，要么给 `cad_studio_run` 传 `check: ["/path/out.step"]`——它会在跑完后把这个文件读回来，回报 `{bytes, solids, volume, valid}`，壳子会显示 `valid:false`。

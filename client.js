@@ -1844,8 +1844,11 @@ const FILE_EXTS = ['step', 'stp', 'iges', 'igs', 'brep', 'stl']
         for (const [key, value] of Object.entries(params || {})) {
           const path = base ? [...base, key] : [key]
           if (typeof value === 'number') out.push({ path, label: path.join('.'), kind: 'num', value })
+          // Selector params are strings (axis/mode/dir/type). They must be
+          // editable too, otherwise "dir: + -> -" needs a JSON edit.
+          else if (typeof value === 'string') out.push({ path, label: path.join('.'), kind: 'text', value })
           else if (Array.isArray(value) && value.every((v) => typeof v === 'number')) out.push({ path, label: path.join('.'), kind: 'vec', value })
-          else if (value && typeof value === 'object' && !Array.isArray(value) && path.length < 2) {
+          else if (value && typeof value === 'object' && !Array.isArray(value) && path.length < 3) {
             // A nested op (`cut.with` = a cylinder) is editable too: drop its
             // kind (you switch shapes by replacing the feature) and expose the
             // numbers that matter — r, h, at.

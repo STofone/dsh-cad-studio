@@ -769,6 +769,38 @@ endsolid t
   ok('a deleted row is not resurrected by the next publish', rows.includes(first.sceneId) === false, JSON.stringify(rows.slice(0, 4)))
 
   await call('cad_studio_doc', { action: 'delete', name: model }).catch(() => {})
+
+  // ---- 7o. sub-shape selectors (Phase 2a) --------------------------------
+  // A predicate, not a persistent id: OCCT renumbers topology on every rebuild,
+  // so "the 4 vertical edges" is the only honest way to say it.
+  const sModel = 'harness_选择器'
+  await call('cad_studio_doc', { action: 'delete', name: sModel })
+  const sRun = async (features, note) => {
+    await call('cad_studio_doc', { action: 'delete', name: sModel })
+    const made = await call('cad_studio_doc', { action: 'create', name: sModel, kind: 'features', features })
+    return { ...made, note }
+  }
+  const sAll = await sRun([{ kind: 'box', size: [60, 40, 20] }, { kind: 'fillet', r: 2 }])
+  const sZ = await sRun([{ kind: 'box', size: [60, 40, 20] }, { kind: 'fillet', r: 2, edges: { axis: 'Z', mode: 'parallel', type: 'line' } }])
+  const sOne = await sRun([{ kind: 'box', size: [60, 40, 20] }, { kind: 'fillet', r: 2, edges: { axis: 'Z', mode: 'parallel', pick: 'max', one: true } }])
+  ok('fillet on every edge is the widest cut', sAll.volume < sZ.volume && sZ.volume < sOne.volume && sOne.volume < 48000,
+    JSON.stringify({ all: sAll.volume, z: sZ.volume, one: sOne.volume }))
+
+  const sMiss = await sRun([{ kind: 'box', size: [60, 40, 20] }, { kind: 'fillet', r: 2, edges: { axis: 'Z', type: 'circle' } }])
+  ok('an empty match fails the node, with the spec in the message', sMiss.evaluated === false && /选择器没有选中任何边/.test(JSON.stringify(sMiss.errors)), JSON.stringify(sMiss.errors?.[0]?.message || ''))
+  ok('a failed selector keeps the geometry it could build', near(sMiss.volume, 48000, 1), String(sMiss.volume))
+
+  const sAmb = await sRun([{ kind: 'box', size: [60, 40, 20] }, { kind: 'fillet', r: 2, edges: { axis: 'Z', mode: 'parallel', one: true } }])
+  ok('one:true rejects an ambiguous match', sAmb.evaluated === false && /要求恰好 1 个/.test(JSON.stringify(sAmb.errors)), JSON.stringify(sAmb.errors?.[0]?.message || ''))
+
+  const sShell = await sRun([
+    { kind: 'box', size: [60, 40, 20] },
+    { kind: 'shell', t: 2, faces: { axis: 'Z', mode: 'aligned', dir: '+', type: 'plane' } },
+  ])
+  const sClosed = await sRun([{ kind: 'box', size: [60, 40, 20] }, { kind: 'shell', t: 2 }])
+  ok('shell opens exactly the selected face', sShell.volume < sClosed.volume && sShell.volume > 0,
+    JSON.stringify({ open: sShell.volume, closed: sClosed.volume }))
+  await call('cad_studio_doc', { action: 'delete', name: sModel }).catch(() => {})
 }
 
 // ---- 8. teardown --------------------------------------------------------
