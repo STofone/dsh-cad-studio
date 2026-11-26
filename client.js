@@ -1377,6 +1377,10 @@ const FILE_EXTS = ['step', 'stp', 'iges', 'igs', 'brep', 'stl']
       const [activityPin, setActivityPin] = useState(null)
       const activityPinRef = useRef(null)
       const [docs, setDocs] = useState(null)
+      // The drawer needs the host's /docs route (0.34+). When the live module is
+      // older the route answers 404 and the list would read as "no models", which
+      // is a lie — say what is actually wrong instead.
+      const [docsStale, setDocsStale] = useState(false)
       const [crumb, setCrumb] = useState([])
       const [folderDraft, setFolderDraft] = useState(null)
       const [importDraft, setImportDraft] = useState(null)
@@ -3083,7 +3087,10 @@ const FILE_EXTS = ['step', 'stp', 'iges', 'igs', 'brep', 'stl']
             : null,
         ])),
         !docsHere.length && !leafIn(curFolder).length
-          ? h('div', { key: 'empty', style: styles.treeHint }, curFolder ? '这个文件夹还是空的' : '还没有模型')
+          ? h('div', { key: 'empty', style: { ...styles.treeHint, whiteSpace: 'normal' }, 'data-cad-docs-stale': '1' },
+              docsStale
+                ? '宿主进程还是旧版本（没有 /docs 接口），所以这里列不出模型。重启 dsh web 后文件夹与模型列表就会出现；现在可以用 + 导入 STEP 或让 AI 直接打开模型。'
+                : (curFolder ? '这个文件夹还是空的' : '还没有模型'))
           : null,
         h('div', { key: 'tools', style: styles.docTools }, [
           folderDraft === null
@@ -3121,8 +3128,10 @@ const FILE_EXTS = ['step', 'stp', 'iges', 'igs', 'brep', 'stl']
         const load = async () => {
           try {
             const res = await fetch(`${ROUTE}/docs`)
+            if (!alive) return
+            if (res.status === 404) { setDocsStale(true); return }
             const json = await res.json()
-            if (alive && json && json.ok) setDocs(json)
+            if (json && json.ok) { setDocsStale(false); setDocs(json) }
           } catch {}
         }
         load()
