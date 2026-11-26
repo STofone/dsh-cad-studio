@@ -761,6 +761,9 @@ class FreeCadBridge {
     this.touched = new Set()
     /** Assemblies keep their base placements so joints can re-place instances. */
     this.assemblies = new Map()
+    // Ids the user dropped: persist() merges what an earlier process wrote, so
+    // a deletion has to be remembered or the next publish writes the row back.
+    this.forgottenAssemblies = new Set()
     this.sessionUndo = []
     this.sessionRedo = []
     this.assemblySeq = 0
@@ -879,7 +882,9 @@ class FreeCadBridge {
       // Merge with what an earlier process wrote: this process may only know
       // about the assemblies it touched, and an unrelated publish must not wipe
       // the others (the panel drives them by hydrating on demand).
-      assemblies: [...this.assembleRecords(prevAssemblies).values()].map((a) => ({
+      assemblies: [...this.assembleRecords(prevAssemblies).values()]
+        .filter((a) => !this.forgottenAssemblies.has(a.id))
+        .map((a) => ({
         id: a.id,
         title: a.title,
         sceneId: a.sceneId,
@@ -1130,8 +1135,9 @@ class FreeCadBridge {
       joints: joints ?? [],
       mates: [],
       // What was asked for (part files + placements), so a relink can re-run the
-      // same build against a corrected path.
-      spec: spec ?? null,
+      // same build against a corrected path. `builtAt` makes drift visible: a
+      // part file newer than this was changed after the assembly was built.
+      spec: spec ? { ...spec, builtAt: Date.now() } : null,
       explode: 0,
     }
     this.assemblies.set(id, record)
@@ -1158,6 +1164,8 @@ class FreeCadBridge {
     const names = new Set(record.base.map((b) => b.name))
     record.joints = (record.joints ?? []).filter((j) => names.has(j.instance))
     record.mates = (record.mates ?? []).filter((m) => names.has(m.a) && names.has(m.b))
+    // A rebuild re-reads every part file, so "built" time is now.
+    if (record.spec) record.spec.builtAt = Date.now()
     return record
   }
 
@@ -1350,7 +1358,11 @@ class FreeCadBridge {
     const metas = Array.isArray(pointer.assemblies) ? pointer.assemblies : []
     const meta = id ? metas.find((a) => a.id === id) : metas[metas.length - 1]
     if (!meta) return null
-    const candidates = [meta.sceneId, pointer.latest?.id].filter(Boolean)
+    // Only this record's own scene: falling back to the newest scene revived
+    // shell records (their scene was deleted, so they borrowed another
+    // assembly's parts and popped back into the deps list after a prune).
+    const candidates = [meta.sceneId].filter(Boolean)
+    if (!candidates.length && pointer.latest?.id) candidates.push(pointer.latest.id)
     for (const sceneId of candidates) {
       try {
         const scene = JSON.parse(await readFile(join(FreeCadBridge.dataDir, 'scenes', `${sceneId}.json`), 'utf8'))
@@ -1363,6 +1375,57 @@ class FreeCadBridge {
       } catch {}
     }
     return null
+  }
+
+  /** Every assembly whose title matches, live scenes first. Records are lazy,
+   * so hydrate before looking: after a restart the map is empty until a tool
+   * names one, and a title-only rebuild would otherwise mint a duplicate. */
+  async findAssembliesByTitle(title) {
+    const want = String(title ?? '').trim()
+    if (!want) return []
+    await this.hydrateAssemblies()
+    const live = (record) => this.scenes.has(record.sceneId)
+    return [...this.assemblies.values()]
+      .filter((record) => String(record.title ?? '').trim() === want)
+      .sort((a, b) => (live(b) ? 1 : 0) - (live(a) ? 1 : 0))
+  }
+
+  /** Drop one assembly record. Its scene is a separate object (cad_studio_scene
+   * deletes that), so this only forgets the registry row. */
+  async forgetAssembly(id) {
+    const key = String(id ?? '').trim()
+    if (!key) return false
+    this.forgottenAssemblies.add(key)
+    const had = this.assemblies.delete(key)
+    await this.persist()
+    return had || true
+  }
+
+  /** Forget every record whose scene is gone: the shells left behind when
+   * scenes were deleted one by one. Returns the ids that were dropped. */
+  async pruneAssemblies() {
+    const gone = new Set()
+    for (const [id, record] of [...this.assemblies]) {
+      if (!this.scenes.has(record.sceneId)) {
+        this.assemblies.delete(id)
+        gone.add(id)
+      }
+    }
+    // Shells whose scene file is gone never load, so they are not in the map:
+    // the pointer still lists them and that is what has to be cleaned.
+    let metas = []
+    try {
+      const pointer = JSON.parse(await readFile(join(FreeCadBridge.dataDir, 'state.json'), 'utf8'))
+      metas = Array.isArray(pointer.assemblies) ? pointer.assemblies : []
+    } catch {}
+    for (const meta of metas) {
+      if (!meta?.id) continue
+      const file = meta.sceneId ? join(FreeCadBridge.dataDir, 'scenes', `${meta.sceneId}.json`) : ''
+      if (!this.scenes.has(meta.sceneId) && (!file || !existsSync(file))) gone.add(meta.id)
+    }
+    for (const id of gone) this.forgottenAssemblies.add(id)
+    if (gone.size) await this.persist()
+    return [...gone]
   }
 
   async run(code, { title, publishHint = true, publish = true, meta = null, docKey = '', sceneId = '' } = {}) {
@@ -3774,9 +3837,21 @@ else:
       // `assembly` is an id when it looks like one (`asm-3`) and a display name
       // otherwise — older callers passed a title here.
       let reuse = null
+      let reusedBy = ''
+      let sameTitle = []
+      const wantsNew = String(assembly ?? '').trim().toLowerCase() === 'new'
       if (assembly && /^asm-\d+$/.test(String(assembly))) {
         try { reuse = await bridge.loadAssembly(String(assembly)) } catch {}
         if (!reuse) return { ok: false, error: `没有这个装配：${assembly}` }
+      } else if (!wantsNew && typeof assembly === 'string' && assembly.trim()) {
+        // A title here used to always mint a new record: re-running a build to
+        // refresh the geometry piled up asm-8/9/11 sharing one title, and the
+        // caller believed it had refreshed the one on screen. Rebuild in place
+        // instead; `assembly:'new'` asks for a second copy on purpose.
+        sameTitle = await bridge.findAssembliesByTitle(assembly)
+        const live = sameTitle.find((record) => bridge.scenes.has(record.sceneId))
+        reuse = live ?? sameTitle[0] ?? null
+        if (reuse) reusedBy = 'title'
       }
       const asmId = reuse ? reuse.id : bridge.reserveAssemblyId()
       const out = await bridge.run(py, { title: title ?? 'assembly', docKey: `asm:${asmId}` })
@@ -3810,6 +3885,16 @@ else:
       await bridge.persist()
       out.assembly = record.id
       out.joints = record.joints.length
+      if (reusedBy) {
+        out.reused = true
+        out.note = `按标题原地重建 ${record.id}（关节、mate、外观都保留）`
+      } else if (wantsNew) {
+        out.reused = false
+      }
+      if (sameTitle.length > 1) {
+        const others = sameTitle.filter((r) => r.id !== record.id).map((r) => r.id)
+        out.warn = `同名装配共有 ${sameTitle.length} 条（${sameTitle.map((r) => r.id).join(', ')}），本次重建 ${record.id}；${others.join(', ')} 是历史壳记录，用 cad_studio_deps {action:'prune'} 一次清掉。`
+      }
       return out
     },
   })
@@ -3842,18 +3927,23 @@ else:
     let exists = false
     let bytes = 0
     let modified = ''
+    let mtimeMs = 0
     try {
       const st = statSync(p.path)
       exists = st.isFile()
       bytes = st.size
+      mtimeMs = st.mtimeMs
       modified = new Date(st.mtimeMs).toISOString()
     } catch {}
+    // Newer than the build that read it: the part moved on, this assembly did not.
+    const builtAt = Number(record.spec?.builtAt ?? 0)
     return {
       part: p.name,
       path: p.path,
       exists,
       bytes,
       modified,
+      changed: Boolean(exists && builtAt && mtimeMs > builtAt + 1000),
       color: Array.isArray(p.color) ? p.color : null,
       instances: (record.spec?.instances ?? []).filter((i) => i.part === p.name).map((i) => i.name),
     }
@@ -3908,7 +3998,7 @@ else:
     parameters: {
       type: 'object',
       properties: {
-        action: { type: 'string', enum: ['list', 'relink', 'rebuild'], description: 'Default: list.' },
+        action: { type: 'string', enum: ['list', 'relink', 'rebuild', 'delete', 'prune'], description: 'Default: list. delete forgets one assembly record; prune forgets every record whose scene is gone (the shells left by deleted scenes).' },
         assembly: { type: 'string', description: 'Assembly id (asm-1) or unique title. Omitted: every assembly for `list`, newest for `relink`.' },
         part: { type: 'string', description: 'Part name to repoint (relink).' },
         path: { type: 'string', description: 'New file path for that part (relink).' },
@@ -3938,13 +4028,24 @@ else:
             tracked: Boolean(r.spec),
             files,
             missingParts: files.filter((f) => !f.exists).map((f) => f.part),
+            // Files edited after the build: the geometry on screen is older.
+            changedParts: files.filter((f) => f.changed).map((f) => f.part),
+            sceneAlive: bridge.scenes.has(r.sceneId),
             // An assembly built before sources were recorded cannot relink: the
             // part files are unknown, not missing. Say so instead of an empty list.
             ...(r.spec ? {} : { hint: '这个装配没有记录来源文件（0.24 之前建的）。用 action=rebuild 并给 parts:[{name,path}] 记一次，之后 relink 就能用。' }),
           }
         })
         const missing = models.reduce((n, m) => n + m.missingParts.length, 0)
-        return { ok: true, models, missing }
+        const changed = models.reduce((n, m) => n + m.changedParts.length, 0)
+        const shells = models.filter((m) => !m.sceneAlive).map((m) => m.assembly)
+        return {
+          ok: true,
+          models,
+          missing,
+          changed,
+          ...(shells.length ? { shells, hint: `有 ${shells.length} 条记录的场景已删除（${shells.join(', ')}），用 action:'prune' 一次清掉。` } : {}),
+        }
       }
       if (mode === 'rebuild') {
         let record
@@ -3967,6 +4068,18 @@ else:
         bridge.rebaseAssembly(record, { title: record.title, sceneId: out.sceneId, scene })
         const published = await bridge.republishAssembly(record)
         return { ok: true, assembly: record.id, sceneId: published.id, tracked: true, files: specRows(record).length, instances: placed.length }
+      }
+      if (mode === 'delete') {
+        if (!assembly) return { ok: false, error: 'delete 需要 assembly（asm-N 或标题）' }
+        let record
+        try { record = findAssembly(assembly) } catch (error) { return { ok: false, error: String(error?.message ?? error) } }
+        const had = await bridge.forgetAssembly(record.id)
+        return { ok: had, removed: record.id, title: record.title, note: '场景还在，需要的话用 cad_studio_scene {action:"delete"} 一起删。' }
+      }
+      if (mode === 'prune') {
+        await bridge.hydrateAssemblies()
+        const gone = await bridge.pruneAssemblies()
+        return { ok: true, removed: gone, count: gone.length }
       }
       return relinkPart({ assembly, part, path })
     },

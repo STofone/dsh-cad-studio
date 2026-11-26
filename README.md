@@ -14,11 +14,11 @@ DeepSeek Harness 的 CAD 插件：**把 FreeCAD 桥接成给 AI 用的工具**�
 |---|---|
 | 建模 | `cad_studio_feature` 声明式特征（box/cylinder/sphere/cone/torus/extrude/revolve/fuse/cut/common/fillet/chamfer/shell/pattern/translate/rotate/mirror）；`cad_studio_run` 跑任意 FreeCAD Python |
 | 工程文件 | `cad_studio_doc` 存 `script` 或 `features` 两种模型；`cad_studio_features` 改一条特征→整表重算（0.2–0.6 s），失败整表回滚 |
-| 装配 | `cad_studio_assembly` 读 manifest，`App::Link` 语义的实例位姿；零件是 STEP 文件级引用（改零件重开即跟随）；`measure:true` 回每实例体积/包围盒，`interference:true` 回真正重叠的实例对 |
+| 装配 | `cad_studio_assembly` 读 manifest，`App::Link` 语义的实例位姿；零件是 STEP 文件级引用（改零件重开即跟随；没有文件监视，重跑才刷新）；**同名 `assembly` 原地重建**（保关节/mate/外观），要再开一个副本用 `assembly:'new'`；`measure:true` 回每实例体积/包围盒，`interference:true` 回真正重叠的实例对 |
 | 运动 | `cad_studio_joint`（revolute/linear）+ `cad_studio_drive` + `cad_studio_explode`，面板拖滑杆看运动 |
 | 出图 | `cad_studio_drawing` HLR → SVG（主/俯/左/等轴）；`cad_studio_sheet` 正式图纸（图框 + 标题栏 + 三视图 + 尺寸，A4/A3/A2，可出 DXF） |
 | 装配 | `cad_studio_assembly` 多零件实例、`cad_studio_joint` 关节、`cad_studio_mate` 约束（同心/贴合/距离）、`cad_studio_drive` 驱动、`cad_studio_explode` 爆炸图 |
-| 依赖 | `cad_studio_deps` 列出模型的来源 STEP（谁在用、还在不在），`relink` 换路径后原地重建、`rebuild` 给 0.24 之前建的老装配补一次源文件清单；面板「信息」里能直接填新路径 |
+| 依赖 | `cad_studio_deps` 列出模型的来源 STEP（谁在用、还在不在、**哪个件比装配新**），`relink` 换路径后原地重建、`rebuild` 给 0.24 之前建的老装配补一次源文件清单、`delete` 忘掉一条记录、`prune` 一次清掉所有场景已删的空壳记录；面板「信息」里能直接填新路径 |
 | 外观 | 面板里改的颜色/显隐/透明度/线框按模型保存（`POST /cad-studio/appearance`），刷新和重启后仍在 |
 | 其它 | `cad_studio_open`（STEP/STL/BREP/IGES 进来看）、`cad_studio_export`、`cad_studio_measure`、`cad_studio_env`；`cad_studio_doc {action:"create", from:"…/x.step"}` 把已有 STEP 变成可编辑模型文档 |
 | 模型清单 | `cad_studio_scene`（`action: list / delete / rename / prune`，`ids:[…]` 一次删多行）——面板里那条列表就是它；0 体积 0 三角的幽灵行会被标 `stale`，`prune` 一次清掉 |
@@ -102,6 +102,8 @@ npm 包：<https://www.npmjs.com/package/dsh-cad-studio>（`dsh plugin` / DSH �
 - `cad_studio_export` 的返回里 `volume` / `solids` 是**真正写出去的那一套**，`sourceVolume` / `sourceSolids` 是输入侧的；`minVolume` 会按实体体积过滤（滤掉圆丝、灰尘），`alsoStl` 顺手写一份 STL。
 - **布尔链会留共面裂面，`unify` 默认开**：逐次 `fuse`/`cut` 之后同一平面会留一圈缝，体积不变但面数与文件变大（实测托架 174→64 面、STEP 607 KB→274 KB）。`cad_studio_export` 写文件前对每个实体 `removeSplitter()`，传 `unify:false` 可保留原始拓扑；返回里的 `faces` / `shells` / `fingerprint: {solids, faces, shells, volume}` 就是用来核几何的——**别用 md5**，STEP 头带时间戳，同一件两次导出 md5 也不同。
 - `cad_studio_assembly` 传 `measure: true` 会回每实例的 bbox/体积/实体数与总体积，`interference: true` 会回真正重叠的实例对（先用包围盒筛，再做布尔交）。
+- 装配记录只认**它自己的场景**：场景被删掉之后记录不会被别的场景“借壳复活”（旧版会退回到最新场景的 parts，于是 prune 过的空壳又冒出来）。删场景后要清记录用 `cad_studio_deps {action:'prune'}`，单条用 `action:'delete'`。
+- 部件文件改了但装配没重建时，`deps list` 会把它标成 `changed`（比 `spec.builtAt` 新）；这是提示，不是自动重建——自动把用户正在看的场景换掉更糟。
 - **`fuse` / `cut` / `common` 的 `with` 可以是数组**：U 形围壁写成「一条 `fuse` 外块 + 一条 `cut` 带两个内腔」即可，不必拆成中间状态（中间状态是实心块，顺序错了会削到别处）。
 - **`extrude` 支持 3D 剖面点与 `dir`**：三角棱柱写 `{kind:"extrude", points:[[0,0,0],[40,0,0],[0,30,0]], dir:[0,0,20]}`，不用再拿 `base`/`h` 手算覆盖范围。
 - 特征参数在 `normalizeFeature` 阶段就校验，报错带行号与名字：`特征 f10（倒角_左后） cut：需要 with 子图元（…）`——不会再从 FreeCAD 里冒出一句 `第 10 步（cut）失败：'with'`。

@@ -1691,6 +1691,60 @@ endsolid t
   await call('cad_studio_doc', { action: 'delete', name: feat })
 }
 
+// ---- 8b. assembly identity: a title rebuilds in place, shells can be pruned --
+{
+  const dir = mkdtempSync(join(tmpdir(), 'cad-harness-asm-'))
+  const src = `${dir}/blk.step`
+  await call('cad_studio_export', { target: src, code: 'scene = Part.makeBox(10, 10, 10)' })
+  const first = await call('cad_studio_assembly', {
+    parts: [{ name: 'blk', path: src }],
+    instances: [{ name: 'one', part: 'blk', at: [0, 0, 0] }],
+    assembly: 'harness_身份',
+  })
+  // The reported bug: re-running a build by title silently minted asm-11 next
+  // to asm-8/asm-9 instead of refreshing the one on screen.
+  const again = await call('cad_studio_assembly', {
+    parts: [{ name: 'blk', path: src }],
+    instances: [{ name: 'one', part: 'blk', at: [20, 0, 0] }],
+    assembly: 'harness_身份',
+  })
+  ok('assembly: re-running by title rebuilds that record instead of minting a new one',
+    again.ok === true && again.assembly === first.assembly && again.reused === true,
+    JSON.stringify({ first: first.assembly, again: again.assembly, reused: again.reused }))
+  const listed = await call('cad_studio_deps', { action: 'list', assembly: first.assembly })
+  ok('assembly: one record survives the rebuild', listed.ok === true && listed.models.length === 1,
+    JSON.stringify(listed.models.map((m) => m.assembly)))
+  const copy = await call('cad_studio_assembly', {
+    parts: [{ name: 'blk', path: src }],
+    instances: [{ name: 'one', part: 'blk', at: [40, 0, 0] }],
+    assembly: 'new',
+    title: 'harness_身份副本',
+  })
+  ok('assembly: assembly:"new" still mints a second record',
+    copy.ok === true && copy.assembly !== first.assembly, JSON.stringify({ copy: copy.assembly, first: first.assembly }))
+
+  // Drift: the file moves on after the build; the listing has to say so.
+  await new Promise((r) => setTimeout(r, 1200))
+  await call('cad_studio_export', { target: src, code: 'scene = Part.makeBox(20, 10, 10)' })
+  const drift = await call('cad_studio_deps', { action: 'list', assembly: first.assembly })
+  ok('deps: a part file newer than the build shows up as changed',
+    drift.ok === true && drift.changed >= 1 && drift.models[0].changedParts.includes('blk'),
+    JSON.stringify({ changed: drift.changed, parts: drift.models[0].changedParts }))
+
+  // Shells: deleting the scene used to leave a record nothing could remove.
+  await call('cad_studio_scene', { action: 'delete', id: copy.sceneId })
+  const pruned = await call('cad_studio_deps', { action: 'prune' })
+  ok('deps: prune forgets records whose scene is gone', pruned.ok === true && pruned.removed.includes(copy.assembly),
+    JSON.stringify(pruned.removed))
+  const afterPrune = await call('cad_studio_deps', { action: 'list' })
+  ok('deps: the pruned record is gone, the live one stays',
+    afterPrune.models.some((m) => m.assembly === first.assembly) && !afterPrune.models.some((m) => m.assembly === copy.assembly),
+    JSON.stringify(afterPrune.models.map((m) => m.assembly)))
+  const dropped = await call('cad_studio_deps', { action: 'delete', assembly: first.assembly })
+  ok('deps: delete forgets one record but leaves its scene',
+    dropped.ok === true && dropped.removed === first.assembly, JSON.stringify(dropped))
+}
+
 // ---- 9. teardown --------------------------------------------------------
 for (const d of disposed.reverse()) { try { d() } catch (e) { console.log('  [dispose warn]', e.message) } }
 ok('all tools unregistered on dispose', tools.size === 0, [...tools.keys()].join(','))

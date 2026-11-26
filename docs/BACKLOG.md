@@ -29,6 +29,11 @@
 - [x] 15. P5 外观持久化：外观（颜色/显隐/透明度/线框）按**模型**存（`docKey` 如 `asm:asm-3`），`POST /cad-studio/appearance` 校验后写进 `state.json.appearances` 并镜像进该模型的每个场景文件；面板载入时先取服务端外观，改动用 700 ms 防抖回写。撤销仍是纯客户端快照栈（服务端 doc.undo 管不到外观），两者时序各自独立但互不覆盖。
 - 装配改为可原地重建：`cad_studio_assembly {assembly:'asm-3'}` 复用同一 id（保留关节/mate/外观），只有形如 `asm-N` 才当 id，其它字符串仍当显示名。
 
+## 来自 fish-tank 会话（2026-11-26 第二轮，0.31.0 处理）
+- [x] 11. 用标题重跑 `cad_studio_assembly` 会静默新建（asm-8/9/11 同名堆叠）→ 现在按标题**原地重建**（`reused:true`，保关节/mate/外观），要副本用 `assembly:'new'`；同名多条时返回 `warn` 列出旧壳
+- [x] 12. 装配记录只增不删（空壳无 API 清）→ `cad_studio_deps {action:'delete'|'prune'}`，并且 persist 记住"已忘掉"的 id，不会被下一次发布写回
+- [x] 13. 部件改了装配没重建时没有提示 → `deps list` 每件带 `changed`（文件 mtime > `spec.builtAt`），顶层 `changed` 计数；不自动重建
+
 ## 明确不做
 - 旧 op 日志重放导入（静默算错几何的风险不可接受）
 - Path/Fem/Arch/Robot/Ship/Idf/Plot/Raytracing/Web/Points/ReverseEngineering/Inspection/AddonManager/Start/Tux
