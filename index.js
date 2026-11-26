@@ -4545,6 +4545,66 @@ else:
     return value
   }
 
+  // ---- folders -------------------------------------------------------------
+  // A "disk drive" for models: folders are plain paths stored next to the model
+  // files (not in the scene pointer), so they travel with a models dir and stay
+  // valid when the panel runs in another process. Storage stays flat on disk — a
+  // folder is metadata, not a directory — which keeps names, history and scene
+  // pointers intact when a document moves.
+  const FOLDER_FILE = '.folders.json'
+  const normalizeFolder = (raw) => {
+    if (raw === undefined || raw === null) return ''
+    const parts = String(raw).replace(/\\/g, '/').split('/').map((x) => x.trim()).filter(Boolean)
+    if (!parts.length) return ''
+    for (const seg of parts) {
+      if (seg === '.' || seg === '..') throw new Error('文件夹路径不能包含 . 或 ..')
+      if (seg.length > 40) throw new Error(`文件夹名太长（每段最多 40 字）：${seg}`)
+    }
+    const path = parts.join('/')
+    if (path.length > 120) throw new Error('文件夹路径太长（最多 120 字）')
+    return path
+  }
+  const folderParents = (path) => {
+    const out = []
+    const segs = String(path).split('/').filter(Boolean)
+    for (let i = 1; i <= segs.length; i += 1) out.push(segs.slice(0, i).join('/'))
+    return out
+  }
+  const readFolders = async (dir) => {
+    try {
+      const raw = JSON.parse(await readFile(join(dir, FOLDER_FILE), 'utf8'))
+      return Array.isArray(raw.folders) ? raw.folders.map(String).filter(Boolean) : []
+    } catch {
+      return []
+    }
+  }
+  const writeFolders = async (dir, list) => {
+    const uniq = [...new Set(list.map(String).filter(Boolean))].sort()
+    await mkdir(dir, { recursive: true })
+    await writeFile(join(dir, FOLDER_FILE), JSON.stringify({ version: 1, folders: uniq }, null, 2), 'utf8')
+    return uniq
+  }
+  // Folders that documents actually live in show up even if nobody created them
+  // explicitly, so a hand-edited file can never make its folder invisible.
+  const folderInventory = async (dir) => {
+    const used = new Set(await readFolders(dir))
+    let names = []
+    try {
+      names = (await readdir(dir)).filter((f) => f.endsWith('.json') && !f.startsWith('.')).map((f) => f.slice(0, -5))
+    } catch { names = [] }
+    const docs = []
+    for (const n of names) {
+      try {
+        const doc = JSON.parse(await readFile(modelFile(n, dir), 'utf8'))
+        const folder = typeof doc.folder === 'string' ? doc.folder : ''
+        if (folder) folderParents(folder).forEach((x) => used.add(x))
+        docs.push({ name: n, folder })
+      } catch { /* an unreadable file must not fail the whole listing */ }
+    }
+    for (const f of [...used]) folderParents(f).forEach((x) => used.add(x))
+    return { folders: [...used].sort(), docs }
+  }
+
   const readModel = async (name, dir) => {
     const key = checkName(name)
     let text
@@ -4578,6 +4638,7 @@ else:
     doc.rev = Number.isFinite(doc.rev) ? doc.rev : 0
     doc.changes = Array.isArray(doc.changes) ? doc.changes : []
     doc.seen = doc.seen && typeof doc.seen === 'object' && !Array.isArray(doc.seen) ? doc.seen : {}
+    doc.folder = typeof doc.folder === 'string' ? normalizeFolder(doc.folder) : ''
     for (const f of doc.features) {
       if (!f || typeof f !== 'object') continue
       if (typeof f.suppressed === 'boolean') f.enabled = f.suppressed !== true
@@ -5024,7 +5085,8 @@ except Exception:
     parameters: {
       type: 'object',
       properties: {
-        action: { type: 'string', enum: ['list', 'show', 'create', 'update', 'revert', 'delete', 'rename', 'duplicate'], description: 'list / show / create / update / revert / delete / rename / duplicate' },
+        action: { type: 'string', enum: ['list', 'show', 'create', 'update', 'revert', 'delete', 'rename', 'duplicate', 'move'], description: 'list / show / create / update / revert / delete / rename / duplicate / move' },
+        folder: { type: 'string', description: 'Folder path for create / move ("鱼缸/背滤" or "" for the root). Folders are metadata: the model file never changes location, so moving never breaks history or exports.' },
         name: { type: 'string', description: 'Model name (中英文/数字/下划线/连字符).' },
         script: { type: 'string', description: 'FreeCAD Python source; reads params from `P`, binds the result to `scene`. Required for create unless kind is "features" or `from` is given.' },
         from: { type: 'string', description: 'create-only: import an existing STEP/IGES/BREP file as a script model. The generated script binds `scene` to that shape and the path is kept in params.source, so updates and exports keep working; feature-ise it later by rebuilding it as a feature list.' },
@@ -5363,6 +5425,93 @@ except Exception:
     return out
   }
 
+  const folderAction = async (args, dir) => {
+    try {
+        const action = String(args?.action ?? 'list')
+        if (action === 'list') {
+          const inv = await folderInventory(dir)
+          const rows = inv.folders.map((path) => {
+            const direct = inv.docs.filter((d) => d.folder === path).length
+            const total = inv.docs.filter((d) => d.folder === path || d.folder.startsWith(`${path}/`)).length
+            return { path, docs: direct, total }
+          })
+          const loose = inv.docs.filter((d) => !d.folder).length
+          return { ok: true, dir, folders: rows, root: { docs: loose }, models: inv.docs.length }
+        }
+        if (action === 'create') {
+          const path = normalizeFolder(args?.path)
+          if (!path) throw new Error('create 需要 path（文件夹路径，例如 "鱼缸/背滤"）')
+          const next = await writeFolders(dir, [...(await readFolders(dir)), ...folderParents(path)])
+          return { ok: true, created: path, folders: next }
+        }
+        if (action === 'rename') {
+          const from = normalizeFolder(args?.path)
+          const to = normalizeFolder(args?.to)
+          if (!from) throw new Error('rename 需要 path（要改的文件夹）')
+          if (!to) throw new Error('rename 需要 to（新的文件夹路径）')
+          const inv = await folderInventory(dir)
+          if (!inv.folders.includes(from) && !inv.docs.some((d) => d.folder === from || d.folder.startsWith(`${from}/`))) {
+            throw new Error(`没有这个文件夹：${from}`)
+          }
+          let moved = 0
+          for (const row of inv.docs) {
+            if (row.folder === from || row.folder.startsWith(`${from}/`)) {
+              const doc = await readModel(row.name, dir)
+              doc.folder = to + row.folder.slice(from.length)
+              recordChange(doc, { by: 'agent', kind: 'doc.move', detail: `文件夹改名：${from} → ${to}` })
+              await writeModel(doc, dir)
+              moved += 1
+            }
+          }
+          const kept = (await readFolders(dir)).filter((f) => f !== from && !f.startsWith(`${from}/`))
+          const next = await writeFolders(dir, [...kept, ...folderParents(to)])
+          return { ok: true, renamed: { from, to }, moved, folders: next }
+        }
+        if (action === 'delete') {
+          const path = normalizeFolder(args?.path)
+          if (!path) throw new Error('delete 需要 path（要删的文件夹）')
+          const inv = await folderInventory(dir)
+          const inside = inv.docs.filter((d) => d.folder === path || d.folder.startsWith(`${path}/`))
+          if (inside.length) {
+            throw new Error(`文件夹「${path}」里还有 ${inside.length} 个模型（${inside.slice(0, 5).map((d) => d.name).join('、')}${inside.length > 5 ? '…' : ''}），先移出去再删`)
+          }
+          const next = await writeFolders(dir, (await readFolders(dir)).filter((f) => f !== path && !f.startsWith(`${path}/`)))
+          return { ok: true, deleted: path, folders: next }
+        }
+        throw new Error(`不认识的 action：${action}（list / create / rename / delete）`)
+
+    } catch (err) {
+      return { ok: false, error: String((err && err.message) || err) }
+    }
+  }
+
+  tool({
+    name: 'cad_studio_folder',
+    description: 'Organise models into folders (the drive-like view of the 模型 panel). Folders are plain paths ("鱼缸/背滤"), stored beside the models, and a document keeps its file, history and scene pointer when it moves — so moving is always safe. delete refuses while a folder still holds documents (move them out first, or delete them).',
+    parameters: {
+      type: 'object',
+      properties: {
+        action: { type: 'string', enum: ['list', 'create', 'rename', 'delete'], description: 'list / create / rename / delete' },
+        path: { type: 'string', description: 'Folder path ("鱼缸/背滤"). Empty string means the root.' },
+        to: { type: 'string', description: 'For action=rename: the new path.' },
+      },
+      required: ['action'],
+      additionalProperties: false,
+    },
+    output: {
+      schema: { type: 'object', properties: { ok: { type: 'boolean' }, folders: { type: 'array', items: { type: 'object' } } } },
+      render: (_args, value) => [{ type: 'text', text: JSON.stringify(value, null, 2) }],
+    },
+    execute: async (args, exec) => {
+      try {
+        const dir = modelsDirFor(exec)
+        return await folderAction(args, dir)
+      } catch (err) {
+        return { ok: false, error: String((err && err.message) || err) }
+      }
+    },
+  })
+
   tool({
     name: 'cad_studio_features',
     description: `Edit a feature-list model one feature at a time (the "边画边改" path): change one feature's parameters and the whole list is re-derived in ~0.2–0.6 s. Actions: list / add / update / remove / move / toggle (alias suppress) / tip / undo / redo / sketch (edit one document sketch and rebuild). Feature kinds: ${FEATURE_KINDS.join(', ')}. A feature is {kind, label?, params} — params hold that kind's fields (box: size:[dx,dy,dz], at?; cylinder: r,h,at?,axis?; cut/fuse/common: with:<primitive>; fillet: r; chamfer: d; shell: t,open?; pattern_linear: delta,count; rotate: axis?,at?,deg; mirror: normal?,at?). Flat form ({kind:'box', size:[…]}) is accepted too.`,
@@ -5481,6 +5630,7 @@ __out = {"ok": True, "exported": ${JSON.stringify(target)}, "volume": round(scen
             const row = bridge.history.find((h) => h.docKey === `model:${doc.name}` || h.title === doc.name)
             models.push({
               name: doc.name, kind: doc.kind, features: doc.features.length, params: doc.params, runs: doc.run ?? 0,
+              folder: doc.folder ?? '',
               updatedAt: doc.updatedAt ?? '',
               // A features document records volume/faces at publish time but not the
               // triangle count; the scene row that publish created does have it.
@@ -5499,6 +5649,7 @@ __out = {"ok": True, "exported": ${JSON.stringify(target)}, "volume": round(scen
           ok: true,
           name: doc.name,
           kind: doc.kind,
+          folder: doc.folder ?? '',
           params: doc.params,
           ...(typeof doc.script === 'string' ? { script: doc.script } : {}),
           ...(doc.kind === 'features' ? { features: publicFeatures(doc), graph: graphView(doc, { errors: [], executed: null }), tip: doc.tip ?? null, vars: doc.vars ?? {}, sketches: doc.sketches } : {}),
@@ -5541,6 +5692,7 @@ __out = {"ok": True, "exported": ${JSON.stringify(target)}, "volume": round(scen
             doc.features.push(normalizeFeature(doc, raw))
           }
           if (!doc.features.length) throw new Error('特征模型至少要有一个 feature，例如 {kind:"box", size:[60,40,20]}')
+          doc.folder = normalizeFolder(args.folder ?? '')
           const result = await rebuild(doc, dir, { note: args.note ?? 'create' })
           if (result.ok === false) return result
           doc.history.push({ at: doc.updatedAt, note: args.note ?? 'create', params: JSON.parse(JSON.stringify(doc.params)), features: JSON.parse(JSON.stringify(doc.features)), run: doc.run })
@@ -5564,6 +5716,7 @@ __out = {"ok": True, "exported": ${JSON.stringify(target)}, "volume": round(scen
           history: [],
           ...(fromPath ? { imported: fromPath } : {}),
         }
+        doc.folder = normalizeFolder(args.folder ?? '')
         const result = await rebuild(doc, dir, { note: args.note ?? 'create' })
         if (result.ok === false) return result
         doc.history.push({ at: doc.updatedAt, note: args.note ?? 'create', params: JSON.parse(JSON.stringify(doc.params)), run: doc.run })
@@ -5662,6 +5815,24 @@ __out = {"ok": True, "exported": ${JSON.stringify(target)}, "volume": round(scen
         return { ok: true, name: key, deleted: true, dir }
       }
 
+      if (action === 'move') {
+        // Moving is metadata only: the file, its history and its scene pointer all
+        // stay put, so a move can never invalidate a model or its undo stack.
+        const doc = await readModel(args.name, dir)
+        const guard = by === 'agent' ? foreignWriteGuard(doc, by, args) : null
+        if (guard && guard.ok === false) return guardRefusal(doc, guard, by)
+        const want = normalizeFolder(args.folder)
+        const from = doc.folder ?? ''
+        if (want !== from) {
+          doc.folder = want
+          recordChange(doc, { by, kind: 'doc.move', detail: `移到「${want || '根目录'}」` })
+          await writeModel(doc, dir)
+        }
+        const inv = await folderInventory(dir)
+        if (want) await writeFolders(dir, inv.folders)
+        return { ok: true, name: doc.name, folder: want, movedFrom: from, folders: inv.folders }
+      }
+
       if (action === 'rename') {
         const key = checkName(args.name)
         const to = checkName(args.to ?? args.newName)
@@ -5755,6 +5926,18 @@ __out = {"ok": True, "exported": ${JSON.stringify(target)}, "volume": round(scen
         res.end(body)
       }
       const dir = FreeCadBridge.dataDir
+      // Declared before any route branch: `const` is not hoisted, and a route
+      // that calls bodyOf() while sitting above this line would hit the TDZ.
+      const bodyOf = async () => {
+        const raw = await new Promise((resolve) => {
+          let data = ''
+          req.on('data', (chunk) => { data += chunk; if (data.length > 1 << 20) req.destroy() })
+          req.on('end', () => resolve(data))
+          req.on('error', () => resolve(''))
+        })
+        try { return JSON.parse(raw) } catch { return null }
+      }
+
       if (url.pathname === `${ROUTE_PREFIX}/state`) {
         // Runtime is live (the binary may have been installed after boot);
         // only the published scene pointer is persisted.
@@ -5773,6 +5956,77 @@ __out = {"ok": True, "exported": ${JSON.stringify(target)}, "volume": round(scen
           return send(200, JSON.stringify({ runtime, setup, diag, config: { autoOpen: resolved.autoOpen }, latest: null, lastSession: '', running: bridge.running || 0, runningSession: bridge.runningSession || '' }))
         }
       }
+      // ---- docs drive: folders + the document browser ----------------------
+      // One read that answers "what do I have, and where is it": the panel draws
+      // a folder tree from it, and an agent can list the same inventory without
+      // walking the models directory itself.
+      if (url.pathname === `${ROUTE_PREFIX}/docs` && req.method === 'GET') {
+        try {
+          const dirs = bridge.modelsCandidates()
+          const modelsDir = (resolved.modelsDir && existsSync(resolved.modelsDir)) ? resolved.modelsDir : (dirs.find((d) => existsSync(d)) || dirs[0] || modelsDirFor(undefined))
+          const inv = await folderInventory(modelsDir)
+          const rows = []
+          for (const row of inv.docs) {
+            try {
+              const doc = await readModel(row.name, modelsDir)
+              rows.push({
+                name: doc.name, folder: doc.folder ?? '', kind: doc.kind,
+                features: doc.features?.length ?? 0, rev: doc.rev ?? 0,
+                updatedAt: doc.updatedAt ?? '',
+                volume: doc.stats?.volume ?? null, triangles: doc.stats?.triangles ?? null,
+                sceneId: doc.stats?.sceneId ?? null,
+              })
+            } catch { /* skip unreadable */ }
+          }
+          rows.sort((a, b) => String(b.updatedAt).localeCompare(String(a.updatedAt)))
+          return send(200, JSON.stringify({ ok: true, dir: modelsDir, folders: inv.folders, docs: rows }))
+        } catch (error) {
+          return send(500, JSON.stringify({ ok: false, error: String(error?.message ?? error) }))
+        }
+      }
+      if (url.pathname === `${ROUTE_PREFIX}/docs/move` && req.method === 'POST') {
+        const body = await bodyOf()
+        if (!body || typeof body.name !== 'string' || !body.name) return send(400, JSON.stringify({ ok: false, error: 'name required' }))
+        try {
+          const dirs = bridge.modelsCandidates()
+          const modelsDir = dirs.find((d) => existsSync(join(d, `${body.name}.json`))) || resolved.modelsDir || dirs[0] || modelsDirFor(undefined)
+          const out = await runDocAction({ action: 'move', name: body.name, folder: body.folder ?? '', by: 'panel' }, modelsDir)
+          return send(out.ok ? 200 : 400, JSON.stringify(out))
+        } catch (error) {
+          return send(400, JSON.stringify({ ok: false, error: String(error?.message ?? error) }))
+        }
+      }
+      if (url.pathname === `${ROUTE_PREFIX}/import` && req.method === 'POST') {
+        // Bring an existing STEP/IGES/BREP file into the drive as a model. Same
+        // code path as cad_studio_doc create {from}, so the panel and an agent
+        // produce identical documents (and the path is kept in params.source).
+        const body = await bodyOf()
+        if (!body || typeof body.path !== 'string' || !body.path.trim()) return send(400, JSON.stringify({ ok: false, error: 'path required' }))
+        try {
+          const dirs = bridge.modelsCandidates()
+          const modelsDir = resolved.modelsDir || dirs[0] || modelsDirFor(undefined)
+          const name = typeof body.name === 'string' && body.name.trim()
+            ? body.name.trim()
+            : String(body.path).split('/').pop().replace(/\.[^.]*$/, '')
+          const out = await runDocAction({ action: 'create', name, from: body.path, folder: body.folder ?? '', by: 'panel' }, modelsDir)
+          return send(out.ok === false ? 400 : 200, JSON.stringify(out))
+        } catch (error) {
+          return send(400, JSON.stringify({ ok: false, error: String(error?.message ?? error) }))
+        }
+      }
+      if (url.pathname === `${ROUTE_PREFIX}/folders` && req.method === 'POST') {
+        const body = await bodyOf()
+        if (!body || typeof body.action !== 'string') return send(400, JSON.stringify({ ok: false, error: 'action required' }))
+        try {
+          const dirs = bridge.modelsCandidates()
+          const modelsDir = resolved.modelsDir || dirs[0] || modelsDirFor(undefined)
+          const out = await folderAction(body, modelsDir)
+          return send(out.ok ? 200 : 400, JSON.stringify(out))
+        } catch (error) {
+          return send(400, JSON.stringify({ ok: false, error: String(error?.message ?? error) }))
+        }
+      }
+
       if (url.pathname === `${ROUTE_PREFIX}/changes`) {
         // The panel's own copy of the ledger, so a person can see what the agent
         // did in their absence — the mirror image of the digest the agent gets.
@@ -5814,16 +6068,6 @@ __out = {"ok": True, "exported": ${JSON.stringify(target)}, "volume": round(scen
           return send(200, JSON.stringify({ latest: null, scenes: [] }))
         }
       }
-      const bodyOf = async () => {
-        const raw = await new Promise((resolve) => {
-          let data = ''
-          req.on('data', (chunk) => { data += chunk; if (data.length > 1 << 20) req.destroy() })
-          req.on('end', () => resolve(data))
-          req.on('error', () => resolve(''))
-        })
-        try { return JSON.parse(raw) } catch { return null }
-      }
-
       if (url.pathname === `${ROUTE_PREFIX}/appearance` && req.method === 'POST') {
         // Colours / visibility picked by hand in the panel: stored per model so
         // a reload or a restart shows the same look.

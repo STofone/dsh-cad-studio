@@ -1856,6 +1856,47 @@ endsolid t
   await call('cad_studio_deps', { action: 'delete', assembly: live.assembly })
 }
 
+// ---- 8c. the docs drive: folders + the document browser -----------------
+{
+  // Folders are metadata over a flat models dir: creating one must never move a
+  // file, and moving a document must never lose its history or its scene.
+  const name = 'drive_doc'
+  await call('cad_studio_doc', { action: 'delete', name }).catch(() => {})
+
+  const born = await call('cad_studio_doc', { action: 'create', name, kind: 'features', folder: '鱼缸/背滤', features: [{ kind: 'box', size: [20, 10, 4] }] })
+  ok('drive: create with a folder keeps the geometry intact', born.ok === true && born.volume === 800, JSON.stringify({ ok: born.ok, volume: born.volume }))
+
+  const docs = JSON.parse((await hit('/cad-studio/docs')).body)
+  ok('drive: /docs lists the model under its folder', docs.ok === true && (docs.folders || []).includes('鱼缸/背滤') && (docs.docs || []).some((d) => d.name === name && d.folder === '鱼缸/背滤'), JSON.stringify({ folders: docs.folders, doc: (docs.docs || []).find((d) => d.name === name) }))
+  ok('drive: /docs carries the parent folder too', (docs.folders || []).includes('鱼缸'), JSON.stringify(docs.folders))
+
+  const moved = await call('cad_studio_doc', { action: 'move', name, folder: '设计/草图' })
+  ok('drive: move only rewrites the folder', moved.ok === true && moved.folder === '设计/草图' && moved.movedFrom === '鱼缸/背滤', JSON.stringify(moved))
+  const shown = await call('cad_studio_doc', { action: 'show', name })
+  ok('drive: a moved model keeps its geometry and history', shown.ok === true && shown.stats?.volume === 800 && (shown.history || []).length >= 1, JSON.stringify({ volume: shown.stats?.volume, history: shown.history?.length }))
+
+  const created = await call('cad_studio_folder', { action: 'create', path: '设计/零件/标准件' })
+  ok('drive: creating a nested folder creates its parents', created.ok === true && created.folders.includes('设计/零件') && created.folders.includes('设计/零件/标准件'), JSON.stringify(created.folders))
+
+  const listed = await call('cad_studio_folder', { action: 'list' })
+  const row = (listed.folders || []).find((f) => f.path === '设计')
+  ok('drive: folder list counts documents below it', listed.ok === true && row && row.total >= 1, JSON.stringify(row))
+
+  const renamed = await call('cad_studio_folder', { action: 'rename', path: '设计/草图', to: '设计/layout' })
+  ok('drive: renaming a folder carries its documents', renamed.ok === true && renamed.moved === 1, JSON.stringify(renamed))
+  const after = await call('cad_studio_doc', { action: 'show', name })
+  ok('drive: the document landed in the renamed folder', after.folder === '设计/layout', JSON.stringify({ folder: after.folder }))
+
+  const blocked = await call('cad_studio_folder', { action: 'delete', path: '设计/layout' })
+  ok('drive: deleting a non-empty folder is refused', blocked.ok === false && /还有 1 个模型/.test(String(blocked.error)), String(blocked.error))
+  await call('cad_studio_doc', { action: 'move', name, folder: '' })
+  const dropped = await call('cad_studio_folder', { action: 'delete', path: '设计/layout' })
+  ok('drive: an empty folder can be deleted', dropped.ok === true && !dropped.folders.includes('设计/layout'), JSON.stringify(dropped.folders))
+  const bad = await call('cad_studio_doc', { action: 'move', name, folder: '../etc' })
+  ok('drive: a folder path cannot escape the models dir', bad.ok === false, String(bad.error))
+  await call('cad_studio_doc', { action: 'delete', name }).catch(() => {})
+}
+
 // ---- 9. teardown --------------------------------------------------------
 for (const d of disposed.reverse()) { try { d() } catch (e) { console.log('  [dispose warn]', e.message) } }
 ok('all tools unregistered on dispose', tools.size === 0, [...tools.keys()].join(','))

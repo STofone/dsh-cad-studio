@@ -168,6 +168,25 @@ window.__ModuleLoader__.load({
         cursor: 'pointer', display: 'inline-flex', alignItems: 'center', gap: 5, borderRadius: 4,
         font: 'inherit', fontSize: 9.5, color: 'inherit', fontVariantNumeric: 'tabular-nums',
       },
+    crumb: { display: 'flex', alignItems: 'center', gap: 2, flexWrap: 'wrap', padding: '2px 10px 6px' },
+    crumbBtn: (active) => ({
+      border: 0, background: 'transparent', color: 'inherit', padding: '1px 2px', cursor: 'pointer',
+      font: 'inherit', fontSize: 10.5, opacity: active ? 0.95 : 0.55, fontWeight: active ? 600 : 400,
+    }),
+    docRow: { display: 'flex', alignItems: 'center', gap: 4 },
+    docTools: { display: 'flex', flexDirection: 'column', gap: 6, padding: '10px 10px 2px', borderTop: '1px solid rgba(127,127,127,.16)', marginTop: 8 },
+    importBox: { display: 'flex', flexDirection: 'column', gap: 4 },
+    inlineEdit: { display: 'flex', alignItems: 'center', gap: 4 },
+    linkBtn: { border: 0, background: 'transparent', color: 'inherit', opacity: 0.8, cursor: 'pointer', font: 'inherit', fontSize: 11, textAlign: 'left', padding: '2px 0' },
+    miniBtn: {
+      border: '1px solid rgba(127,127,127,.3)', background: 'transparent', color: 'inherit', borderRadius: 5,
+      fontSize: 10.5, padding: '1px 6px', cursor: 'pointer', flex: '0 0 auto',
+    },
+    input: {
+      border: '1px solid rgba(127,127,127,.35)', background: 'transparent', color: 'inherit', borderRadius: 5,
+      fontSize: 11, padding: '3px 6px', minWidth: 0, flex: 1,
+    },
+
       swatchHex: { opacity: 0.7, letterSpacing: '.02em' },
       eyeButton: { marginLeft: 'auto', padding: 2, border: 0, background: 'transparent', cursor: 'pointer', display: 'inline-flex', opacity: 0.85, flex: 'none' },
       colorPop: { position: 'absolute', top: '100%', left: 4, zIndex: 40, padding: 6, borderRadius: 6, border: '1px solid', boxShadow: '0 10px 26px rgba(0,0,0,.3)', display: 'flex', flexDirection: 'column', gap: 5 },
@@ -1357,6 +1376,10 @@ const FILE_EXTS = ['step', 'stp', 'iges', 'igs', 'brep', 'stl']
       const addBtnRef = useRef(null)
       const [activityPin, setActivityPin] = useState(null)
       const activityPinRef = useRef(null)
+      const [docs, setDocs] = useState(null)
+      const [crumb, setCrumb] = useState([])
+      const [folderDraft, setFolderDraft] = useState(null)
+      const [importDraft, setImportDraft] = useState(null)
       const [picked, setPicked] = useState('')
       const revealedRef = useRef('')
       const [payload, setPayload] = useState(null)
@@ -2976,6 +2999,136 @@ const FILE_EXTS = ['step', 'stp', 'iges', 'igs', 'brep', 'stl']
           '这里只记外观（颜色/显隐/透明度/线框），一步一条，快捷键 Ctrl+Z / Ctrl+Shift+Z。模型特征与参数的撤销在「特征」里。'),
       ])
 
+      // The 模型 drawer is a drive, not a flat list: folders are a view over one
+      // flat models dir, so entering a folder never moves a file and a model keeps
+      // its scene while it moves between folders.
+      const curFolder = crumb.join('/')
+      const docsList = (docs && docs.docs) || []
+      const foldersList = (docs && docs.folders) || []
+      const leafIn = (base) => foldersList
+        .filter((f) => f.startsWith(base ? `${base}/` : '') && f !== base)
+        .map((f) => f.slice(base ? base.length + 1 : 0))
+        .filter((rest) => rest && !rest.includes('/'))
+      const docsHere = docsList.filter((d) => (d.folder || '') === curFolder)
+      const enterFolder = (leaf) => setCrumb(curFolder ? [...crumb, leaf] : [leaf])
+      const moveDoc = async (name, folder) => {
+        try {
+          const res = await fetch(`${ROUTE}/docs/move`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ name, folder }) })
+          const out = await res.json()
+          if (out.ok) { setDocs(await (await fetch(`${ROUTE}/docs`)).json()); setNote(`已移到「${folder || '全部'}」`) }
+          else setNote(String(out.error || '移动失败'))
+        } catch (error) { setNote(String(error.message || error)) }
+      }
+      const newFolder = async () => {
+        const name = String(folderDraft || '').trim()
+        if (!name) { setFolderDraft(null); return }
+        const path = curFolder ? `${curFolder}/${name}` : name
+        try {
+          const res = await fetch(`${ROUTE}/folders`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ action: 'create', path }) })
+          const out = await res.json()
+          if (out.ok) { setFolderDraft(null); setDocs(await (await fetch(`${ROUTE}/docs`)).json()) } else setNote(String(out.error || '新建失败'))
+        } catch (error) { setNote(String(error.message || error)) }
+      }
+      const importStep = async () => {
+        const draft = importDraft || {}
+        const path = String(draft.path || '').trim()
+        if (!path) { setImportDraft(null); return }
+        try {
+          const res = await fetch(`${ROUTE}/import`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ path, name: String(draft.name || '').trim() || undefined, folder: curFolder }) })
+          const out = await res.json()
+          if (out.ok !== false) { setImportDraft(null); setDocs(await (await fetch(`${ROUTE}/docs`)).json()); setNote(`已导入${out.name ? ` ${out.name}` : ''}`) }
+          else setNote(String(out.error || '导入失败'))
+        } catch (error) { setNote(String(error.message || error)) }
+      }
+      const openDoc = async (doc) => {
+        if (doc.sceneId) { await switchModel(doc.sceneId); return }
+        setNote(`${doc.name} 还没有发布过场景（用 cad_studio_doc update 重算一次）`)
+      }
+      const docsBody = [
+        h('div', { key: 'crumb', style: styles.crumb, 'data-cad-crumb': curFolder }, [
+          h('button', { key: 'root', type: 'button', style: styles.crumbBtn(crumb.length === 0), onClick: () => setCrumb([]) }, '全部'),
+          ...crumb.map((seg, i) => h('button', {
+            key: `${i}-${seg}`, type: 'button', style: styles.crumbBtn(i === crumb.length - 1),
+            onClick: () => setCrumb(crumb.slice(0, i + 1)),
+          }, ` / ${seg}`)),
+        ]),
+        ...leafIn(curFolder).map((leaf) => {
+          const path = curFolder ? `${curFolder}/${leaf}` : leaf
+          const total = foldersList.filter((f) => f === path || f.startsWith(`${path}/`)).length
+          return h('button', {
+            key: `f-${path}`, type: 'button', 'data-cad-folder': path,
+            style: styles.modelRow(false),
+            onClick: () => enterFolder(leaf),
+          }, [
+            h('span', { key: 'n', style: styles.modelName }, `▸ ${leaf}`),
+            h('span', { key: 'm', style: styles.modelMeta }, `${total} 个`),
+          ])
+        }),
+        ...docsHere.map((doc) => h('div', { key: `d-${doc.name}`, style: styles.docRow }, [
+          h('button', {
+            key: 'b', type: 'button', 'data-cad-doc': doc.name,
+            style: styles.modelRow(false),
+            title: doc.sceneId ? `打开 ${doc.name}` : `${doc.name} 还没有场景`,
+            onClick: () => { openDoc(doc) },
+          }, [
+            h('span', { key: 'n', style: styles.modelName }, doc.name),
+            h('span', { key: 'm', style: styles.modelMeta }, `${doc.updatedAt ? new Date(doc.updatedAt).toLocaleDateString('zh-CN') : ''} · ${doc.kind === 'features' ? `${doc.features} 特征` : '脚本'}${doc.volume ? ` · ${Math.round(doc.volume / 1000)} cm³` : ''}`),
+          ]),
+          curFolder
+            ? h('button', {
+              key: 'up', type: 'button', 'data-cad-doc-move-out': doc.name, style: styles.miniBtn,
+              title: '移到上一级',
+              onClick: () => { moveDoc(doc.name, curFolder.includes('/') ? curFolder.slice(0, curFolder.lastIndexOf('/')) : '') },
+            }, '↑')
+            : null,
+        ])),
+        !docsHere.length && !leafIn(curFolder).length
+          ? h('div', { key: 'empty', style: styles.treeHint }, curFolder ? '这个文件夹还是空的' : '还没有模型')
+          : null,
+        h('div', { key: 'tools', style: styles.docTools }, [
+          folderDraft === null
+            ? h('button', { key: 'nf', type: 'button', 'data-cad-newfolder': '1', style: styles.linkBtn, onClick: () => setFolderDraft('') }, '+ 新建文件夹')
+            : h('span', { key: 'nfw', style: styles.inlineEdit }, [
+              h('input', {
+                key: 'i', style: styles.input, autoFocus: true, placeholder: '文件夹名', value: folderDraft,
+                'data-cad-newfolder-input': '1',
+                onChange: (e) => setFolderDraft(e.currentTarget.value),
+                onKeyDown: (e) => { if (e.key === 'Enter') newFolder(); if (e.key === 'Escape') setFolderDraft(null) },
+              }),
+              h('button', { key: 'ok', type: 'button', style: styles.miniBtn, onClick: newFolder }, '好'),
+            ]),
+          importDraft === null
+            ? h('button', { key: 'im', type: 'button', 'data-cad-import': '1', style: styles.linkBtn, onClick: () => setImportDraft({ path: '', name: '' }) }, '+ 导入 STEP')
+            : h('div', { key: 'imw', style: styles.importBox }, [
+              h('input', {
+                key: 'p', style: styles.input, autoFocus: true, placeholder: '/path/part.step', value: importDraft.path,
+                'data-cad-import-path': '1',
+                onChange: (e) => setImportDraft({ ...importDraft, path: e.currentTarget.value }),
+              }),
+              h('input', {
+                key: 'n', style: styles.input, placeholder: '模型名（可留空）', value: importDraft.name,
+                'data-cad-import-name': '1',
+                onChange: (e) => setImportDraft({ ...importDraft, name: e.currentTarget.value }),
+                onKeyDown: (e) => { if (e.key === 'Enter') importStep(); if (e.key === 'Escape') setImportDraft(null) },
+              }),
+              h('button', { key: 'ok', type: 'button', 'data-cad-import-go': '1', style: styles.miniBtn, onClick: importStep }, '导入'),
+            ]),
+        ]),
+      ]
+      useEffect(() => {
+        if (panel !== 'models') return undefined
+        let alive = true
+        const load = async () => {
+          try {
+            const res = await fetch(`${ROUTE}/docs`)
+            const json = await res.json()
+            if (alive && json && json.ok) setDocs(json)
+          } catch {}
+        }
+        load()
+        const timer = setInterval(load, 5000)
+        return () => { alive = false; clearInterval(timer) }
+      }, [panel, docs && docs.dir])
       const panelBody = panel === 'parts'
         ? rows
         : panel === 'features'
@@ -2989,19 +3142,7 @@ const FILE_EXTS = ['step', 'stp', 'iges', 'igs', 'brep', 'stl']
           : panel === 'view'
           ? h(ViewMenu, { theme, display, setDisplay, handleRef: viewportRef, inline: true, onClose: () => {} })
           : panel === 'models'
-            ? (scenes.length
-              ? scenes.map((sc) => h('button', {
-                key: sc.id,
-                type: 'button',
-                'data-cad-scene': sc.id,
-                style: styles.modelRow(sc.id === activeModel),
-                title: `切换到 ${shortName(sc)}（替换当前视图里的模型，不新开页签）`,
-                onClick: () => { switchModel(sc.id) },
-              }, [
-                h('span', { key: 'n', style: { ...styles.modelName, fontWeight: sc.id === activeModel ? 600 : 400 } }, shortName(sc)),
-                h('span', { key: 'm', style: styles.modelMeta }, `${(sc.at ? new Date(sc.at).toLocaleTimeString('zh-CN', { hour12: false }) : '')} · ${sc.instances || 0} 实例 · ${sc.parts || 0} 零件`),
-              ]))
-              : h('div', { key: 'none', style: styles.treeHint }, '还没有别的模型'))
+            ? docsBody
             : panel === 'info'
               ? [
                 ...infoRows.map(([key, value]) => h('div', { key, style: styles.infoRow }, [
