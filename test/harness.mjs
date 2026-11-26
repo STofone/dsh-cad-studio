@@ -1938,6 +1938,9 @@ endsolid t
   ok('paramdoc: POST /params accepts paramMeta', panel.status === 200 && panelOut.ok !== false, `status=${panel.status} body=${String(panel.body).slice(0, 160)}`)
   const fromPanel = (await call('cad_studio_doc', { action: 'show', name })).paramMeta || {}
   ok('paramdoc: the panel description persists', fromPanel['高']?.description === '面板写的说明', JSON.stringify(fromPanel))
+  const sceneId = (await call('cad_studio_doc', { action: 'show', name })).stats?.sceneId
+  const sceneMeta = sceneId ? JSON.parse((await hit(`/cad-studio/scene/${sceneId}`)).body) : {}
+  ok('paramdoc: the published scene carries the descriptions', sceneMeta?.paramMeta?.['高']?.description === '面板写的说明', JSON.stringify(sceneMeta?.paramMeta))
   await call('cad_studio_doc', { action: 'delete', name }).catch(() => {})
 }
 

@@ -4988,6 +4988,31 @@ else:
     return { tip: doc.tip ?? null, nodes: withDeps }
   }
 
+  /**
+   * The published scene doubles as the panel's view of the document: it carries
+   * params, their descriptions, the feature list and the tip. A rebuild that
+   * decides "nothing changed, skip the kernel" still has to refresh that surface,
+   * otherwise a description edit would never reach the drawer.
+   */
+  const writeSceneSurface = async (doc, sceneId, graph) => {
+    const scene = sceneId ? bridge.scenes?.get(sceneId) : null
+    if (!scene) return null
+    if (graph) scene.graph = graph
+    scene.params = doc.params ?? {}
+    scene.paramMeta = doc.paramMeta ?? {}
+    if (doc.kind === 'features') {
+      scene.features = publicFeatures(doc)
+      scene.sketches = doc.sketches ?? {}
+      scene.tip = doc.tip ?? null
+    }
+    try {
+      const packed = await bridge.packScene(sceneId, scene)
+      await writeFile(join(FreeCadBridge.dataDir, 'scenes', `${sceneId}.json`), JSON.stringify(packed), 'utf8')
+      if (bridge.latest && bridge.latest.id === sceneId) bridge.latest.scene = packed
+    } catch { /* the scene is already published; stale JSON meta is not fatal */ }
+    return scene
+  }
+
   const rebuild = async (doc, dir, { note } = {}) => {
     const isFeatures = doc.kind === 'features'
     // Incremental recompute (DESIGN §5.3): hash the op chain once, find the
@@ -5009,11 +5034,17 @@ else:
       const fullHash = hashes[hashes.length - 1] ?? ''
       const keep = doc.stats?.sceneId && bridge.scenes?.has(doc.stats.sceneId)
       if (fullHash && keep && doc.stats?.hash === fullHash) {
-        // Nothing changed and the scene is still live: no kernel run at all.
+        // Nothing changed and the scene is still live: no kernel run at all — but
+        // the document's editable surface may still have changed (a param renamed,
+        // a description added), so refresh what the panel reads before returning.
+        const sameGraph = graphView(doc, { errors: [], executed: hashes.length })
+        await writeSceneSurface(doc, doc.stats.sceneId, sameGraph)
+        try { await bridge.persist() } catch {}
         return {
           ok: true, evaluated: true, cached: hashes.length, computed: 0, name: doc.name, dir,
-          graph: graphView(doc, { errors: [], executed: hashes.length }),
-          errors: [], run: doc.run, params: doc.params, volume: doc.stats.volume,
+          graph: sameGraph,
+          errors: [], run: doc.run, params: doc.params, paramMeta: doc.paramMeta ?? {},
+          volume: doc.stats.volume,
           triangles: doc.stats.triangles, sceneId: doc.stats.sceneId, bounds: doc.stats.bounds,
           note: doc.note, revalidated: true,
         }
@@ -5044,7 +5075,12 @@ except Exception:
     const code = isFeatures
       ? featuresScript(featureOps(doc), null, { cache, resume, sketches: doc.sketches })
       : `${PRELUDE}\nP = ${JSON.stringify(doc.params ?? {})}\n${doc.script}\n${unifyTail}`
-    const meta = isFeatures ? { model: doc.name, features: publicFeatures(doc), sketches: doc.sketches ?? {}, tip: doc.tip ?? null } : { model: doc.name, params: doc.params ?? {} }
+    // The scene carries the document's editable surface: the panel reads params
+    // (and their descriptions) off the published meta rather than a second call.
+    const paramMeta = doc.paramMeta ?? {}
+    const meta = isFeatures
+      ? { model: doc.name, features: publicFeatures(doc), sketches: doc.sketches ?? {}, tip: doc.tip ?? null, params: doc.params ?? {}, paramMeta }
+      : { model: doc.name, params: doc.params ?? {}, paramMeta }
     doc.run = (doc.run ?? 0) + 1
     doc.updatedAt = new Date().toISOString()
     // One row per model: a rebuild rewrites the model's existing scene.
@@ -5073,12 +5109,9 @@ except Exception:
     // The scene was published before the kernel reported which nodes failed, so
     // attach the statuses now: the panel paints dots from payload.graph.
     const graph = graphView(doc, out)
-    const scene = sceneId ? bridge.scenes?.get(sceneId) : null
-    if (scene) {
-      scene.graph = graph
-      scene.cache = { cached: out.cached ?? 0, computed: out.computed ?? null, of: hashes.length }
-      try { await bridge.persist() } catch {}
-    }
+    const patched = await writeSceneSurface(doc, sceneId, graph)
+    if (patched) patched.cache = { cached: out.cached ?? 0, computed: out.computed ?? null, of: hashes.length }
+    if (patched) { try { await bridge.persist() } catch {} }
     await writeModel(doc, dir)
     if (isFeatures && hashes.length) {
       // Cheap housekeeping, off the hot path: a 400-file / 14-day cap keeps the
@@ -5783,6 +5816,7 @@ __out = {"ok": True, "exported": ${JSON.stringify(target)}, "volume": round(scen
         } else {
           doc.paramMeta = normalizeParamMeta(doc.paramMeta, doc.params)
         }
+        if (process.env.CAD_DEBUG_META) console.error('[upd]', doc.name, 'params', JSON.stringify(doc.params), 'pm', JSON.stringify(doc.paramMeta), 'argPM', JSON.stringify(args.paramMeta))
         if (Array.isArray(args.features)) {
           if (doc.kind !== 'features') throw new Error(`${doc.name} 是脚本模型；要换成特征列表请新建一个 kind="features" 的模型`)
           doc.features = []
