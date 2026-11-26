@@ -1410,9 +1410,15 @@ class FreeCadBridge {
   /** Forget every record whose scene is gone: the shells left behind when
    * scenes were deleted one by one. Returns the ids that were dropped. */
   async pruneAssemblies() {
+    // A fresh process has an empty scene map: judging "alive" by it alone would
+    // call every live assembly a shell and delete the lot. The scene file on
+    // disk is the truth, so hydrate it first.
+    await this.hydrateHistory()
     const gone = new Set()
+    const alive = (sceneId) => Boolean(sceneId)
+      && (this.scenes.has(sceneId) || existsSync(join(FreeCadBridge.dataDir, 'scenes', `${sceneId}.json`)))
     for (const [id, record] of [...this.assemblies]) {
-      if (!this.scenes.has(record.sceneId)) {
+      if (!alive(record.sceneId)) {
         this.assemblies.delete(id)
         gone.add(id)
       }
@@ -1425,9 +1431,7 @@ class FreeCadBridge {
       metas = Array.isArray(pointer.assemblies) ? pointer.assemblies : []
     } catch {}
     for (const meta of metas) {
-      if (!meta?.id) continue
-      const file = meta.sceneId ? join(FreeCadBridge.dataDir, 'scenes', `${meta.sceneId}.json`) : ''
-      if (!this.scenes.has(meta.sceneId) && (!file || !existsSync(file))) gone.add(meta.id)
+      if (meta?.id && !alive(meta.sceneId)) gone.add(meta.id)
     }
     for (const id of gone) this.forgottenAssemblies.add(id)
     if (gone.size) await this.persist()
@@ -4104,6 +4108,7 @@ else:
     execute: async ({ action, assembly, part, path, parts, instances }) => {
       const mode = action ?? 'list'
       if (mode === 'list') {
+        await bridge.hydrateHistory()
         if (!assembly) await bridge.hydrateAssemblies()
         const records = assembly
           ? [(() => { try { return findAssembly(assembly) } catch { return null } })()].filter(Boolean)
@@ -5710,6 +5715,7 @@ __out = {"ok": True, "exported": ${JSON.stringify(target)}, "volume": round(scen
       if (url.pathname === `${ROUTE_PREFIX}/deps`) {
         // What the panel shows under "来源文件": which STEP each part came from
         // and whether it is still there.
+        await bridge.hydrateHistory()
         const records = [...(await bridge.hydrateAssemblies()).values()]
         const models = records.map((r) => {
           const files = (r.spec?.parts ?? []).map((p) => {
