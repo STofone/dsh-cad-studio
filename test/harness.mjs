@@ -1897,6 +1897,50 @@ endsolid t
   await call('cad_studio_doc', { action: 'delete', name }).catch(() => {})
 }
 
+// ---- 8d. per-parameter documentation ------------------------------------
+{
+  // A param is a name→value pair the script reads as P["名"]. A human reading the
+  // panel needs to know what "高" means, so the meaning rides beside the value:
+  // paramMeta = {"高": {description, unit}}. It must never leak a description for
+  // a parameter that no longer exists.
+  const name = 'params_doc'
+  await call('cad_studio_doc', { action: 'delete', name }).catch(() => {})
+
+  const born = await call('cad_studio_doc', {
+    action: 'create', name, kind: 'features',
+    features: [{ kind: 'box', size: [40, 20, 10] }],
+  })
+  ok('paramdoc: create without metadata is fine', born.ok === true && born.volume === 8000, JSON.stringify({ volume: born.volume }))
+
+  const withMeta = await call('cad_studio_doc', {
+    action: 'update', name,
+    params: { 高: 10, 宽: 40 },
+    paramMeta: { 高: { description: '托底到顶面的高度', unit: 'mm' }, 宽: '底板的宽度', 不存在: { description: '孤儿' } },
+  })
+  ok('paramdoc: update stores descriptions', withMeta.ok === true, JSON.stringify({ ok: withMeta.ok, error: withMeta.error }))
+
+  const shown = await call('cad_studio_doc', { action: 'show', name })
+  const meta = shown.paramMeta || {}
+  ok('paramdoc: show returns the description and unit', meta['高']?.description === '托底到顶面的高度' && meta['高']?.unit === 'mm', JSON.stringify(meta))
+  ok('paramdoc: a bare string becomes a description', meta['宽']?.description === '底板的宽度', JSON.stringify(meta['宽']))
+  ok('paramdoc: descriptions for missing params are dropped', meta['不存在'] === undefined, JSON.stringify(Object.keys(meta)))
+
+  const dropped = await call('cad_studio_doc', {
+    action: 'update', name, params: { 宽: null }, paramMeta: { 高: null },
+  })
+  ok('paramdoc: dropping a param drops its description', dropped.ok === true, JSON.stringify({ ok: dropped.ok, error: dropped.error }))
+  const after = (await call('cad_studio_doc', { action: 'show', name })).paramMeta || {}
+  ok('paramdoc: the meta is pruned with the param', after['宽'] === undefined, JSON.stringify(Object.keys(after)))
+
+  // The panel edits this through the same route it uses for numbers.
+  const panel = await post('/cad-studio/params', { model: name, params: {}, paramMeta: { 高: { description: '面板写的说明' } } })
+  const panelOut = JSON.parse(panel.body || '{}')
+  ok('paramdoc: POST /params accepts paramMeta', panel.status === 200 && panelOut.ok !== false, `status=${panel.status} body=${String(panel.body).slice(0, 160)}`)
+  const fromPanel = (await call('cad_studio_doc', { action: 'show', name })).paramMeta || {}
+  ok('paramdoc: the panel description persists', fromPanel['高']?.description === '面板写的说明', JSON.stringify(fromPanel))
+  await call('cad_studio_doc', { action: 'delete', name }).catch(() => {})
+}
+
 // ---- 9. teardown --------------------------------------------------------
 for (const d of disposed.reverse()) { try { d() } catch (e) { console.log('  [dispose warn]', e.message) } }
 ok('all tools unregistered on dispose', tools.size === 0, [...tools.keys()].join(','))

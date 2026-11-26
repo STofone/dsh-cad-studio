@@ -198,6 +198,11 @@ window.__ModuleLoader__.load({
       propName: { display: 'flex', alignItems: 'center', gap: 6, padding: '2px 2px 6px', fontWeight: 600, fontSize: 11.5, minWidth: 0 },
       propSub: { fontSize: 9.5, opacity: 0.55, padding: '0 2px 8px', wordBreak: 'break-all' },
       propRow: { display: 'flex', alignItems: 'center', gap: 8, padding: '4px 2px', minWidth: 0 },
+      paramBlock: { display: 'flex', flexDirection: 'column', gap: 1, padding: '2px 0' },
+      paramDescRow: { display: 'flex', paddingLeft: 2 },
+      paramDesc: { background: 'transparent', border: 'none', padding: 0, textAlign: 'left', fontSize: 9.5, lineHeight: '14px', opacity: 0.66, cursor: 'text', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
+      paramDescEmpty: { opacity: 0.34 },
+      paramDescInput: { width: '100%', boxSizing: 'border-box', fontSize: 9.5, padding: '1px 4px' },
       propLabel: { fontSize: 10.5, opacity: 0.62, flex: 'none', width: 34 },
       propValue: { marginLeft: 'auto', fontSize: 10, opacity: 0.75, fontVariantNumeric: 'tabular-nums', flex: 'none' },
       slider: { flex: '1 1 auto', minWidth: 0, height: 14, accentColor: '#4d6bfe', cursor: 'pointer' },
@@ -2172,6 +2177,26 @@ const FILE_EXTS = ['step', 'stp', 'iges', 'igs', 'brep', 'stl']
       // the same way — one number, one rebuild of the same document.
       const modelParams = payload && payload.params && typeof payload.params === 'object' ? payload.params : {}
       const paramKeys = Object.keys(modelParams)
+      const modelParamMeta = payload && payload.paramMeta && typeof payload.paramMeta === 'object' ? payload.paramMeta : {}
+      const [descEditing, setDescEditing] = useState(null)
+      const saveParamDesc = async (key, text) => {
+        setDescEditing(null)
+        const clean = String(text || '').trim()
+        const current = (modelParamMeta[key] && modelParamMeta[key].description) || ''
+        if (clean === current) return
+        try {
+          const res = await fetch(`${ROUTE}/params`, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ model: featureModel, paramMeta: { [key]: clean ? { description: clean } : null } }),
+          })
+          const out = await res.json()
+          if (!res.ok || !out || out.ok === false) setFeatError(String((out && out.error) || `HTTP ${res.status}`))
+          else { setFeatError(''); if (out.sceneId) await applyScene(out.sceneId, out.at) }
+        } catch (error) {
+          setFeatError(String(error && error.message ? error.message : error))
+        }
+      }
       const [paramDraft, setParamDraft] = useState({})
       const paramTimer = useRef(null)
       const featureDefaults = {
@@ -2297,23 +2322,51 @@ const FILE_EXTS = ['step', 'stp', 'iges', 'igs', 'brep', 'stl']
         const draft = paramDraft[key]
         const value = draft === undefined ? base : draft
         const numeric = typeof base === 'number'
-        return h('label', { key: `p-${key}`, style: styles.propRow }, [
-          h('span', { key: 'l', style: { ...styles.propLabel, flex: '1 1 auto', minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis' } }, key),
-          h('input', {
-            key: 'i',
-            type: numeric ? 'number' : 'text',
-            style: styles.jointNum,
-            'data-cad-param': key,
-            value: String(value),
-            onChange: (event) => {
-              const raw = event.currentTarget.value
-              if (raw === '') return
-              const next = numeric ? Number(raw) : raw
-              if (numeric && !Number.isFinite(next)) return
-              setParamDraft((prev) => ({ ...prev, [key]: next }))
-              queueParams({ ...modelParams, ...paramDraft, [key]: next })
-            },
-          }),
+        const meta = modelParamMeta[key] || {}
+        const desc = meta.description || ''
+        const unit = meta.unit || ''
+        const descRow = descEditing === key
+          ? h('input', {
+              key: 'd-edit',
+              style: styles.paramDescInput,
+              'data-cad-param-desc-input': key,
+              defaultValue: desc,
+              placeholder: '说明这个参数是什么（回车保存，Esc 取消）',
+              autoFocus: true,
+              onKeyDown: (event) => {
+                if (event.key === 'Enter') saveParamDesc(key, event.currentTarget.value)
+                else if (event.key === 'Escape') setDescEditing(null)
+              },
+              onBlur: (event) => saveParamDesc(key, event.currentTarget.value),
+            })
+          : h('button', {
+              key: 'd',
+              type: 'button',
+              style: { ...styles.paramDesc, ...(desc ? {} : styles.paramDescEmpty) },
+              'data-cad-param-desc': key,
+              title: '点击编辑参数说明',
+              onClick: () => setDescEditing(key),
+            }, desc ? (unit ? `${desc}（${unit}）` : desc) : '＋ 说明')
+        return h('div', { key: `p-${key}`, style: styles.paramBlock }, [
+          h('label', { key: 'row', style: styles.propRow }, [
+            h('span', { key: 'l', style: { ...styles.propLabel, flex: '1 1 auto', minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis' } }, key),
+            h('input', {
+              key: 'i',
+              type: numeric ? 'number' : 'text',
+              style: styles.jointNum,
+              'data-cad-param': key,
+              value: String(value),
+              onChange: (event) => {
+                const raw = event.currentTarget.value
+                if (raw === '') return
+                const next = numeric ? Number(raw) : raw
+                if (numeric && !Number.isFinite(next)) return
+                setParamDraft((prev) => ({ ...prev, [key]: next }))
+                queueParams({ ...modelParams, ...paramDraft, [key]: next })
+              },
+            }),
+          ]),
+          h('div', { key: 'desc', style: styles.paramDescRow }, [descRow]),
         ])
       })
       const paramsSection = paramKeys.length

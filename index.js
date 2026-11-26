@@ -452,6 +452,31 @@ function normalizeVars(raw, base = {}) {
   return out
 }
 
+/**
+ * Per-parameter documentation. Params stay a flat name→value dict (the script
+ * reads them as `P["高"]`), so the human-readable meaning lives beside it:
+ * `paramMeta = { "高": { description: "托底到顶面的高度", unit: "mm" } }`.
+ * Entries for parameters that no longer exist are dropped on read, so deleting
+ * a parameter never leaves an orphan explanation behind.
+ */
+function normalizeParamMeta(raw, params = {}) {
+  const out = {}
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return out
+  for (const [k, v] of Object.entries(raw)) {
+    if (!Object.prototype.hasOwnProperty.call(params, k)) continue
+    if (v === null || v === undefined) continue
+    const src = typeof v === 'string' ? { description: v } : (typeof v === 'object' ? v : null)
+    if (!src) continue
+    const row = {}
+    for (const field of ['description', 'unit']) {
+      const text = typeof src[field] === 'string' ? src[field].trim() : ''
+      if (text) row[field] = text.slice(0, 240)
+    }
+    if (Object.keys(row).length) out[k] = row
+  }
+  return out
+}
+
 const EXPR_OK = /^[0-9A-Za-z_+\-*/(). \t]*$/
 
 function evalExpression(src, vars) {
@@ -4615,6 +4640,7 @@ else:
     }
     const doc = JSON.parse(text)
     doc.params = doc.params && typeof doc.params === 'object' ? doc.params : {}
+    doc.paramMeta = normalizeParamMeta(doc.paramMeta, doc.params)
     doc.history = Array.isArray(doc.history) ? doc.history : []
     // Two document shapes share one file format: a Python script with params, or
     // a declarative feature list. Older files predate the field and are scripts.
@@ -5092,6 +5118,7 @@ except Exception:
         from: { type: 'string', description: 'create-only: import an existing STEP/IGES/BREP file as a script model. The generated script binds `scene` to that shape and the path is kept in params.source, so updates and exports keep working; feature-ise it later by rebuilding it as a feature list.' },
         kind: { type: 'string', enum: ['script', 'features'], description: 'script (default): a Python script + params. features: a declarative feature list you can edit one feature at a time (see cad_studio_features).' },
         features: { type: 'array', items: { type: 'object' }, description: 'For kind="features": the initial feature list, each {kind, label?, params?} (flat params such as {kind:"box", size:[60,40,20]} also work).' },
+        paramMeta: { type: 'object', description: 'Optional per-parameter documentation, e.g. {"高": {description: "托底到顶面的高度", unit: "mm"}}. Keys must be existing params; set a key to null to drop it. On update it is merged like params.' },
         params: { type: 'object', description: 'Parameter dict. On update these are merged into the existing params (set a key to null to delete it).' },
         note: { type: 'string', description: 'What this revision changed (kept in history).' },
         to: { type: 'string', description: 'For action=rename / duplicate: the new model name.' },
@@ -5651,6 +5678,7 @@ __out = {"ok": True, "exported": ${JSON.stringify(target)}, "volume": round(scen
           kind: doc.kind,
           folder: doc.folder ?? '',
           params: doc.params,
+          paramMeta: doc.paramMeta ?? {},
           ...(typeof doc.script === 'string' ? { script: doc.script } : {}),
           ...(doc.kind === 'features' ? { features: publicFeatures(doc), graph: graphView(doc, { errors: [], executed: null }), tip: doc.tip ?? null, vars: doc.vars ?? {}, sketches: doc.sketches } : {}),
           runs: doc.run ?? 0,
@@ -5693,6 +5721,7 @@ __out = {"ok": True, "exported": ${JSON.stringify(target)}, "volume": round(scen
           }
           if (!doc.features.length) throw new Error('特征模型至少要有一个 feature，例如 {kind:"box", size:[60,40,20]}')
           doc.folder = normalizeFolder(args.folder ?? '')
+          doc.paramMeta = normalizeParamMeta(args.paramMeta, doc.params)
           const result = await rebuild(doc, dir, { note: args.note ?? 'create' })
           if (result.ok === false) return result
           doc.history.push({ at: doc.updatedAt, note: args.note ?? 'create', params: JSON.parse(JSON.stringify(doc.params)), features: JSON.parse(JSON.stringify(doc.features)), run: doc.run })
@@ -5717,6 +5746,7 @@ __out = {"ok": True, "exported": ${JSON.stringify(target)}, "volume": round(scen
           ...(fromPath ? { imported: fromPath } : {}),
         }
         doc.folder = normalizeFolder(args.folder ?? '')
+        doc.paramMeta = normalizeParamMeta(args.paramMeta, doc.params)
         const result = await rebuild(doc, dir, { note: args.note ?? 'create' })
         if (result.ok === false) return result
         doc.history.push({ at: doc.updatedAt, note: args.note ?? 'create', params: JSON.parse(JSON.stringify(doc.params)), run: doc.run })
@@ -5742,6 +5772,16 @@ __out = {"ok": True, "exported": ${JSON.stringify(target)}, "volume": round(scen
             if (v === null) delete doc.params[k]
             else doc.params[k] = v
           }
+        }
+        if (args.paramMeta && typeof args.paramMeta === 'object') {
+          const merged = { ...(doc.paramMeta ?? {}) }
+          for (const [k, v] of Object.entries(args.paramMeta)) {
+            if (v === null) delete merged[k]
+            else merged[k] = v
+          }
+          doc.paramMeta = normalizeParamMeta(merged, doc.params)
+        } else {
+          doc.paramMeta = normalizeParamMeta(doc.paramMeta, doc.params)
         }
         if (Array.isArray(args.features)) {
           if (doc.kind !== 'features') throw new Error(`${doc.name} 是脚本模型；要换成特征列表请新建一个 kind="features" 的模型`)
@@ -6177,7 +6217,7 @@ __out = {"ok": True, "exported": ${JSON.stringify(target)}, "volume": round(scen
           }
           const candidates = resolved.modelsDir ? [resolved.modelsDir, ...bridge.modelsCandidates()] : bridge.modelsCandidates()
           const modelsDir = candidates.find((d) => existsSync(join(d, `${body.model}.json`))) || candidates[0] || modelsDirFor(undefined)
-          const out = await runDocAction({ action: 'update', name: body.model, params: body.params ?? {}, by: 'panel' }, modelsDir)
+          const out = await runDocAction({ action: 'update', name: body.model, params: body.params ?? {}, paramMeta: body.paramMeta, by: 'panel' }, modelsDir)
           const entry = out && out.sceneId ? bridge.history.find((h) => h.id === out.sceneId) : null
           return send(200, JSON.stringify(entry ? { ...out, at: entry.at } : out))
         } catch (error) {
