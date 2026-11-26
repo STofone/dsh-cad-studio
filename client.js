@@ -2388,7 +2388,7 @@ const FILE_EXTS = ['step', 'stp', 'iges', 'igs', 'brep', 'stl']
         return h('div', {
           key: 'param-tip',
           'data-cad-param-tip': descHover.key,
-          style: { ...styles.paramTip(theme === 'dark'), left, top: descHover.top + 18 },
+          style: { ...styles.paramTip(theme === 'dark'), left, top: descHover.top + 4 },
         }, text)
       })()
       const paramsSection = paramKeys.length
