@@ -2347,7 +2347,9 @@ const FILE_EXTS = ['step', 'stp', 'iges', 'igs', 'brep', 'stl']
               type: 'button',
               style: styles.paramName,
               'data-cad-param-desc': key,
-              title: tipText,
+              // No `title` here: the browser draws its own tooltip on top of ours,
+              // so hovering showed two boxes at once. aria-label keeps it readable.
+              'aria-label': tipText,
               onClick: () => setDescEditing(key),
             }, key)
         return h('div', { key: `p-${key}`, style: styles.paramBlock }, [
