@@ -1383,7 +1383,7 @@ const FILE_EXTS = ['step', 'stp', 'iges', 'igs', 'brep', 'stl']
           if (!res.ok) return scene
           const buf = await res.arrayBuffer()
           const head = new DataView(buf)
-          if (head.getUint32(0, true) !== 0x32435344) return scene // 'DCS2'
+          if (new TextDecoder().decode(new Uint8Array(buf, 0, 4)) !== 'DCS2') return scene
           const headerLen = head.getUint32(4, true)
           const header = JSON.parse(new TextDecoder().decode(new Uint8Array(buf, 8, headerLen)))
           const base = 8 + headerLen
