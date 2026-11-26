@@ -1644,6 +1644,10 @@ endsolid t
   ok('doc: a script model publishes merged faces (not the raw fuse topology)',
     seamCreated.ok === true && seamCreated.faces === 6 && near(seamCreated.volume, 96000, 1),
     JSON.stringify({ faces: seamCreated.faces, v: seamCreated.volume }))
+  const seamExport = await call('cad_studio_export', { model: seamDoc, target: '/tmp/harness_seam_model.step' })
+  ok('export: a document export reports solids/faces/fingerprint as well',
+    seamExport.ok === true && seamExport.faces === 6 && seamExport.fingerprint && seamExport.fingerprint.faces === 6,
+    JSON.stringify({ faces: seamExport.faces, fp: seamExport.fingerprint }))
   await call('cad_studio_doc', { action: 'delete', name: seamDoc })
 
   // ④ env must count what the scene list counts, not what this process happens

@@ -2748,7 +2748,7 @@ else:
         const dir = dirs.find((d) => existsSync(join(d, `${model}.json`))) || dirs[0]
         const doc = await readModel(model, dir)
         bridge.noteModelsDir(dir)
-        const exported = await exportModelStep(doc, target)
+        const exported = await exportModelStep(doc, target, { unify })
         return { ...exported, source: `model:${model}` }
       }
       const src = shapesFrom({ source, code })
@@ -5073,17 +5073,18 @@ except Exception:
       : `${PRELUDE}\nP = ${JSON.stringify(doc.params ?? {})}\n${doc.script}\n`
   }
 
-  async function exportModelStep(doc, target) {
+  async function exportModelStep(doc, target, opts = {}) {
     if (typeof target !== 'string' || !target) throw new Error('export 需要目标路径，例如 /path/model.step')
     await mkdir(dirname(target), { recursive: true })
     const head = doc.kind === 'features'
       ? featuresScript(featureOps(doc), target, { sketches: doc.sketches })
       : `${PRELUDE}\nP = ${JSON.stringify(doc.params ?? {})}\n${doc.script}\n`
+    const unify = opts.unify !== false
     const code = doc.kind === 'features'
       ? head
       : `${head}import os as _os
 _os.makedirs(_os.path.dirname(${JSON.stringify(target)}) or ".", exist_ok=True)
-Part.makeCompound([scene]).exportStep(${JSON.stringify(target)})
+${unify ? 'try:\n    if hasattr(scene, "removeSplitter"):\n        _u = scene.removeSplitter()\n        if _u is not None and len(_u.Solids):\n            scene = _u\nexcept Exception:\n    pass\n' : ''}Part.makeCompound([scene]).exportStep(${JSON.stringify(target)})
 __out = {"ok": True, "exported": ${JSON.stringify(target)}, "volume": round(scene.Volume, 3),
          "bytes": _os.path.getsize(${JSON.stringify(target)})}`
     // publish:false — an export is a product, not a new row in the model list.
@@ -5091,7 +5092,19 @@ __out = {"ok": True, "exported": ${JSON.stringify(target)}, "volume": round(scen
     if (out.ok === false) return { ...out, model: doc.name, path: target }
     let bytes = Number(out.bytes ?? 0)
     try { bytes = (await stat(target)).size } catch {}
-    return { ok: true, model: doc.name, path: target, bytes, valid: bytes > 200, volume: out.volume ?? null }
+    // Read the written file back once: the return has to say what was actually
+    // exported (solids/faces/shells), not what the script intended. Callers used
+    // to have to start a second kernel just to count faces.
+    let geom = null
+    try {
+      const probe = await bridge.run(`${PRELUDE}\n_s = Part.Shape()\n_s.read(${JSON.stringify(target)})\n__out = {"ok": True, "solids": len(_s.Solids), "faces": len(_s.Faces), "shells": len(_s.Shells), "volume": round(_s.Volume, 3)}\n`, { title: 'read back', publish: false })
+      if (probe.ok && Number.isFinite(probe.faces)) geom = probe
+    } catch { /* the export itself succeeded; the readback is extra evidence */ }
+    return {
+      ok: true, model: doc.name, path: target, bytes, valid: bytes > 200,
+      volume: geom?.volume ?? out.volume ?? null,
+      ...(geom ? { solids: geom.solids, faces: geom.faces, shells: geom.shells, fingerprint: { solids: geom.solids, faces: geom.faces, shells: geom.shells, volume: geom.volume } } : {}),
+    }
   }
 
   /** One readable sentence per doc write, e.g. "改参数 高 从 20 到 30". */
