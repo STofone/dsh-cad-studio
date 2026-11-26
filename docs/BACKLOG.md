@@ -32,3 +32,13 @@
 ## 明确不做
 - 旧 op 日志重放导入（静默算错几何的风险不可接受）
 - Path/Fem/Arch/Robot/Ship/Idf/Plot/Raytracing/Web/Points/ReverseEngineering/Inspection/AddonManager/Start/Tux
+
+## 来自 fish-tank 会话（2026-11-26，0.30.0 处理）
+
+- [x] ① 布尔链共面裂面：`unify` 默认开（export + 脚本模型发布都走 `removeSplitter`），回报 `faces`/`shells`/`fingerprint`
+- [x] ② 老装配没有 dep 记录：`cad_studio_deps {action:'rebuild', parts:[…], instances?:[…]}` 补记一次，之后 relink 可用；list 对未追踪记录给 `hint`
+- [x] ③⑨ 场景卡膨胀 / 0 体积幽灵行：`cad_studio_scene` 支持 `ids:[…]` 批量删与 `prune`，list 每行带 `stale`
+- [x] ④ `cad_studio_env` 与场景列表同源（都读 state.json 的 history）
+- [x] ⑤ `cad_studio_doc {action:'create', from:'…/x.step'}` 导入 STEP/IGES/BREP 为脚本模型，`params.source` 记路径
+- [x] ⑥⑦ 几何同一性用 `fingerprint`（体积+面数+实体数+壳数），不用 md5
+- [x] ⑧ `cad_studio_doc list` 对 features 模型回落场景行取 `triangles`

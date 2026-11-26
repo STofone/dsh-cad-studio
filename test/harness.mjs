@@ -1615,7 +1615,79 @@ endsolid t
     panelAgain.ok === true && near(panelAgain.volume, 48000, 1), JSON.stringify({ ok: panelAgain.ok, v: panelAgain.volume }))
 }
 
-// ---- 8. teardown --------------------------------------------------------
+// ---- 8. fish-tank feedback (2026-11-26) ----------------------------------
+{
+  // ① A fuse chain leaves coplanar seams: same volume, 3-6x the faces and bytes.
+  //    export now merges them by default and reports the numbers either way.
+  const seam = [
+    'import Part',
+    'a = Part.makeBox(60,40,20)',
+    'b = Part.makeBox(60,40,20); b.translate(Vector(60,0,0))',
+    'scene = a.fuse(b)',
+  ].join('\n')
+  const raw = await call('cad_studio_export', { code: seam, target: '/tmp/harness_seam_raw.step', unify: false })
+  const uni = await call('cad_studio_export', { code: seam, target: '/tmp/harness_seam_uni.step' })
+  ok('export: unify merges coplanar seams', uni.ok === true && raw.ok === true && uni.faces < raw.faces,
+    JSON.stringify({ raw: raw.faces, uni: uni.faces }))
+  ok('export: volume is identical, so faces are the only tell',
+    near(raw.volume, uni.volume, 0.001) && near(uni.volume, 96000, 1), JSON.stringify({ raw: raw.volume, uni: uni.volume }))
+  ok('export: unify also shrinks the file', uni.bytes < raw.bytes, JSON.stringify({ raw: raw.bytes, uni: uni.bytes }))
+  ok('export: reports faces/shells and a geometry fingerprint',
+    uni.solids === 1 && uni.faces > 0 && uni.shells > 0 && uni.fingerprint && uni.fingerprint.faces === uni.faces &&
+      uni.fingerprint.solids === uni.solids && near(uni.fingerprint.volume, uni.volume, 0.001),
+    JSON.stringify(uni.fingerprint))
+
+  // ① doc side: a script model publishes merged topology too, and reports it.
+  const seamDoc = 'harness_裂面'
+  const seamScript = ['import Part','a = Part.makeBox(60,40,20)','b = Part.makeBox(60,40,20); b.translate(Vector(60,0,0))','scene = a.fuse(b)'].join('\n')
+  const seamCreated = await call('cad_studio_doc', { action: 'create', name: seamDoc, script: seamScript })
+  ok('doc: a script model publishes merged faces (not the raw fuse topology)',
+    seamCreated.ok === true && seamCreated.faces === 6 && near(seamCreated.volume, 96000, 1),
+    JSON.stringify({ faces: seamCreated.faces, v: seamCreated.volume }))
+  await call('cad_studio_doc', { action: 'delete', name: seamDoc })
+
+  // ④ env must count what the scene list counts, not what this process happens
+  //    to hold in memory (0 after a restart).
+  const envNow = await call('cad_studio_env')
+  const listNow = await call('cad_studio_scene', { action: 'list' })
+  ok('env: scenes/latest agree with the scene list',
+    envNow.scenes === listNow.scenes && envNow.latest === (listNow.latest || ''),
+    JSON.stringify({ env: envNow.scenes, list: listNow.scenes, envLatest: envNow.latest, listLatest: listNow.latest }))
+  ok('scene: list flags 0-geometry shells as stale', Array.isArray(listNow.stale), JSON.stringify(listNow.stale))
+
+  // ⑨ A refit leaves a dozen rows; deleting them one call at a time is the bug.
+  const p1 = await call('cad_studio_run', { code: 'scene = Part.makeBox(10,10,10)', title: 'harness-probe-a' })
+  const p2 = await call('cad_studio_run', { code: 'scene = Part.makeBox(10,10,12)', title: 'harness-probe-b' })
+  const batch = await call('cad_studio_scene', { action: 'delete', ids: [p1.sceneId, p2.sceneId] })
+  ok('scene: ids deletes several rows in one call', batch.ok === true && batch.removed.length === 2,
+    JSON.stringify({ removed: batch.removed, failed: batch.failed }))
+
+  // ⑤ A STEP on disk could not become a document; now it can, and the path is
+  //    kept in params so updates/exports keep working.
+  await call('cad_studio_export', { code: 'import Part\nscene = Part.makeBox(30,20,10)', target: '/tmp/harness_import.step' })
+  const imported = await call('cad_studio_doc', { action: 'create', name: 'harness_导入件', from: '/tmp/harness_import.step' })
+  ok('doc: create from a STEP file builds an import document',
+    imported.ok === true && near(imported.volume, 6000, 1), JSON.stringify({ ok: imported.ok, v: imported.volume }))
+  const impShown = await call('cad_studio_doc', { action: 'show', name: 'harness_导入件' })
+  ok('doc: the import keeps its source path in params',
+    impShown.ok === true && impShown.params && impShown.params.source === '/tmp/harness_import.step',
+    JSON.stringify(impShown.params))
+  const missingFrom = await call('cad_studio_doc', { action: 'create', name: 'harness_缺文件', from: '/tmp/definitely-not-here.step' })
+  ok('doc: a missing import source is refused', missingFrom.ok === false && /找不到要导入的文件/.test(String(missingFrom.error)),
+    JSON.stringify(missingFrom.error))
+  await call('cad_studio_doc', { action: 'delete', name: 'harness_导入件' })
+
+  // ⑧ A features document used to report triangles:null in the model list.
+  const feat = 'harness_面数'
+  await call('cad_studio_doc', { action: 'create', name: feat, kind: 'features', features: [{ kind: 'box', size: [20, 20, 20] }] })
+  const featList = await call('cad_studio_doc', { action: 'list' })
+  const featRow = (featList.items || []).find((r) => r.name === feat)
+  ok('doc: list reports triangles for a features model (falls back to its scene row)',
+    Boolean(featRow) && typeof featRow.triangles === 'number' && featRow.triangles > 0, JSON.stringify(featRow))
+  await call('cad_studio_doc', { action: 'delete', name: feat })
+}
+
+// ---- 9. teardown --------------------------------------------------------
 for (const d of disposed.reverse()) { try { d() } catch (e) { console.log('  [dispose warn]', e.message) } }
 ok('all tools unregistered on dispose', tools.size === 0, [...tools.keys()].join(','))
 

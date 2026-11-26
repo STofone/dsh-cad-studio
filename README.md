@@ -18,10 +18,10 @@ DeepSeek Harness 的 CAD 插件：**把 FreeCAD 桥接成给 AI 用的工具**�
 | 运动 | `cad_studio_joint`（revolute/linear）+ `cad_studio_drive` + `cad_studio_explode`，面板拖滑杆看运动 |
 | 出图 | `cad_studio_drawing` HLR → SVG（主/俯/左/等轴）；`cad_studio_sheet` 正式图纸（图框 + 标题栏 + 三视图 + 尺寸，A4/A3/A2，可出 DXF） |
 | 装配 | `cad_studio_assembly` 多零件实例、`cad_studio_joint` 关节、`cad_studio_mate` 约束（同心/贴合/距离）、`cad_studio_drive` 驱动、`cad_studio_explode` 爆炸图 |
-| 依赖 | `cad_studio_deps` 列出模型的来源 STEP（谁在用、还在不在），`relink` 换路径后原地重建；面板「信息」里能直接填新路径 |
+| 依赖 | `cad_studio_deps` 列出模型的来源 STEP（谁在用、还在不在），`relink` 换路径后原地重建、`rebuild` 给 0.24 之前建的老装配补一次源文件清单；面板「信息」里能直接填新路径 |
 | 外观 | 面板里改的颜色/显隐/透明度/线框按模型保存（`POST /cad-studio/appearance`），刷新和重启后仍在 |
-| 其它 | `cad_studio_open`（STEP/STL/BREP/IGES 进来看）、`cad_studio_export`、`cad_studio_measure`、`cad_studio_env` |
-| 模型清单 | `cad_studio_scene`（`action: list / delete / rename`）——面板里那条列表就是它；探查脚本留下的卡片可以直接删 |
+| 其它 | `cad_studio_open`（STEP/STL/BREP/IGES 进来看）、`cad_studio_export`、`cad_studio_measure`、`cad_studio_env`；`cad_studio_doc {action:"create", from:"…/x.step"}` 把已有 STEP 变成可编辑模型文档 |
+| 模型清单 | `cad_studio_scene`（`action: list / delete / rename / prune`，`ids:[…]` 一次删多行）——面板里那条列表就是它；0 体积 0 三角的幽灵行会被标 `stale`，`prune` 一次清掉 |
 | 模型改名 / 复制 | `cad_studio_doc {action:"rename", name, to}` 与 `{action:"duplicate", name, to}`：改名会同步列表里的标题与 `docKey`，复制会得到一条独立的新场景（副本不继承运行历史与撤销栈）；两者都可 `cad_studio_undo` 回退 |
 | 几何自检 | `cad_studio_check {source}` 在导出/打印前问一次：是否有效实体、外壳是否闭合、每个实体体积多少，返回中文问题清单（零体积 / 外壳未闭合 / 几何无效 / 没有实体） |
 | 拔模挤出 | `{kind:"extrude", sketch:"S1", h:20, draft:3}` 按 3° 拔模：截面按 `h*tan(3°)` 偏移后 loft 成体，正角度内收、负角度外放 |
@@ -100,6 +100,7 @@ npm 包：<https://www.npmjs.com/package/dsh-cad-studio>（`dsh plugin` / DSH �
 - **导出只走 `cad_studio_export`**。在 `cad_studio_run` 里直接 `Part.export([compound], path)` 会写出一个 1.6 KB 的 STEP 壳子，读回来是空形状，而脚本本身不报错。要么用 `cad_studio_export`，要么给 `cad_studio_run` 传 `check: ["/path/out.step"]`——它会在跑完后把这个文件读回来，回报 `{bytes, solids, volume, valid}`，壳子会显示 `valid:false`。
 - **探查脚本别发布场景**。`cad_studio_run` 默认会把绑定的 `scene` 发布成面板里的一行；只是量体积/查干涉的脚本传 `publish: false`，否则模型列表会被探针卡片塞满（实测一次会话攒到 28 行）。已经混进去的用 `cad_studio_scene {action:"delete", id:"scene-12"}` 清。
 - `cad_studio_export` 的返回里 `volume` / `solids` 是**真正写出去的那一套**，`sourceVolume` / `sourceSolids` 是输入侧的；`minVolume` 会按实体体积过滤（滤掉圆丝、灰尘），`alsoStl` 顺手写一份 STL。
+- **布尔链会留共面裂面，`unify` 默认开**：逐次 `fuse`/`cut` 之后同一平面会留一圈缝，体积不变但面数与文件变大（实测托架 174→64 面、STEP 607 KB→274 KB）。`cad_studio_export` 写文件前对每个实体 `removeSplitter()`，传 `unify:false` 可保留原始拓扑；返回里的 `faces` / `shells` / `fingerprint: {solids, faces, shells, volume}` 就是用来核几何的——**别用 md5**，STEP 头带时间戳，同一件两次导出 md5 也不同。
 - `cad_studio_assembly` 传 `measure: true` 会回每实例的 bbox/体积/实体数与总体积，`interference: true` 会回真正重叠的实例对（先用包围盒筛，再做布尔交）。
 - **`fuse` / `cut` / `common` 的 `with` 可以是数组**：U 形围壁写成「一条 `fuse` 外块 + 一条 `cut` 带两个内腔」即可，不必拆成中间状态（中间状态是实心块，顺序错了会削到别处）。
 - **`extrude` 支持 3D 剖面点与 `dir`**：三角棱柱写 `{kind:"extrude", points:[[0,0,0],[40,0,0],[0,30,0]], dir:[0,0,20]}`，不用再拿 `base`/`h` 手算覆盖范围。

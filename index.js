@@ -19,7 +19,7 @@ import crypto from 'node:crypto'
 import { mkdtemp, mkdir, readdir, readFile, rm, stat, unlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { fileURLToPath } from 'node:url'
-import { dirname, join } from 'node:path'
+import { dirname, join, resolve } from 'node:path'
 
 export const name = 'dsh-cad-studio'
 
@@ -2273,7 +2273,15 @@ __out = {
       schema: { type: 'object', properties: { available: { type: 'boolean' }, binary: { type: 'string' }, scenes: { type: 'number' }, latest: { type: 'string' } } },
       render: (_args, value) => [{ type: 'text', text: JSON.stringify(value, null, 2) }],
     },
-    execute: async () => bridge.status(),
+    execute: async () => {
+      // The count must come from the same place the panel's list comes from:
+      // `status().scenes` is only what this process published since boot, which
+      // is 0 after a restart while state.json still lists every row.
+      await bridge.hydrateHistory()
+      const rows = bridge.listSceneRows()
+      const base = bridge.status()
+      return { ...base, scenes: rows.length, latest: (bridge.latest && bridge.latest.id) || (rows[0] && rows[0].id) || '' }
+    },
   })
 
   tool({
@@ -2398,8 +2406,9 @@ __out = {
     parameters: {
       type: 'object',
       properties: {
-        action: { type: 'string', enum: ['list', 'delete', 'rename'], description: 'list (default) / delete / rename.' },
+        action: { type: 'string', enum: ['list', 'delete', 'rename', 'prune'], description: 'list (default) / delete / rename / prune (drop every row with no geometry).' },
         id: { type: 'string', description: 'Scene id, e.g. scene-12. Required for delete and rename.' },
+        ids: { type: 'array', items: { type: 'string' }, description: 'Delete several rows at once (a refit can leave a dozen); same as calling delete once per id.' },
         title: { type: 'string', description: 'New title (rename only).' },
       },
       additionalProperties: false,
@@ -2408,16 +2417,39 @@ __out = {
       schema: { type: 'object', properties: { ok: { type: 'boolean' }, scenes: { type: 'number' } } },
       render: (_args, value) => [{ type: 'text', text: JSON.stringify(value, null, 2) }],
     },
-    execute: async ({ action, id, title }) => {
+    execute: async ({ action, id, title, ids }) => {
       const kind = String(action ?? 'list')
       // A fresh process starts with an empty in-memory list; the rows live in
       // state.json until the next publish hydrates them.
       await bridge.hydrateHistory()
       if (kind === 'list') {
-        const rows = bridge.listSceneRows()
-        return { ok: true, scenes: rows.length, latest: bridge.latest ? bridge.latest.id : '', items: rows }
+        const rows = bridge.listSceneRows().map((r) => ({
+          ...r,
+          // A row with no triangles and no volume is a shell: it cannot be opened,
+          // has nothing to relink, and only clutters the panel's model list.
+          stale: (r.triangles ?? 0) === 0 && (r.volume ?? 0) === 0,
+        }))
+        return { ok: true, scenes: rows.length, latest: bridge.latest ? bridge.latest.id : '', stale: rows.filter((r) => r.stale).map((r) => r.id), items: rows }
       }
-      if (kind === 'delete') return bridge.removeScene(id)
+      if (kind === 'delete') {
+        // One id keeps the old return shape ({removed: 'scene-3'}) so existing
+        // callers and scripts do not have to learn a new one.
+        if (!Array.isArray(ids) || !ids.length) return bridge.removeScene(id)
+        const list = ids.map(String)
+        const removed = []
+        const failed = []
+        for (const key of list) {
+          if (!key) continue
+          try { await bridge.removeScene(key); removed.push(key) } catch (err) { failed.push({ id: key, error: String(err?.message ?? err) }) }
+        }
+        return { ok: failed.length === 0, removed, failed, scenes: bridge.history.length, latest: bridge.latest ? bridge.latest.id : '' }
+      }
+      if (kind === 'prune') {
+        const doomed = bridge.listSceneRows().filter((r) => (r.triangles ?? 0) === 0 && (r.volume ?? 0) === 0).map((r) => r.id)
+        const removed = []
+        for (const key of doomed) { try { await bridge.removeScene(key); removed.push(key) } catch { /* keep going: one bad row must not block the rest */ } }
+        return { ok: true, removed, scenes: bridge.history.length, latest: bridge.latest ? bridge.latest.id : '' }
+      }
       if (kind === 'rename') return bridge.renameScene(id, title)
       return { ok: false, error: `不支持的 action：${kind}（list / delete / rename）` }
     },
@@ -2604,6 +2636,9 @@ if not _shapes:
   const writeShapeFile = (target, src, opts = {}) => {
     const minVolume = Number.isFinite(opts.minVolume) && opts.minVolume > 0 ? Number(opts.minVolume) : 0
     const alsoStl = Boolean(opts.alsoStl)
+    // Coplanar seams survive a chain of fuse/cut: the solid is right, the face
+    // count (and the STEP size) is 3-6x too big. removeSplitter merges them.
+    const unify = opts.unify !== false
     const py = `${PRELUDE}
 ${src}
 if not _shapes:
@@ -2619,10 +2654,19 @@ else:
     for _s in _shapes:
         _solids.extend(list(_s.Solids) or [_s])
     _minv = ${minVolume}
+    _UNIFY = ${unify ? 'True' : 'False'}
     _kept = [x for x in _solids if x.Volume >= _minv] if _minv > 0 else _solids
     if not _kept:
         raise RuntimeError("no solids left after minVolume=%.3f (smallest %.3f)" % (_minv, min((x.Volume for x in _solids), default=0.0)))
     _shapes = _kept
+    if _UNIFY:
+        _unified = []
+        for _s in _shapes:
+            try:
+                _unified.append(_s.removeSplitter() if hasattr(_s, "removeSplitter") else _s)
+            except Exception:
+                _unified.append(_s)
+        _shapes = _unified
     if _fmt in ("step", "stp"):
         # Part.export([shape]) writes a 1.6 KB STEP that reads back as a NULL shape;
         # Shape.exportStep / compound exportStep is the API that produces a valid file.
@@ -2663,7 +2707,13 @@ else:
     __out = {"ok": True, "path": _target, "format": _fmt, "bytes": os.path.getsize(_target),
              "solids": len(_shapes), "volume": round(sum(float(x.Volume) for x in _shapes), 3),
              "sourceSolids": len(_solids), "sourceVolume": round(sum(float(x.Volume) for x in _solids), 3),
-             "filtered": len(_solids) - len(_shapes)}
+             "filtered": len(_solids) - len(_shapes),
+             "faces": sum(len(x.Faces) for x in _shapes),
+             "shells": sum(len(x.Shells) for x in _shapes)}
+    # A geometry fingerprint: identical bytes are not identical geometry (the STEP
+    # header carries a timestamp), so compare these four numbers instead of md5.
+    __out["fingerprint"] = {"solids": __out["solids"], "faces": __out["faces"],
+                            "shells": __out["shells"], "volume": __out["volume"]}
     if _stl:
         __out["stl"] = {"path": _stl, "bytes": os.path.getsize(_stl)}
 `
@@ -2682,6 +2732,7 @@ else:
         model: { type: 'string', description: 'Export a saved model document by name (feature or script model) instead of a file or a script.' },
         minVolume: { type: 'number', description: 'Drop solids smaller than this (mm³). Use it to keep round wires and dust out of a print file; the return says how many were filtered.' },
         alsoStl: { type: 'boolean', description: 'Also write an STL next to the target (a light file for viewers that do not read STEP).' },
+        unify: { type: 'boolean', description: 'Merge coplanar seams left by fuse/cut before writing (default true). A boolean chain can leave 174 faces where 64 is right; volume is identical either way, so only faces/bytes show it. Pass false to keep the raw topology.' },
       },
       required: ['target'],
       additionalProperties: false,
@@ -2690,7 +2741,7 @@ else:
       schema: { type: 'object', properties: { ok: { type: 'boolean' }, path: { type: 'string' }, bytes: { type: 'number' } } },
       render: (_a, v) => [{ type: 'text', text: JSON.stringify(v, null, 2) }],
     },
-    execute: async ({ target, source, code, model, minVolume, alsoStl }) => {
+    execute: async ({ target, source, code, model, minVolume, alsoStl, unify }) => {
       if (!target || extOf(target) === '') return { ok: false, error: 'target must be an absolute path with an extension' }
       if (typeof model === 'string' && model) {
         const dirs = bridge.modelsCandidates()
@@ -2702,7 +2753,7 @@ else:
       }
       const src = shapesFrom({ source, code })
       if (!src) return { ok: false, error: 'pass either source (a model file) or code (FreeCAD Python)' }
-      const out = await writeShapeFile(target, src, { minVolume, alsoStl })
+      const out = await writeShapeFile(target, src, { minVolume, alsoStl, unify })
       // Keep the two numbers apart on purpose: `volume` is what was written,
       // `sourceVolume` is what the input held. Mixing them is how a batch export
       // gets mistaken for the part it produced.
@@ -3857,10 +3908,12 @@ else:
     parameters: {
       type: 'object',
       properties: {
-        action: { type: 'string', enum: ['list', 'relink'], description: 'Default: list.' },
+        action: { type: 'string', enum: ['list', 'relink', 'rebuild'], description: 'Default: list.' },
         assembly: { type: 'string', description: 'Assembly id (asm-1) or unique title. Omitted: every assembly for `list`, newest for `relink`.' },
         part: { type: 'string', description: 'Part name to repoint (relink).' },
         path: { type: 'string', description: 'New file path for that part (relink).' },
+        parts: { type: 'array', items: { type: 'object' }, description: 'rebuild: the source list to record, [{name, path}] — assemblies built before 0.24 have no spec, and their source files cannot be inferred, so they have to be stated once.' },
+        instances: { type: 'array', items: { type: 'object' }, description: 'rebuild: optional placement list [{name, part, at, rot}]; omitted keeps the ones already on the record.' },
       },
       additionalProperties: false,
     },
@@ -3868,7 +3921,7 @@ else:
       schema: { type: 'object', properties: { ok: { type: 'boolean' }, models: { type: 'array' }, missing: { type: 'number' } } },
       render: (_a, v) => [{ type: 'text', text: JSON.stringify(v, null, 2) }],
     },
-    execute: async ({ action, assembly, part, path }) => {
+    execute: async ({ action, assembly, part, path, parts, instances }) => {
       const mode = action ?? 'list'
       if (mode === 'list') {
         if (!assembly) await bridge.hydrateAssemblies()
@@ -3885,10 +3938,35 @@ else:
             tracked: Boolean(r.spec),
             files,
             missingParts: files.filter((f) => !f.exists).map((f) => f.part),
+            // An assembly built before sources were recorded cannot relink: the
+            // part files are unknown, not missing. Say so instead of an empty list.
+            ...(r.spec ? {} : { hint: '这个装配没有记录来源文件（0.24 之前建的）。用 action=rebuild 并给 parts:[{name,path}] 记一次，之后 relink 就能用。' }),
           }
         })
         const missing = models.reduce((n, m) => n + m.missingParts.length, 0)
         return { ok: true, models, missing }
+      }
+      if (mode === 'rebuild') {
+        let record
+        try { record = findAssembly(assembly) } catch (error) { return { ok: false, error: String(error?.message ?? error) } }
+        if (!Array.isArray(parts) || !parts.length) return { ok: false, error: 'rebuild 需要 parts:[{name,path}]（这个装配的源文件清单）' }
+        const spec = parts.map((raw) => {
+          const name = String(raw?.name ?? '').trim()
+          const file = String(raw?.path ?? '').trim()
+          if (!name) throw new Error('parts 里每一项都要有 name')
+          if (!file || !existsSync(file)) throw new Error(`零件 ${name} 的文件不存在：${file || '(空)'}`)
+          return { name, path: file, ...(raw.color !== undefined ? { color: raw.color } : {}) }
+        })
+        const placed = Array.isArray(instances) && instances.length ? instances : (record.spec?.instances ?? [])
+        if (!placed.length) return { ok: false, error: 'rebuild 还需要 instances（或先有一次用 cad_studio_assembly 建的实例布局）' }
+        const out = await bridge.run(assemblyScript(spec, placed, '', false, false), { title: record.title, docKey: `asm:${record.id}` })
+        if (!out.ok || !out.sceneId) return { ok: false, error: out.error ?? '重新读取文件失败', stderr: out.stderr ?? '' }
+        const scene = bridge.scenes.get(out.sceneId)
+        if (!scene) return { ok: false, error: '重新读取后没有拿到场景' }
+        record.spec = { parts: spec, instances: placed }
+        bridge.rebaseAssembly(record, { title: record.title, sceneId: out.sceneId, scene })
+        const published = await bridge.republishAssembly(record)
+        return { ok: true, assembly: record.id, sceneId: published.id, tracked: true, files: specRows(record).length, instances: placed.length }
       }
       return relinkPart({ assembly, part, path })
     },
@@ -4511,9 +4589,31 @@ else:
         }
       }
     }
+    // A fuse/cut chain leaves coplanar seams: the volume is right, the face count
+    // and the STEP size are not. Feature chains are emitted clean, script models
+    // are not, so only they get the tail (doc.unify === false opts out).
+    const unifyTail = doc.unify === false ? '' : `
+try:
+    _sc = globals().get("scene")
+    if _sc is not None and hasattr(_sc, "removeSplitter"):
+        _u = _sc.removeSplitter()
+        if _u is not None and hasattr(_u, "Solids") and len(_u.Solids):
+            scene = _u
+except Exception:
+    pass
+try:
+    if globals().get("scene") is not None:
+        _o = globals().get("__out")
+        if not isinstance(_o, dict):
+            _o = {}
+            __out = _o
+        _o["faces"] = len(globals()["scene"].Faces)
+except Exception:
+    pass
+`
     const code = isFeatures
       ? featuresScript(featureOps(doc), null, { cache, resume, sketches: doc.sketches })
-      : `${PRELUDE}\nP = ${JSON.stringify(doc.params ?? {})}\n${doc.script}`
+      : `${PRELUDE}\nP = ${JSON.stringify(doc.params ?? {})}\n${doc.script}\n${unifyTail}`
     const meta = isFeatures ? { model: doc.name, features: publicFeatures(doc), sketches: doc.sketches ?? {}, tip: doc.tip ?? null } : { model: doc.name, params: doc.params ?? {} }
     doc.run = (doc.run ?? 0) + 1
     doc.updatedAt = new Date().toISOString()
@@ -4532,6 +4632,7 @@ else:
     doc.stats = {
       volume: out.volume ?? null,
       triangles: row?.triangles ?? null,
+      faces: Number.isFinite(out.faces) ? out.faces : null,
       bounds: out.bounds ?? null,
       sceneId,
       at: doc.updatedAt,
@@ -4567,6 +4668,7 @@ else:
       params: doc.params,
       volume: doc.stats.volume,
       triangles: doc.stats.triangles,
+      faces: doc.stats.faces ?? null,
       sceneId: doc.stats.sceneId,
       published: Boolean(doc.stats.sceneId),
       updatedAt: doc.updatedAt,
@@ -4581,7 +4683,8 @@ else:
       properties: {
         action: { type: 'string', enum: ['list', 'show', 'create', 'update', 'revert', 'delete', 'rename', 'duplicate'], description: 'list / show / create / update / revert / delete / rename / duplicate' },
         name: { type: 'string', description: 'Model name (中英文/数字/下划线/连字符).' },
-        script: { type: 'string', description: 'FreeCAD Python source; reads params from `P`, binds the result to `scene`. Required for create unless kind is "features".' },
+        script: { type: 'string', description: 'FreeCAD Python source; reads params from `P`, binds the result to `scene`. Required for create unless kind is "features" or `from` is given.' },
+        from: { type: 'string', description: 'create-only: import an existing STEP/IGES/BREP file as a script model. The generated script binds `scene` to that shape and the path is kept in params.source, so updates and exports keep working; feature-ise it later by rebuilding it as a feature list.' },
         kind: { type: 'string', enum: ['script', 'features'], description: 'script (default): a Python script + params. features: a declarative feature list you can edit one feature at a time (see cad_studio_features).' },
         features: { type: 'array', items: { type: 'object' }, description: 'For kind="features": the initial feature list, each {kind, label?, params?} (flat params such as {kind:"box", size:[60,40,20]} also work).' },
         params: { type: 'object', description: 'Parameter dict. On update these are merged into the existing params (set a key to null to delete it).' },
@@ -5019,7 +5122,15 @@ __out = {"ok": True, "exported": ${JSON.stringify(target)}, "volume": round(scen
         for (const n of names) {
           try {
             const doc = await readModel(n, dir)
-            models.push({ name: doc.name, kind: doc.kind, features: doc.features.length, params: doc.params, runs: doc.run ?? 0, updatedAt: doc.updatedAt ?? '', volume: doc.stats?.volume ?? null, triangles: doc.stats?.triangles ?? null })
+            const row = bridge.history.find((h) => h.docKey === `model:${doc.name}` || h.title === doc.name)
+            models.push({
+              name: doc.name, kind: doc.kind, features: doc.features.length, params: doc.params, runs: doc.run ?? 0,
+              updatedAt: doc.updatedAt ?? '',
+              // A features document records volume/faces at publish time but not the
+              // triangle count; the scene row that publish created does have it.
+              volume: doc.stats?.volume ?? row?.volume ?? null,
+              triangles: doc.stats?.triangles ?? row?.triangles ?? null,
+            })
           } catch { /* a hand-edited file that no longer parses is skipped, not fatal */ }
         }
         models.sort((a, b) => String(b.updatedAt).localeCompare(String(a.updatedAt)))
@@ -5045,9 +5156,11 @@ __out = {"ok": True, "exported": ${JSON.stringify(target)}, "volume": round(scen
       if (action === 'create') {
         const key = checkName(args.name)
         const wantFeatures = args.kind === 'features' || Array.isArray(args.features)
-        if (!wantFeatures && (typeof args.script !== 'string' || !args.script.trim())) {
-          throw new Error('create 需要 script（FreeCAD Python，读 P、写 scene），或用 kind="features" 建特征列表模型')
+        const fromPath = typeof args.from === 'string' && args.from.trim() ? resolve(args.from) : ''
+        if (!wantFeatures && !fromPath && (typeof args.script !== 'string' || !args.script.trim())) {
+          throw new Error('create 需要 script（FreeCAD Python，读 P、写 scene）、from（导入 STEP/IGES/BREP），或用 kind="features" 建特征列表模型')
         }
+        if (fromPath && !existsSync(fromPath)) throw new Error(`找不到要导入的文件：${fromPath}`)
         try {
           await readModel(key, dir)
           throw new Error(`模型已存在：${key}（要改的话用 action=update）`)
@@ -5080,14 +5193,20 @@ __out = {"ok": True, "exported": ${JSON.stringify(target)}, "volume": round(scen
           await journalDocCreate(key, dir, result)
           return await withChanges(doc, by, { ...result, kind: 'features', features: publicFeatures(doc) }, dir)
         }
+        // `from` turns a file into a document instead of a one-shot scene: the
+        // shape is re-read on every rebuild, so params/notes/undo still apply and
+        // a later feature rebuild can replace the import step.
         const doc = {
           name: key,
           kind: 'script',
-          script: args.script,
-          params: args.params && typeof args.params === 'object' ? args.params : {},
+          script: fromPath
+            ? ['import Part', '_shape = Part.Shape()', '_shape.read(P["source"])', 'scene = _shape'].join('\n')
+            : args.script,
+          params: { ...(fromPath ? { source: fromPath } : {}), ...(args.params && typeof args.params === 'object' ? args.params : {}) },
           run: 0,
           createdAt: new Date().toISOString(),
           history: [],
+          ...(fromPath ? { imported: fromPath } : {}),
         }
         const result = await rebuild(doc, dir, { note: args.note ?? 'create' })
         if (result.ok === false) return result
