@@ -840,10 +840,14 @@ class FreeCadBridge {
     // Whatever an earlier process registered stays registered.
     let prevAssemblies = []
     let prevAppearances = {}
+    let prevHistory = []
+    let prevLatest = null
     try {
       const prev = JSON.parse(await readFile(join(dir, 'state.json'), 'utf8'))
       prevAssemblies = Array.isArray(prev.assemblies) ? prev.assemblies : []
       if (prev.appearances && typeof prev.appearances === 'object') prevAppearances = prev.appearances
+      prevHistory = Array.isArray(prev.history) ? prev.history : []
+      prevLatest = prev.latest ?? null
     } catch {}
     // Keep new ids clear of the ones already in use.
     for (const rec of this.assembleRecords(prevAssemblies).values()) {
@@ -858,7 +862,15 @@ class FreeCadBridge {
       const prev = JSON.parse(await readFile(join(dir, 'state.json'), 'utf8'))
       diskIds = new Set((Array.isArray(prev.history) ? prev.history : []).map((h) => h.id))
     } catch {}
-    if (diskIds) {
+    // A process that only knows the one scene it just published must not wipe
+    // the rows it never loaded: an empty in-memory history is "I don't know",
+    // not "they were deleted". A real prune leaves the rows in memory, so the
+    // disk-id filter below still catches it.
+    if (!this.history.length && prevHistory.length) {
+      this.history = prevHistory.slice()
+      if (!this.latest && prevLatest) this.latest = { ...prevLatest, scene: this.scenes.get(prevLatest.id) ?? null }
+    }
+    if (diskIds && this.history.length) {
       this.history = this.history.filter((h) => diskIds.has(h.id) || this.touched.has(h.id))
       if (this.latest && !this.history.some((h) => h.id === this.latest.id)) {
         const next = this.history[0]
