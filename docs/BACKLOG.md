@@ -49,3 +49,9 @@
 - [x] ⑤ `cad_studio_doc {action:'create', from:'…/x.step'}` 导入 STEP/IGES/BREP 为脚本模型，`params.source` 记路径
 - [x] ⑥⑦ 几何同一性用 `fingerprint`（体积+面数+实体数+壳数），不用 md5
 - [x] ⑧ `cad_studio_doc list` 对 features 模型回落场景行取 `triangles`
+
+## 借鉴上游 dsh-cad v0.18（2026-11-26）
+
+- [x] **二进制场景传输**（0.33.0/0.33.1，`docs/DESIGN-SCENE-BINARY.md`；鱼缸总体 412 KB → 94.5 KB，gzip 11.25×）
+- [x] **网盘式文档视图**（0.34.0：`cad_studio_folder`、`/docs`、`/docs/move`、`/import`，面板「模型」抽屉变成文件夹树）
+- [ ] **多格式导入**：STEP/IGES/BREP 已支持（`Part.Shape().read`）。STL 走不通——0.20 的 `Import.insert` 对 STL 报 `no supported file format`，且 `MeshPart` 没有 `meshToShape`（实测 AttributeError），要做得先解决「三角网格→实体」，暂缓；OBJ 同理。DXF 可后续用 `importDXF` 读线框再拉成面。

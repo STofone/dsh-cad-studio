@@ -251,6 +251,15 @@ MIT
 里，每个节点带 `dependsOn / dependents / anchored`：特征是顺序求值链（`f3` 依赖 `f2`），
 `anchored: true` 表示它还跟着某个面走。这是如实的表示——我们不假装有一个比实际更复杂的图。
 
+## 模型文档的「网盘」视图（0.34.0）
+
+模型不再是一个平铺列表：`cad_studio_folder` 与面板「模型」抽屉把文档组织成文件夹（路径就是名字，如 `鱼缸/背滤`），`cad_studio_doc {action:"move", folder:"…"}` 移动。要点：
+
+- **移动只改元数据**：模型文件、历史、场景指针都不动，所以移动永远不会破坏一个模型或它的撤销栈；存储仍是平铺的（文件夹不是目录），改名/移动不产生文件搬移。
+- **一条读接口**：`GET /cad-studio/docs` 一次返回 `{folders, docs:[{name, folder, kind, features, volume, triangles, sceneId, updatedAt}]}`，面板画树、agent 列清单都用它。
+- **导入**：`POST /cad-studio/import {path, name?, folder?}` 与 `cad_studio_doc {action:"create", from:"…/x.step"}` 同一条路径，导入后 `params.source` 记住来源，后续 update/export 照常。
+- **删文件夹**必须先清空（拒绝时列出里面还剩哪些模型），免得一个误删带走一批文档。
+
 ## 场景几何的二进制传输（0.33.0）
 
 场景 JSON 现在只放元数据，网格放在同名的 `.dcs` 伴随文件里：
