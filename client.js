@@ -1926,6 +1926,46 @@ const FILE_EXTS = ['step', 'stp', 'iges', 'igs', 'brep', 'stl']
         } catch {}
         loadChanges()
       }
+      // The build does not watch files unless the model opted into follow: the
+      // panel polls while the drawer is open so "某件被改了" is visible without a
+      // tool call, and the person decides when to rebuild.
+      useEffect(() => {
+        if (panel !== 'info') return undefined
+        const timer = setInterval(() => { loadDeps() }, 5000)
+        return () => clearInterval(timer)
+      }, [panel, payload && payload.docKey])
+      const doRebuildDeps = async (assembly) => {
+        setRelinkNote('重新读取部件并重建…')
+        try {
+          const res = await fetch(`${ROUTE}/drift`, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ assembly, action: 'rebuild' }),
+          })
+          const out = await res.json()
+          if (!out || out.ok === false) return setRelinkNote(String((out && out.error) || `HTTP ${res.status}`))
+          setRelinkNote('已按磁盘上的部件重建')
+          await loadDeps()
+          if (out.sceneId) await applyScene(out.sceneId, out.at)
+        } catch (error) {
+          setRelinkNote(String(error?.message ?? error))
+        }
+      }
+      const doFollowDeps = async (assembly, on) => {
+        try {
+          const res = await fetch(`${ROUTE}/drift`, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ assembly, action: on ? 'follow' : 'unfollow' }),
+          })
+          const out = await res.json()
+          if (!out || out.ok === false) return setRelinkNote(String((out && out.error) || `HTTP ${res.status}`))
+          setRelinkNote(on ? '已开启自动跟随：部件文件变了会自动重建' : '已关闭自动跟随')
+          await loadDeps()
+        } catch (error) {
+          setRelinkNote(String(error?.message ?? error))
+        }
+      }
       const doRelink = async (assembly, part) => {
         const path = (relinkFor[part] ?? '').trim()
         if (!path) return setRelinkNote('先填新的文件路径')
@@ -2938,7 +2978,29 @@ const FILE_EXTS = ['step', 'stp', 'iges', 'igs', 'brep', 'stl']
                   h('div', { key: 'deps-head', style: { ...styles.infoRow, marginTop: 6 } }, [
                     h('span', { key: 'k', style: styles.infoKey }, '来源文件'),
                     h('span', { key: 'v', style: { ...styles.infoVal, color: depsModel.missingParts?.length ? '#d9534f' : undefined } },
-                      depsModel.missingParts?.length ? `缺 ${depsModel.missingParts.length}` : `${depsModel.files.length} 个`),
+                      depsModel.missingParts?.length
+                        ? `缺 ${depsModel.missingParts.length}`
+                        : depsModel.changedParts?.length ? `${depsModel.files.length} 个 · 变 ${depsModel.changedParts.length}` : `${depsModel.files.length} 个`),
+                  ]),
+                  h('div', { key: 'deps-actions', style: { display: 'flex', alignItems: 'center', gap: 6, paddingTop: 2 } }, [
+                    h('button', {
+                      key: 'rebuild',
+                      type: 'button',
+                      'data-cad-drift-rebuild': depsModel.assembly,
+                      disabled: !depsModel.tracked,
+                      style: { flex: '0 0 auto', padding: '2px 8px', fontSize: 11, cursor: depsModel.tracked ? 'pointer' : 'default', opacity: depsModel.tracked ? 1 : 0.4, borderRadius: 4, border: '1px solid rgba(77,107,254,.5)', background: 'rgba(77,107,254,.16)', color: 'inherit' },
+                      onClick: () => doRebuildDeps(depsModel.assembly),
+                    }, depsModel.changedParts && depsModel.changedParts.length ? `重建（${depsModel.changedParts.length} 件已更新）` : '重建'),
+                    h('label', { key: 'follow', style: { display: 'flex', alignItems: 'center', gap: 4, fontSize: 10.5, cursor: 'pointer', opacity: 0.8 } }, [
+                      h('input', {
+                        key: 'cb',
+                        type: 'checkbox',
+                        checked: Boolean(depsModel.follow),
+                        'data-cad-follow': depsModel.assembly,
+                        onChange: (event) => doFollowDeps(depsModel.assembly, event.target.checked),
+                      }),
+                      h('span', { key: 't' }, '自动跟随'),
+                    ]),
                   ]),
                   ...depsModel.files.map((f) => h('div', {
                     key: `dep-${f.part}`,

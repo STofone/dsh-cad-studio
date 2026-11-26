@@ -14,11 +14,11 @@ DeepSeek Harness 的 CAD 插件：**把 FreeCAD 桥接成给 AI 用的工具**�
 |---|---|
 | 建模 | `cad_studio_feature` 声明式特征（box/cylinder/sphere/cone/torus/extrude/revolve/fuse/cut/common/fillet/chamfer/shell/pattern/translate/rotate/mirror）；`cad_studio_run` 跑任意 FreeCAD Python |
 | 工程文件 | `cad_studio_doc` 存 `script` 或 `features` 两种模型；`cad_studio_features` 改一条特征→整表重算（0.2–0.6 s），失败整表回滚 |
-| 装配 | `cad_studio_assembly` 读 manifest，`App::Link` 语义的实例位姿；零件是 STEP 文件级引用（改零件重开即跟随；没有文件监视，重跑才刷新）；**同名 `assembly` 原地重建**（保关节/mate/外观），要再开一个副本用 `assembly:'new'`；`measure:true` 回每实例体积/包围盒，`interference:true` 回真正重叠的实例对 |
+| 装配 | `cad_studio_assembly` 读 manifest，`App::Link` 语义的实例位姿；零件是 STEP 文件级引用（改零件重开即跟随；没有文件监视，重跑才刷新）；**同名 `assembly` 原地重建**（保关节/mate/外观），要再开一个副本用 `assembly:'new'`；`follow:true` 会让它盯住部件文件、变了自动重建（默认关：自动把正在看的场景换掉更糟）；`measure:true` 回每实例体积/包围盒，`interference:true` 回真正重叠的实例对 |
 | 运动 | `cad_studio_joint`（revolute/linear）+ `cad_studio_drive` + `cad_studio_explode`，面板拖滑杆看运动 |
 | 出图 | `cad_studio_drawing` HLR → SVG（主/俯/左/等轴）；`cad_studio_sheet` 正式图纸（图框 + 标题栏 + 三视图 + 尺寸，A4/A3/A2，可出 DXF） |
 | 装配 | `cad_studio_assembly` 多零件实例、`cad_studio_joint` 关节、`cad_studio_mate` 约束（同心/贴合/距离）、`cad_studio_drive` 驱动、`cad_studio_explode` 爆炸图 |
-| 依赖 | `cad_studio_deps` 列出模型的来源 STEP（谁在用、还在不在、**哪个件比装配新**），`relink` 换路径后原地重建、`rebuild` 给 0.24 之前建的老装配补一次源文件清单、`delete` 忘掉一条记录、`prune` 一次清掉所有场景已删的空壳记录；面板「信息」里能直接填新路径 |
+| 依赖 | `cad_studio_deps` 列出模型的来源 STEP（谁在用、还在不在、**哪个件比装配新**；面板「来源文件」每 5 秒自检一次，变了的件标 `changed`，旁边有「重建」按钮与「自动跟随」开关，后者等价于 `cad_studio_deps {action:'follow'}`），`relink` 换路径后原地重建、`rebuild` 给 0.24 之前建的老装配补一次源文件清单、`delete` 忘掉一条记录、`prune` 一次清掉所有场景已删的空壳记录；面板「信息」里能直接填新路径 |
 | 外观 | 面板里改的颜色/显隐/透明度/线框按模型保存（`POST /cad-studio/appearance`），刷新和重启后仍在 |
 | 其它 | `cad_studio_open`（STEP/STL/BREP/IGES 进来看）、`cad_studio_export`、`cad_studio_measure`、`cad_studio_env`；`cad_studio_doc {action:"create", from:"…/x.step"}` 把已有 STEP 变成可编辑模型文档 |
 | 模型清单 | `cad_studio_scene`（`action: list / delete / rename / prune`，`ids:[…]` 一次删多行）——面板里那条列表就是它；0 体积 0 三角的幽灵行会被标 `stale`，`prune` 一次清掉 |

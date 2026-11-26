@@ -1743,6 +1743,43 @@ endsolid t
   const dropped = await call('cad_studio_deps', { action: 'delete', assembly: first.assembly })
   ok('deps: delete forgets one record but leaves its scene',
     dropped.ok === true && dropped.removed === first.assembly, JSON.stringify(dropped))
+
+  // Live follow: the panel sees drift, a person clicks rebuild, or the model
+  // opts into watching and rebuilds itself. Nothing swaps a scene silently
+  // unless follow was asked for.
+  const live = await call('cad_studio_assembly', {
+    parts: [{ name: 'blk', path: src }],
+    instances: [{ name: 'one', part: 'blk', at: [0, 0, 0] }],
+    assembly: 'harness_跟随',
+    follow: false,
+  })
+  await new Promise((r) => setTimeout(r, 1200))
+  await call('cad_studio_export', { target: src, code: 'scene = Part.makeBox(12, 10, 10)' })
+  const drifted = await call('cad_studio_deps', { action: 'list', assembly: live.assembly })
+  ok('deps: the panel can see which part moved on',
+    drifted.ok === true && drifted.models[0].changedParts.includes('blk'), JSON.stringify(drifted.models[0].changedParts))
+  const rebuilt = await hit('/cad-studio/drift', '127.0.0.1:3180', { assembly: live.assembly, action: 'rebuild' })
+  const rebuiltOut = JSON.parse(rebuilt.body)
+  ok('drift: rebuild re-reads the files and republishes the same assembly',
+    rebuilt.status === 200 && rebuiltOut.ok === true && Boolean(rebuiltOut.sceneId), rebuilt.body.slice(0, 200))
+  const afterBuild = await call('cad_studio_deps', { action: 'list', assembly: live.assembly })
+  ok('drift: a rebuild clears the changed marks', (afterBuild.models[0].changedParts || []).length === 0,
+    JSON.stringify(afterBuild.models[0].changedParts))
+  const followed = await call('cad_studio_deps', { action: 'follow', assembly: live.assembly })
+  ok('deps: follow turns the watcher on', followed.ok === true && followed.follow === true, JSON.stringify(followed))
+  await new Promise((r) => setTimeout(r, 1200))
+  await call('cad_studio_export', { target: src, code: 'scene = Part.makeBox(14, 10, 10)' })
+  let autoOut = null
+  for (let i = 0; i < 24; i++) {
+    await new Promise((r) => setTimeout(r, 500))
+    autoOut = await call('cad_studio_deps', { action: 'list', assembly: live.assembly })
+    if (!(autoOut.models[0].changedParts || []).length) break
+  }
+  ok('deps: follow rebuilds by itself when a part file changes',
+    Boolean(autoOut) && (autoOut.models[0].changedParts || []).length === 0,
+    JSON.stringify(autoOut?.models?.[0]?.changedParts))
+  await call('cad_studio_deps', { action: 'unfollow', assembly: live.assembly })
+  await call('cad_studio_deps', { action: 'delete', assembly: live.assembly })
 }
 
 // ---- 9. teardown --------------------------------------------------------

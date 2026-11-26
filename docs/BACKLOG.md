@@ -34,6 +34,8 @@
 - [x] 12. 装配记录只增不删（空壳无 API 清）→ `cad_studio_deps {action:'delete'|'prune'}`，并且 persist 记住"已忘掉"的 id，不会被下一次发布写回
 - [x] 13. 部件改了装配没重建时没有提示 → `deps list` 每件带 `changed`（文件 mtime > `spec.builtAt`），顶层 `changed` 计数；不自动重建
 
+- [x] 14. 装配「实时更新」：不做无提示的自动替换。默认 = 面板每 5 秒自检部件文件、标 `changed`、一键「重建」；要真自动就 `follow:true`（`fs.watchFile` 1 s 轮询 + 1.2 s 合并窗口 + 重建中互斥），共享同一 STEP 的多个装配各挂各的 listener
+
 ## 明确不做
 - 旧 op 日志重放导入（静默算错几何的风险不可接受）
 - Path/Fem/Arch/Robot/Ship/Idf/Plot/Raytracing/Web/Points/ReverseEngineering/Inspection/AddonManager/Start/Tux

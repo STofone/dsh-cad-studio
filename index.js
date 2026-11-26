@@ -14,7 +14,7 @@
  *   GET /cad-studio/client.js    the panel bundle (dev-mode serving)
  */
 import { spawn, spawnSync } from 'node:child_process'
-import { existsSync, mkdirSync, readdirSync, rmSync, statSync, statfsSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readdirSync, rmSync, statSync, statfsSync, unwatchFile, watchFile, writeFileSync } from 'node:fs'
 import crypto from 'node:crypto'
 import { mkdtemp, mkdir, readdir, readFile, rm, stat, unlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -764,6 +764,11 @@ class FreeCadBridge {
     // Ids the user dropped: persist() merges what an earlier process wrote, so
     // a deletion has to be remembered or the next publish writes the row back.
     this.forgottenAssemblies = new Set()
+    // Only assemblies opted into `follow` get file watchers: the panel always
+    // *reports* drift, but silently swapping the scene under a person who is
+    // orbiting it is worse than a one-click rebuild.
+    this.assemblyWatch = new Map()
+    this.rebuilding = new Set()
     this.sessionUndo = []
     this.sessionRedo = []
     this.assemblySeq = 0
@@ -1395,6 +1400,7 @@ class FreeCadBridge {
   async forgetAssembly(id) {
     const key = String(id ?? '').trim()
     if (!key) return false
+    this.unwatchAssembly(key)
     this.forgottenAssemblies.add(key)
     const had = this.assemblies.delete(key)
     await this.persist()
@@ -1426,6 +1432,87 @@ class FreeCadBridge {
     for (const id of gone) this.forgottenAssemblies.add(id)
     if (gone.size) await this.persist()
     return [...gone]
+  }
+
+  /** Part files newer than the build that read them — "changed" in the panel. */
+  driftOf(record) {
+    const builtAt = Number(record.spec?.builtAt ?? 0)
+    if (!builtAt) return []
+    return (record.spec?.parts ?? []).filter((part) => {
+      try {
+        const st = statSync(part.path)
+        return st.isFile() && st.mtimeMs > builtAt + 1000
+      } catch {
+        return false
+      }
+    }).map((part) => part.name)
+  }
+
+  /** Watch one assembly's part files (follow mode). Listeners are tracked per
+   * file so two assemblies sharing a STEP do not unwatch each other. */
+  watchAssembly(record) {
+    this.unwatchAssembly(record.id)
+    const files = [...new Set((record.spec?.parts ?? []).map((p) => p.path).filter(Boolean))]
+    if (!files.length) return
+    const state = { listeners: [], settle: null }
+    const onChange = () => {
+      const parts = this.driftOf(record)
+      if (!parts.length) return
+      record.drift = { at: Date.now(), parts }
+      if (record.follow) this.scheduleFollowRebuild(record)
+    }
+    for (const file of files) {
+      try {
+        watchFile(file, { interval: 1000 }, onChange)
+        state.listeners.push({ file, listener: onChange })
+      } catch {}
+    }
+    this.assemblyWatch.set(record.id, state)
+  }
+
+  unwatchAssembly(id) {
+    const state = this.assemblyWatch.get(id)
+    if (!state) return
+    for (const { file, listener } of state.listeners) {
+      try { unwatchFile(file, listener) } catch {}
+    }
+    if (state.settle) clearTimeout(state.settle)
+    this.assemblyWatch.delete(id)
+  }
+
+  /** Debounced rebuild for follow mode: settle first, then rebuild once. */
+  scheduleFollowRebuild(record) {
+    const state = this.assemblyWatch.get(record.id)
+    if (!state || this.rebuilding.has(record.id)) return
+    if (state.settle) clearTimeout(state.settle)
+    state.settle = setTimeout(() => {
+      state.settle = null
+      this.rebuildAssembly(record, { auto: true }).catch(() => {})
+    }, 1200)
+    if (typeof state.settle.unref === 'function') state.settle.unref()
+  }
+
+  /** Re-read the part files and republish the same assembly in place. */
+  async rebuildAssembly(record, { auto = false } = {}) {
+    if (this.rebuilding.has(record.id)) return { ok: false, error: '这个装配正在重建' }
+    const spec = record.spec
+    if (!spec?.parts?.length || !spec?.instances?.length) {
+      return { ok: false, error: '这个装配没有源文件清单，先跑一次 cad_studio_deps {action:"rebuild"}' }
+    }
+    this.rebuilding.add(record.id)
+    try {
+      const out = await this.run(assemblyScript(spec.parts, spec.instances, '', false, false), { title: record.title, docKey: `asm:${record.id}` })
+      if (!out.ok || !out.sceneId) return { ok: false, error: out.error ?? '重新读取文件失败', stderr: out.stderr ?? '' }
+      const scene = this.scenes.get(out.sceneId)
+      if (!scene) return { ok: false, error: '重建后没有拿到场景' }
+      this.rebaseAssembly(record, { title: record.title, sceneId: out.sceneId, scene })
+      const published = await this.republishAssembly(record)
+      record.drift = null
+      if (record.follow) this.watchAssembly(record)
+      return { ok: true, assembly: record.id, sceneId: published.id, auto }
+    } finally {
+      this.rebuilding.delete(record.id)
+    }
   }
 
   async run(code, { title, publishHint = true, publish = true, meta = null, docKey = '', sceneId = '' } = {}) {
@@ -3792,7 +3879,8 @@ else:
         title: { type: 'string', description: 'Panel title.' },
         measure: { type: 'boolean', description: 'Return per-instance bbox / volume / solid count, and the total volume.' },
         interference: { type: 'boolean', description: 'Return the instance pairs that actually overlap (bbox prefilter, then a boolean common).' },
-        assembly: { type: 'string', description: 'Assembly label for cad_studio_joint / cad_studio_drive / cad_studio_explode (defaults to the title).' },
+        assembly: { type: 'string', description: 'Rebuild this assembly in place: an id (asm-3) or its title. "new" forces a second copy. Joints, mates and the saved look survive a rebuild.' },
+        follow: { type: 'boolean', description: 'Watch the part files and rebuild automatically when one changes. Off by default: the panel reports drift, and a person clicks 重建. Auto-fire is for a build loop, not for someone orbiting the model.' },
         joints: {
           type: 'array',
           description: 'Joints to declare up front: [{id?, instance, type:"revolute"|"linear"|"cylindrical"|"planar"|"ball", axis?, origin?, value?, min?, max?}]. Rotating about the instance centre is the default; pass origin for a hinge.',
@@ -3819,7 +3907,7 @@ else:
       schema: { type: 'object', properties: { ok: { type: 'boolean' }, sceneId: { type: 'string' }, instances: { type: 'number' }, assembly: { type: 'string' } } },
       render: (_a, v) => [{ type: 'text', text: JSON.stringify(v, null, 2) }],
     },
-    execute: async ({ parts, instances, target, title, assembly, joints, measure, interference }) => {
+    execute: async ({ parts, instances, target, title, assembly, joints, measure, interference, follow }) => {
       if (!Array.isArray(parts) || !parts.length) return { ok: false, error: 'parts must be a non-empty array' }
       if (!Array.isArray(instances) || !instances.length) return { ok: false, error: 'instances must be a non-empty array' }
       // Only referenced parts are read and tessellated: an export set often
@@ -3891,6 +3979,8 @@ else:
       } else if (wantsNew) {
         out.reused = false
       }
+      if (follow !== undefined) record.follow = Boolean(follow)
+      if (record.follow) bridge.watchAssembly(record)
       if (sameTitle.length > 1) {
         const others = sameTitle.filter((r) => r.id !== record.id).map((r) => r.id)
         out.warn = `同名装配共有 ${sameTitle.length} 条（${sameTitle.map((r) => r.id).join(', ')}），本次重建 ${record.id}；${others.join(', ')} 是历史壳记录，用 cad_studio_deps {action:'prune'} 一次清掉。`
@@ -3998,7 +4088,7 @@ else:
     parameters: {
       type: 'object',
       properties: {
-        action: { type: 'string', enum: ['list', 'relink', 'rebuild', 'delete', 'prune'], description: 'Default: list. delete forgets one assembly record; prune forgets every record whose scene is gone (the shells left by deleted scenes).' },
+        action: { type: 'string', enum: ['list', 'relink', 'rebuild', 'delete', 'prune', 'follow', 'unfollow'], description: 'Default: list. delete forgets one assembly record; prune forgets every record whose scene is gone; follow/unfollow turns automatic rebuild on file change on or off.' },
         assembly: { type: 'string', description: 'Assembly id (asm-1) or unique title. Omitted: every assembly for `list`, newest for `relink`.' },
         part: { type: 'string', description: 'Part name to repoint (relink).' },
         path: { type: 'string', description: 'New file path for that part (relink).' },
@@ -4030,6 +4120,8 @@ else:
             missingParts: files.filter((f) => !f.exists).map((f) => f.part),
             // Files edited after the build: the geometry on screen is older.
             changedParts: files.filter((f) => f.changed).map((f) => f.part),
+            drift: r.drift ?? null,
+            follow: Boolean(r.follow),
             sceneAlive: bridge.scenes.has(r.sceneId),
             // An assembly built before sources were recorded cannot relink: the
             // part files are unknown, not missing. Say so instead of an empty list.
@@ -4075,6 +4167,15 @@ else:
         try { record = findAssembly(assembly) } catch (error) { return { ok: false, error: String(error?.message ?? error) } }
         const had = await bridge.forgetAssembly(record.id)
         return { ok: had, removed: record.id, title: record.title, note: '场景还在，需要的话用 cad_studio_scene {action:"delete"} 一起删。' }
+      }
+      if (mode === 'follow' || mode === 'unfollow') {
+        let record
+        try { record = findAssembly(assembly) } catch (error) { return { ok: false, error: String(error?.message ?? error) } }
+        record.follow = mode === 'follow'
+        if (record.follow) bridge.watchAssembly(record)
+        else bridge.unwatchAssembly(record.id)
+        await bridge.persist()
+        return { ok: true, assembly: record.id, follow: record.follow }
       }
       if (mode === 'prune') {
         await bridge.hydrateAssemblies()
@@ -5621,11 +5722,48 @@ __out = {"ok": True, "exported": ${JSON.stringify(target)}, "volume": round(scen
               bytes = st.size
               modified = new Date(st.mtimeMs).toISOString()
             } catch {}
-            return { part: p.name, path: p.path, exists, bytes, modified }
+            const builtAt = Number(r.spec?.builtAt ?? 0)
+            let mtimeMs = 0
+            try { mtimeMs = statSync(p.path).mtimeMs } catch {}
+            const changed = Boolean(exists && builtAt && mtimeMs > builtAt + 1000)
+            return { part: p.name, path: p.path, exists, bytes, modified, changed }
           })
-          return { assembly: r.id, title: r.title, tracked: Boolean(r.spec), files, missingParts: files.filter((f) => !f.exists).map((f) => f.part) }
+          return {
+            assembly: r.id,
+            title: r.title,
+            tracked: Boolean(r.spec),
+            files,
+            missingParts: files.filter((f) => !f.exists).map((f) => f.part),
+            changedParts: files.filter((f) => f.changed).map((f) => f.part),
+            drift: r.drift ?? null,
+            follow: Boolean(r.follow),
+            sceneAlive: bridge.scenes.has(r.sceneId),
+          }
         })
         return send(200, JSON.stringify({ ok: true, models }))
+      }
+      if (url.pathname === `${ROUTE_PREFIX}/drift` && req.method === 'POST') {
+        // The panel's 重建 button and its 自动跟随 switch. A rebuild re-reads the
+        // part files and republishes the same assembly; it never renames it.
+        const body = await bodyOf()
+        const key = typeof body?.assembly === 'string' ? body.assembly : ''
+        if (!key) return send(400, JSON.stringify({ ok: false, error: 'assembly required' }))
+        try {
+          await bridge.hydrateAssemblies()
+          const record = findAssembly(key)
+          const action = String(body.action ?? 'rebuild')
+          if (action === 'follow' || action === 'unfollow') {
+            record.follow = action === 'follow'
+            if (record.follow) bridge.watchAssembly(record)
+            else bridge.unwatchAssembly(record.id)
+            await bridge.persist()
+            return send(200, JSON.stringify({ ok: true, assembly: record.id, follow: record.follow }))
+          }
+          const out = await bridge.rebuildAssembly(record)
+          return send(200, JSON.stringify(out))
+        } catch (error) {
+          return send(200, JSON.stringify({ ok: false, error: String(error?.message ?? error) }))
+        }
       }
       if (url.pathname === `${ROUTE_PREFIX}/relink` && req.method === 'POST') {
         const body = await bodyOf()
