@@ -199,10 +199,9 @@ window.__ModuleLoader__.load({
       propSub: { fontSize: 9.5, opacity: 0.55, padding: '0 2px 8px', wordBreak: 'break-all' },
       propRow: { display: 'flex', alignItems: 'center', gap: 8, padding: '4px 2px', minWidth: 0 },
       paramBlock: { display: 'flex', flexDirection: 'column', gap: 1, padding: '2px 0' },
-      paramDescRow: { display: 'flex', paddingLeft: 2 },
-      paramDesc: { background: 'transparent', border: 'none', padding: 0, textAlign: 'left', fontSize: 9.5, lineHeight: '14px', opacity: 0.66, cursor: 'text', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
-      paramDescEmpty: { opacity: 0.34 },
-      paramDescInput: { width: '100%', boxSizing: 'border-box', fontSize: 9.5, padding: '1px 4px' },
+      paramDescInput: { flex: '1 1 auto', minWidth: 0, boxSizing: 'border-box', fontSize: 9.5, padding: '1px 4px' },
+      paramName: { font: 'inherit', background: 'transparent', border: 'none', padding: 0, fontSize: 10.5, opacity: 0.62, textAlign: 'left', cursor: 'text', flex: '1 1 auto', minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
+      paramTip: (dark) => ({ position: 'fixed', zIndex: 45, width: 200, padding: '5px 7px', borderRadius: 6, fontSize: 9.5, lineHeight: '14px', whiteSpace: 'pre-wrap', pointerEvents: 'none', background: dark ? '#2b2e34' : '#ffffff', color: dark ? '#e6e8ea' : '#1f2430', border: `1px solid ${dark ? 'rgba(255,255,255,.16)' : 'rgba(16,24,40,.12)'}`, boxShadow: '0 8px 20px rgba(16,24,40,.26)' }),
       propLabel: { fontSize: 10.5, opacity: 0.62, flex: 'none', width: 34 },
       propValue: { marginLeft: 'auto', fontSize: 10, opacity: 0.75, fontVariantNumeric: 'tabular-nums', flex: 'none' },
       slider: { flex: '1 1 auto', minWidth: 0, height: 14, accentColor: '#4d6bfe', cursor: 'pointer' },
@@ -2179,6 +2178,7 @@ const FILE_EXTS = ['step', 'stp', 'iges', 'igs', 'brep', 'stl']
       const paramKeys = Object.keys(modelParams)
       const modelParamMeta = payload && payload.paramMeta && typeof payload.paramMeta === 'object' ? payload.paramMeta : {}
       const [descEditing, setDescEditing] = useState(null)
+      const [descHover, setDescHover] = useState(null)
       const saveParamDesc = async (key, text) => {
         setDescEditing(null)
         const clean = String(text || '').trim()
@@ -2325,13 +2325,16 @@ const FILE_EXTS = ['step', 'stp', 'iges', 'igs', 'brep', 'stl']
         const meta = modelParamMeta[key] || {}
         const desc = meta.description || ''
         const unit = meta.unit || ''
-        const descRow = descEditing === key
+        const editingDesc = descEditing === key
+        const shown = meta.description || ''
+        const tipText = shown ? (unit ? `${shown}（${unit}）` : shown) : '还没有说明，点参数名添加'
+        const nameCell = editingDesc
           ? h('input', {
-              key: 'd-edit',
+              key: 'l',
               style: styles.paramDescInput,
               'data-cad-param-desc-input': key,
-              defaultValue: desc,
-              placeholder: '说明这个参数是什么（回车保存，Esc 取消）',
+              defaultValue: shown,
+              placeholder: '这个参数是什么（回车保存，Esc 取消）',
               autoFocus: true,
               onKeyDown: (event) => {
                 if (event.key === 'Enter') saveParamDesc(key, event.currentTarget.value)
@@ -2340,16 +2343,25 @@ const FILE_EXTS = ['step', 'stp', 'iges', 'igs', 'brep', 'stl']
               onBlur: (event) => saveParamDesc(key, event.currentTarget.value),
             })
           : h('button', {
-              key: 'd',
+              key: 'l',
               type: 'button',
-              style: { ...styles.paramDesc, ...(desc ? {} : styles.paramDescEmpty) },
+              style: styles.paramName,
               'data-cad-param-desc': key,
-              title: '点击编辑参数说明',
+              title: tipText,
               onClick: () => setDescEditing(key),
-            }, desc ? (unit ? `${desc}（${unit}）` : desc) : '＋ 说明')
+            }, key)
         return h('div', { key: `p-${key}`, style: styles.paramBlock }, [
-          h('label', { key: 'row', style: styles.propRow }, [
-            h('span', { key: 'l', style: { ...styles.propLabel, flex: '1 1 auto', minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis' } }, key),
+          h('div', {
+            key: 'row',
+            style: styles.propRow,
+            'data-cad-param-row': key,
+            onMouseEnter: (event) => {
+              const rect = event.currentTarget.getBoundingClientRect()
+              setDescHover({ key, left: rect.left, top: rect.bottom })
+            },
+            onMouseLeave: () => setDescHover((cur) => (cur && cur.key === key ? null : cur)),
+          }, [
+            nameCell,
             h('input', {
               key: 'i',
               type: numeric ? 'number' : 'text',
@@ -2366,11 +2378,21 @@ const FILE_EXTS = ['step', 'stp', 'iges', 'igs', 'brep', 'stl']
               },
             }),
           ]),
-          h('div', { key: 'desc', style: styles.paramDescRow }, [descRow]),
         ])
       })
+      const hoverTip = descHover && (() => {
+        const meta = modelParamMeta[descHover.key] || {}
+        const text = meta.description ? (meta.unit ? `${meta.description}（${meta.unit}）` : meta.description) : '还没有说明，点参数名添加'
+        const wide = typeof window !== 'undefined' ? window.innerWidth : 900
+        const left = Math.max(6, Math.min(descHover.left, wide - 212))
+        return h('div', {
+          key: 'param-tip',
+          'data-cad-param-tip': descHover.key,
+          style: { ...styles.paramTip(theme === 'dark'), left, top: descHover.top + 18 },
+        }, text)
+      })()
       const paramsSection = paramKeys.length
-        ? [h('div', { key: 'params-h', style: styles.treeHint }, `${featureModel} · 参数（改完即重建）`), ...paramsBody]
+        ? [h('div', { key: 'params-h', style: styles.treeHint }, `${featureModel} · 参数（改完即重建）`), ...paramsBody, hoverTip]
         : []
       useEffect(() => {
         const onKey = (event) => {
