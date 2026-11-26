@@ -250,3 +250,15 @@ MIT
 `cad_studio_features {action:"list"}` 与 `cad_studio_doc {action:"show"}` 返回的 `graph.nodes`
 里，每个节点带 `dependsOn / dependents / anchored`：特征是顺序求值链（`f3` 依赖 `f2`），
 `anchored: true` 表示它还跟着某个面走。这是如实的表示——我们不假装有一个比实际更复杂的图。
+
+## 场景几何的二进制传输（0.33.0）
+
+场景 JSON 现在只放元数据，网格放在同名的 `.dcs` 伴随文件里：
+`DCS2` 容器 = `[magic][header JSON][u16 量化坐标 + u32 索引]`，
+浏览器用 typed array 直接读，不再解析百万级十进制数字。
+
+- 实测（鱼缸总体，4,684 三角）：旧 JSON **412 KB** → 现在 346 B + 94.6 KB（**4.35×**），
+  gzip 上线后**11.25×**。
+- 精度 = 零件包围盒跨度 / 65535（60 mm 零件约 0.0009 mm），远小于三角化弦差。
+- 老场景（几何内联在 JSON 里）继续可读；`.dcs` 缺失时只跳过该零件，不会整块崩。
+- 设计与取舍见 [`docs/DESIGN-SCENE-BINARY.md`](docs/DESIGN-SCENE-BINARY.md)。

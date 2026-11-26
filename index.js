@@ -18,6 +18,7 @@ import { existsSync, mkdirSync, readdirSync, rmSync, statSync, statfsSync, unwat
 import crypto from 'node:crypto'
 import { mkdtemp, mkdir, readdir, readFile, rm, stat, unlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
+import { gzipSync } from 'node:zlib'
 import { fileURLToPath } from 'node:url'
 import { dirname, join, resolve } from 'node:path'
 
@@ -1004,6 +1005,10 @@ class FreeCadBridge {
       scene.docKey = docKey
       scene.appearance = this.appearances[docKey] ?? null
     }
+    // Disk and the wire get the packed form; memory keeps the full scene
+    // because a republish (drive / explode / mate) rebuilds instance matrices
+    // from these parts and would otherwise lose the geometry.
+    const packed = await this.packScene(id, scene)
     this.scenes.set(id, scene)
     // Count what the viewport shows: per-instance totals and only the parts an
     // instance actually references (a scene may carry unreferenced parts).
@@ -1031,11 +1036,81 @@ class FreeCadBridge {
     }
     this.touched.add(id)
     this.history = [stats, ...this.history.filter((h) => h.id !== id)].slice(0, 30)
-    this.latest = { id, title, at: stats.at, scene }
+    this.latest = { id, title, at: stats.at, scene: packed }
     // Persist so a restarted process (and any stale route closure left by a
     // hot reload) still serves the newest scene.
     await this.persist()
     return { id, stats }
+  }
+
+  /**
+   * Pack a scene's geometry into a binary companion file and return the scene
+   * with metadata only. See docs/DESIGN-SCENE-BINARY.md: decimal arrays in JSON
+   * cost ~2.5x the bytes of f32 and a full parse on load; u16 quantisation
+   * against the part's bounding box shrinks that by another 2x at a precision
+   * (extent/65535, sub-micron on a 60 mm part) far below the tessellation
+   * deflection. Normals are not stored — the client recomputes them from the
+   * quantised positions, which is what the JSON path already did.
+   */
+  async packScene(id, scene) {
+    const parts = Array.isArray(scene.parts) ? scene.parts : []
+    const hasGeometry = parts.some((p) => Array.isArray(p.verts) && p.verts.length >= 9)
+    if (!hasGeometry && scene.bin) return scene
+    const table = []
+    const blocks = []
+    let offset = 0
+    for (const part of parts) {
+      const verts = part.verts
+      const tris = part.tris
+      if (!Array.isArray(verts) || verts.length < 9 || !Array.isArray(tris) || tris.length < 3) {
+        table.push({ id: part.id, vcount: 0, tcount: 0 })
+        continue
+      }
+      const n = verts.length / 3
+      const min = [Infinity, Infinity, Infinity]
+      const max = [-Infinity, -Infinity, -Infinity]
+      for (let i = 0; i < verts.length; i += 3) {
+        for (let k = 0; k < 3; k += 1) {
+          const v = verts[i + k]
+          if (v < min[k]) min[k] = v
+          if (v > max[k]) max[k] = v
+        }
+      }
+      const step = [0, 0, 0]
+      for (let k = 0; k < 3; k += 1) step[k] = max[k] > min[k] ? (max[k] - min[k]) / 65535 : 0
+      const pos = Buffer.allocUnsafe(n * 6)
+      for (let i = 0, o = 0; i < verts.length; i += 3) {
+        for (let k = 0; k < 3; k += 1) {
+          const raw = step[k] ? Math.round((verts[i + k] - min[k]) / step[k]) : 0
+          pos.writeUInt16LE(raw < 0 ? 0 : raw > 65535 ? 65535 : raw, o)
+          o += 2
+        }
+      }
+      const idx = Buffer.allocUnsafe(tris.length * 4)
+      for (let i = 0; i < tris.length; i += 1) idx.writeUInt32LE(tris[i], i * 4)
+      table.push({
+        id: part.id, vcount: n, tcount: tris.length / 3,
+        posOff: offset, idxOff: offset + pos.length, min, step,
+      })
+      blocks.push(pos, idx)
+      offset += pos.length + idx.length
+    }
+    const payload = Buffer.concat(blocks)
+    const header = Buffer.from(JSON.stringify({ v: 2, units: 'mm', parts: table }), 'utf8')
+    const head = Buffer.allocUnsafe(8)
+    head.write('DCS2', 0, 'latin1')
+    head.writeUInt32LE(header.length, 4)
+    const file = `${id}.dcs`
+    await mkdir(join(FreeCadBridge.dataDir, 'scenes'), { recursive: true })
+    await writeFile(join(FreeCadBridge.dataDir, 'scenes', file), Buffer.concat([head, header, payload]))
+    return {
+      ...scene,
+      bin: { file, bytes: payload.length, parts: table },
+      parts: parts.map((p) => {
+        const { verts, tris, ...rest } = p
+        return rest
+      }),
+    }
   }
 
   /** The model list, as the panel sees it (newest first). */
@@ -1136,7 +1211,15 @@ class FreeCadBridge {
       }
       scene.docKey = key
       scene.appearance = clean
-      try { await writeFile(file, JSON.stringify(scene), 'utf8') } catch {}
+      try {
+        // The file on disk holds metadata + the .dcs companion only, so an
+        // appearance edit must not dump the in-memory geometry back into JSON.
+        const packed = await this.packScene(row.id, scene)
+        await writeFile(file, JSON.stringify(packed), 'utf8')
+        // persist() rewrites the latest scene file from the packed copy taken at
+        // publish time; without this it would put the pre-edit appearance back.
+        if (this.latest && this.latest.id === row.id) this.latest.scene = packed
+      } catch {}
     }
     await this.persist()
     return clean
@@ -5964,6 +6047,25 @@ __out = {"ok": True, "exported": ${JSON.stringify(target)}, "volume": round(scen
       }
       if (url.pathname.startsWith(`${ROUTE_PREFIX}/scene/`)) {
         const id = decodeURIComponent(url.pathname.slice(`${ROUTE_PREFIX}/scene/`.length))
+        if (id.endsWith('.dcs')) {
+          // Binary geometry companion (docs/DESIGN-SCENE-BINARY.md). Served raw
+          // so the browser can map typed arrays; gzip only when the client asked
+          // for it, because quantised u16 data already compresses well.
+          const base = id.slice(0, -4)
+          if (!/^scene-\d+$/.test(base)) return send(400, JSON.stringify({ error: 'bad scene id' }))
+          let buf = null
+          try { buf = await readFile(join(dir, 'scenes', `${base}.dcs`)) } catch { buf = null }
+          if (!buf) return send(404, JSON.stringify({ error: 'unknown scene' }))
+          const gz = /gzip/.test(String(req.headers['accept-encoding'] || ''))
+          const out = gz ? gzipSync(buf) : buf
+          res.writeHead(200, {
+            'content-type': 'application/octet-stream',
+            'content-length': out.length,
+            'cache-control': 'no-cache',
+            ...(gz ? { 'content-encoding': 'gzip' } : {}),
+          })
+          return res.end(out)
+        }
         if (!/^scene-\d+$/.test(id)) return send(400, JSON.stringify({ error: 'bad scene id' }))
         try {
           const body = await readFile(join(dir, 'scenes', `${id}.json`), 'utf8')

@@ -5,7 +5,9 @@
  * Run inside the container that has freecadcmd:
  *   node /workspace/cad-studio/test/harness.mjs
  */
-import { writeFile } from 'node:fs/promises'
+import { readFile, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { copyFileSync, existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { apply } from '../index.js'
 
@@ -139,6 +141,33 @@ const hit = async (url, host = '127.0.0.1:3180', post = null) => {
   return out
 }
 
+/** Fetch a scene and decode its .dcs companion, so tests can read geometry. */
+const loadSceneGeom = async (id) => {
+  const res = await hit(`/cad-studio/scene/${encodeURIComponent(id)}`)
+  const scene = JSON.parse(res.body)
+  if (!scene.bin) return scene
+  const dir = join(process.env.TMPDIR || tmpdir(), 'dsh-cad-studio', 'scenes')
+  const dcs = await readFile(join(dir, scene.bin.file))
+  const dv = new DataView(dcs.buffer, dcs.byteOffset, dcs.byteLength)
+  const headerLen = dv.getUint32(4, true)
+  const header = JSON.parse(new TextDecoder().decode(new Uint8Array(dcs.buffer, dcs.byteOffset + 8, headerLen)))
+  const payload = new DataView(dcs.buffer, dcs.byteOffset + 8 + headerLen)
+  for (const part of scene.parts || []) {
+    const meta = (header.parts || []).find((p) => p.id === part.id)
+    if (!meta || !meta.vcount) continue
+    const verts = new Float32Array(meta.vcount * 3)
+    for (let i = 0; i < verts.length; i += 1) verts[i] = meta.min[i % 3] + payload.getUint16(meta.posOff + i * 2, true) * meta.step[i % 3]
+    const tris = new Uint32Array(meta.tcount * 3)
+    for (let i = 0; i < tris.length; i += 1) tris[i] = payload.getUint32(meta.idxOff + i * 4, true)
+    part.verts = verts
+    part.tris = tris
+  }
+  for (const part of scene.parts || []) {
+    if (!part.verts) console.log('  [dbg] part without geometry', JSON.stringify({ id: part.id, binFile: scene.bin && scene.bin.file, ids: (header.parts || []).map((x) => x.id), vcounts: (header.parts || []).map((x) => x.vcount) }))
+  }
+  return scene
+}
+
 const st = await hit('/cad-studio/state')
 const stJson = JSON.parse(st.body)
 ok('route /state 200', st.status === 200 && st.body.length > 2, String(st.status))
@@ -149,13 +178,39 @@ const sc = await hit('/cad-studio/scene/scene-3')
 const scJson = JSON.parse(sc.body)
 ok('route /scene/<id> 200', sc.status === 200)
 ok('scene has parts+instances', Array.isArray(scJson.parts) && scJson.parts.length === 1 && Array.isArray(scJson.instances), `parts=${scJson.parts?.length}`)
-const verts = scJson.parts[0].verts
-const tris = scJson.parts[0].tris
+// Since 0.33.0 the scene JSON is metadata only; geometry lives in the .dcs
+// companion (docs/DESIGN-SCENE-BINARY.md). Decode it here the same way the
+// panel does, so the mesh assertions below still test real numbers.
+ok('scene json carries no geometry', !scJson.parts[0].verts && !scJson.parts[0].tris, JSON.stringify(Object.keys(scJson.parts[0])))
+ok('scene has bin table', Boolean(scJson.bin && scJson.bin.file === 'scene-3.dcs'), JSON.stringify(scJson.bin?.file))
+const dcsPath = join(process.env.TMPDIR || tmpdir(), 'dsh-cad-studio', 'scenes', scJson.bin.file)
+const dcs = await readFile(dcsPath)
+const dview = new DataView(dcs.buffer, dcs.byteOffset, dcs.byteLength)
+const headerLen = dview.getUint32(4, true)
+const binHeader = JSON.parse(new TextDecoder().decode(new Uint8Array(dcs.buffer, dcs.byteOffset + 8, headerLen)))
+const bmeta = binHeader.parts[0]
+ok('dcs header ok', dcs.subarray(0, 4).toString('latin1') === 'DCS2' && bmeta.vcount > 0, `v=${bmeta.vcount} t=${bmeta.tcount}`)
+const payloadView = new DataView(dcs.buffer, dcs.byteOffset + 8 + headerLen)
+const decVerts = new Float32Array(bmeta.vcount * 3)
+for (let i = 0; i < decVerts.length; i += 1) {
+  const k = i % 3
+  decVerts[i] = bmeta.min[k] + payloadView.getUint16(bmeta.posOff + i * 2, true) * bmeta.step[k]
+}
+const decTris = new Uint32Array(bmeta.tcount * 3)
+for (let i = 0; i < decTris.length; i += 1) decTris[i] = payloadView.getUint32(bmeta.idxOff + i * 4, true)
+const verts = decVerts
+const tris = decTris
 ok('scene mesh sane', verts.length % 3 === 0 && verts.length >= 9 && tris.length % 3 === 0 && tris.every((i) => i >= 0 && i < verts.length / 3), `verts=${verts.length} tris=${tris.length}`)
 ok('scene numbers lossless', lossless(scJson) === null, String(lossless(scJson)))
+ok('dcs quantisation within step', [0, 1, 2].every((k) => bmeta.step[k] >= 0), `step=${bmeta.step.map((v) => v.toFixed(5)).join(',')}`)
 
 const badId = await hit('/cad-studio/scene/..%2Fetc%2Fpasswd')
 ok('bad scene id rejected', badId.status === 400, String(badId.status))
+
+const dcsRoute = await hit('/cad-studio/scene/scene-3.dcs')
+ok('route /scene/<id>.dcs 200', dcsRoute.status === 200 && dcsRoute.body.length > 100, `${dcsRoute.status} ${dcsRoute.body.length}B`)
+const dcsBad = await hit('/cad-studio/scene/..%2Fetc%2Fpasswd.dcs')
+ok('bad dcs id rejected', dcsBad.status === 400, String(dcsBad.status))
 
 const asset = await hit('/cad-studio/assets/three.min.js')
 ok('asset three.min.js 200', asset.status === 200 && asset.body.length > 100000, `bytes=${asset.body.length} type=${asset.headers?.['content-type']}`)
@@ -198,9 +253,6 @@ const notFile = await post('/cad-studio/open', { path: '/tmp' })
 ok('POST /open directory 400', notFile.status === 400, String(notFile.status))
 
 // ---- 7. persistence -----------------------------------------------------
-const { readFile } = await import('node:fs/promises')
-const { tmpdir } = await import('node:os')
-const { join } = await import('node:path')
 const stateFile = join(tmpdir(), 'dsh-cad-studio', 'state.json')
 const persisted = JSON.parse(await readFile(stateFile, 'utf8'))
 const liveLatest = JSON.parse((await hit('/cad-studio/state')).body).latest
@@ -342,7 +394,7 @@ endsolid t
   })
   ok('assembly publishes two instances', asm.ok === true && asm.instances === 2, JSON.stringify({ ok: asm.ok, inst: asm.instances }))
   ok('assembly exports STEP', typeof asm.exported === 'string' && asm.bytes > 1000, JSON.stringify({ bytes: asm.bytes }))
-  const scene = JSON.parse((await hit(`/cad-studio/scene/${asm.sceneId}`)).body)
+  const scene = await loadSceneGeom(asm.sceneId)
   ok('assembly scene has 1 part / 2 instances', scene.parts?.length === 1 && scene.instances?.length === 2, `${scene.parts?.length}/${scene.instances?.length}`)
   ok('assembly instances rotate independently', JSON.stringify(scene.instances[1].rot) !== JSON.stringify(scene.instances[0].rot), 'rot differs')
 }
@@ -512,7 +564,7 @@ endsolid t
 // ---- 7j4. colours: host must not force one blue on every part -----------
 {
   const opened = await call('cad_studio_open', { path: '/tmp/harness_part.step' })
-  const scene = JSON.parse((await hit(`/cad-studio/scene/${opened.sceneId}`)).body)
+  const scene = await loadSceneGeom(opened.sceneId)
   const part = (scene.parts || [])[0]
   ok('open() leaves part colour to the client palette', part && part.color === undefined, JSON.stringify(part && part.color))
   const asmC = await call('cad_studio_assembly', {
@@ -520,7 +572,7 @@ endsolid t
     instances: [{ name: 'a', part: 'p1', at: [0, 0, 0] }],
     title: 'colour',
   })
-  const sc2 = JSON.parse((await hit(`/cad-studio/scene/${asmC.sceneId}`)).body)
+  const sc2 = await loadSceneGeom(asmC.sceneId)
   ok('explicit part colour survives', JSON.stringify(sc2.parts[0].color) === '[1,0,0]', JSON.stringify(sc2.parts[0].color))
 }
 
@@ -565,21 +617,21 @@ endsolid t
   const scenesBeforeMotion = JSON.parse((await hit('/cad-studio/scenes')).body).scenes.length
   const listed = await call('cad_studio_joint', { action: 'list', assembly: asm.assembly })
   ok('joint list reports the hinge', listed.ok === true && listed.joints?.[0]?.id === 'hinge', JSON.stringify(listed.joints))
-  const before = JSON.parse((await hit(`/cad-studio/scene/${asm.sceneId}`)).body)
+  const before = await loadSceneGeom(asm.sceneId)
   const armBefore = before.instances.find((i) => i.name === 'arm')
   const driven = await call('cad_studio_drive', { assembly: asm.assembly, joint: 'hinge', value: 90 })
   // A parameter change updates the model in place: same scene id, same row.
   ok('drive updates the assembly scene in place', driven.ok === true && driven.sceneId === asm.sceneId, JSON.stringify({ ok: driven.ok, id: driven.sceneId, first: asm.sceneId, err: driven.error }))
-  const after = JSON.parse((await hit(`/cad-studio/scene/${driven.sceneId}`)).body)
+  const after = await loadSceneGeom(driven.sceneId)
   const armAfter = after.instances.find((i) => i.name === 'arm')
   ok('drive rotates the driven instance', JSON.stringify(armAfter.rot) !== JSON.stringify(armBefore.rot), `${JSON.stringify(armBefore.rot)} -> ${JSON.stringify(armAfter.rot)}`)
   ok('drive leaves the other instance fixed', JSON.stringify(after.instances.find((i) => i.name === 'base')) === JSON.stringify(before.instances.find((i) => i.name === 'base')), 'base unchanged')
   const clamped = await call('cad_studio_drive', { assembly: asm.assembly, joint: 'hinge', value: 999 })
   ok('drive clamps to the joint range', clamped.ok === true && clamped.value === 90, String(clamped.value))
-  const scenario = JSON.parse((await hit(`/cad-studio/scene/${clamped.sceneId}`)).body)
+  const scenario = await loadSceneGeom(clamped.sceneId)
   const exploded = await call('cad_studio_explode', { assembly: asm.assembly, factor: 1 })
   ok('explode publishes', exploded.ok === true && exploded.explode === 1, JSON.stringify({ ok: exploded.ok, ex: exploded.explode, err: exploded.error }))
-  const exScene = JSON.parse((await hit(`/cad-studio/scene/${exploded.sceneId}`)).body)
+  const exScene = await loadSceneGeom(exploded.sceneId)
   ok('explode separates the instances', JSON.stringify(exScene.instances.map((i) => i.translate)) !== JSON.stringify(scenario.instances.map((i) => i.translate)), 'moved')
   const routeList = JSON.parse((await hit('/cad-studio/assembly')).body)
   ok('route /assembly lists joints', Array.isArray(routeList.assemblies) && routeList.assemblies.some((a) => a.joints.length === 1), String(routeList.assemblies?.length))
@@ -1326,7 +1378,7 @@ endsolid t
     assembly: asm.assembly, a: 'a', b: 'base', type: 'concentric', axis: [0, 0, 1], offset: 30,
   })
   ok('mate: concentric accepted', con.ok === true, JSON.stringify(con).slice(0, 200))
-  let scene = JSON.parse((await hit(`/cad-studio/scene/${con.sceneId}`)).body)
+  let scene = await loadSceneGeom(con.sceneId)
   const centreOf = (name) => {
     const inst = scene.instances.find((i) => i.name === name)
     const part = scene.parts.find((p) => p.id === inst.part)
@@ -1353,7 +1405,7 @@ endsolid t
   // distance: put `b` beside the base, 5 mm gap along +X.
   const dst = await call('cad_studio_mate', { assembly: asm.assembly, a: 'b', b: 'base', type: 'distance', axis: [1, 0, 0], offset: 5 })
   ok('mate: distance accepted', dst.ok === true, JSON.stringify(dst).slice(0, 200))
-  scene = JSON.parse((await hit(`/cad-studio/scene/${dst.sceneId}`)).body)
+  scene = await loadSceneGeom(dst.sceneId)
   const cb = centreOf('b')
   ok('mate: distance 5 后 b 与 base 沿 X 的间隙是 5', near(cb.mn[0] - cbase.mx[0], 5, 1e-6), JSON.stringify([cb.mn[0], cbase.mx[0]]))
 
@@ -1394,7 +1446,7 @@ endsolid t
     && saved.appearance.opacities.base === 0.42 && !('bad' in saved.appearance.opacities),
     JSON.stringify(saved.appearance))
   // The scene file itself must carry it: a reload fetches /scene/<id>, not /state.
-  const scene = JSON.parse((await hit(`/cad-studio/scene/${asm.sceneId}`)).body)
+  const scene = await loadSceneGeom(asm.sceneId)
   ok('appearance: 场景文件里带着保存的外观', scene.docKey === docKey && scene.appearance && scene.appearance.overrides.inst.base === '#ff8800', JSON.stringify(scene.appearance))
   // A republish of the same model keeps the look: it is keyed by the model, not
   // by the scene id that changes on every rebuild.
@@ -1404,7 +1456,7 @@ endsolid t
     title: 'harness_look',
     assembly: asm.assembly,
   })
-  const scene2 = JSON.parse((await hit(`/cad-studio/scene/${again.sceneId}`)).body)
+  const scene2 = await loadSceneGeom(again.sceneId)
   ok('appearance: 重新发布同一模型仍带着外观', scene2.appearance && scene2.appearance.wireframes.base === true, JSON.stringify(scene2.appearance))
   const empty = await hit('/cad-studio/appearance', '127.0.0.1:3180', { look: {} })
   ok('appearance: 缺 docKey 被拒', empty.status === 400, String(empty.status))

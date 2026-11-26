@@ -1370,12 +1370,49 @@ const FILE_EXTS = ['step', 'stp', 'iges', 'igs', 'brep', 'stl']
       const visibleId = (payload && payload.__id) || ''
       const sceneKey = (payload && payload.assembly && payload.assembly.id) || visibleId
 
+      // Geometry arrives as a binary companion (docs/DESIGN-SCENE-BINARY.md):
+      // the JSON holds metadata only, the .dcs file holds u16-quantised
+      // positions + u32 indices. Decoding fills part.verts/part.tris so the
+      // graph builder below stays unchanged. A missing or corrupt .dcs leaves
+      // parts without geometry — the builder skips them instead of throwing.
+      const decodeBin = async (scene) => {
+        const bin = scene && scene.bin
+        if (!bin || !bin.file) return scene
+        try {
+          const res = await fetch(`${ROUTE}/scene/${encodeURIComponent(bin.file)}`, { headers: { accept: 'application/octet-stream' } })
+          if (!res.ok) return scene
+          const buf = await res.arrayBuffer()
+          const head = new DataView(buf)
+          if (head.getUint32(0, true) !== 0x32435344) return scene // 'DCS2'
+          const headerLen = head.getUint32(4, true)
+          const header = JSON.parse(new TextDecoder().decode(new Uint8Array(buf, 8, headerLen)))
+          const base = 8 + headerLen
+          const view = new DataView(buf, base)
+          const table = new Map((header.parts || []).map((p) => [p.id, p]))
+          for (const part of scene.parts || []) {
+            const meta = table.get(part.id)
+            if (!meta || !meta.vcount) continue
+            const verts = new Float32Array(meta.vcount * 3)
+            for (let i = 0; i < verts.length; i += 1) {
+              const k = i % 3
+              verts[i] = meta.min[k] + view.getUint16(meta.posOff + i * 2, true) * meta.step[k]
+            }
+            const tris = new Uint32Array(meta.tcount * 3)
+            for (let i = 0; i < tris.length; i += 1) tris[i] = view.getUint32(meta.idxOff + i * 4, true)
+            part.verts = verts
+            part.tris = tris
+          }
+        } catch {}
+        return scene
+      }
+
       const loadScene = async (id) => {
         if (!id) return null
         const res = await fetch(`${ROUTE}/scene/${encodeURIComponent(id)}`, { headers: { accept: 'application/json' } })
         if (!res.ok) return null
         const scene = await res.json()
         scene.__id = id
+        await decodeBin(scene)
         return scene
       }
 
