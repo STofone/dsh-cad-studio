@@ -1947,6 +1947,9 @@ const FILE_EXTS = ['step', 'stp', 'iges', 'igs', 'brep', 'stl']
           setRelinkNote('已按磁盘上的部件重建')
           await loadDeps()
           if (out.sceneId) await applyScene(out.sceneId, out.at)
+          // The rebuild refreshed builtAt, so the "N 件已更新" row is stale the
+          // moment the new scene lands: re-read once more after it is applied.
+          await loadDeps()
         } catch (error) {
           setRelinkNote(String(error?.message ?? error))
         }
