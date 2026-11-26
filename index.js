@@ -1451,6 +1451,19 @@ class FreeCadBridge {
   }
 
   /** Part files newer than the build that read them — "changed" in the panel. */
+  // Alive means "the scene can still be shown", not "this process has it in
+  // memory": a scene published by another process (or before a restart) lives
+  // only on disk.
+  sceneAlive(sceneId) {
+    if (!sceneId) return false
+    if (this.scenes.has(sceneId)) return true
+    try {
+      return existsSync(join(FreeCadBridge.dataDir, 'scenes', `${sceneId}.json`))
+    } catch {
+      return false
+    }
+  }
+
   driftOf(record) {
     const builtAt = Number(record.spec?.builtAt ?? 0)
     if (!builtAt) return []
@@ -4139,7 +4152,7 @@ else:
             changedParts: files.filter((f) => f.changed).map((f) => f.part),
             drift: r.drift ?? null,
             follow: Boolean(r.follow),
-            sceneAlive: bridge.scenes.has(r.sceneId),
+            sceneAlive: bridge.sceneAlive(r.sceneId),
             // An assembly built before sources were recorded cannot relink: the
             // part files are unknown, not missing. Say so instead of an empty list.
             ...(r.spec ? {} : { hint: '这个装配没有记录来源文件（0.24 之前建的）。用 action=rebuild 并给 parts:[{name,path}] 记一次，之后 relink 就能用。' }),
@@ -5755,7 +5768,7 @@ __out = {"ok": True, "exported": ${JSON.stringify(target)}, "volume": round(scen
             changedParts: files.filter((f) => f.changed).map((f) => f.part),
             drift: r.drift ?? null,
             follow: Boolean(r.follow),
-            sceneAlive: bridge.scenes.has(r.sceneId),
+            sceneAlive: bridge.sceneAlive(r.sceneId),
           }
         })
         return send(200, JSON.stringify({ ok: true, models }))
