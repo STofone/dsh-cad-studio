@@ -772,6 +772,7 @@ class FreeCadBridge {
     this.sessionUndo = []
     this.sessionRedo = []
     this.assemblySeq = 0
+    this.droppedScenes = new Set()
     /**
      * Models live in the session's workspace, but the panel posts without a
      * session — remember the last dir a tool used so its edits land in the same
@@ -857,28 +858,34 @@ class FreeCadBridge {
     // A row deleted from state.json (by hand or by another process) must stay
     // deleted: without this, the next publish wrote the whole in-memory history
     // back and undid the prune — which is exactly what the reviewer hit twice.
-    let diskIds = null
-    try {
-      const prev = JSON.parse(await readFile(join(dir, 'state.json'), 'utf8'))
-      diskIds = new Set((Array.isArray(prev.history) ? prev.history : []).map((h) => h.id))
-    } catch {}
     // A process that only knows the one scene it just published must not wipe
     // the rows it never loaded: an empty in-memory history is "I don't know",
     // not "they were deleted". A real prune leaves the rows in memory, so the
     // disk-id filter below still catches it.
-    if (!this.history.length && prevHistory.length) {
-      this.history = prevHistory.slice()
-      if (!this.latest && prevLatest) this.latest = { ...prevLatest, scene: this.scenes.get(prevLatest.id) ?? null }
+    // Union, not replacement: a process usually knows only the scenes it
+    // published in this life. Writing just those rows undid everything an
+    // earlier process (or the panel) had registered. Rows this process really
+    // deleted are tracked separately -- that is the only thing to drop.
+    const merged = new Map(prevHistory.map((h) => [h.id, h]))
+    for (const row of this.history) merged.set(row.id, row)
+    for (const id of this.droppedScenes) merged.delete(id)
+    this.history = [...merged.values()]
+      .sort((a, b) => String(b.at ?? '').localeCompare(String(a.at ?? '')))
+      .slice(0, 30)
+    if (!this.latest) {
+      const seed = merged.get(prevLatest?.id) ?? this.history[prevLatest?.id ? 0 : 0] ?? null
+      if (seed) this.latest = { id: seed.id, title: seed.title, at: seed.at, scene: this.scenes.get(seed.id) ?? null }
     }
-    if (diskIds && this.history.length) {
-      this.history = this.history.filter((h) => diskIds.has(h.id) || this.touched.has(h.id))
-      if (this.latest && !this.history.some((h) => h.id === this.latest.id)) {
-        const next = this.history[0]
-        this.latest = next ? { id: next.id, title: next.title, at: next.at, scene: this.scenes.get(next.id) ?? null } : null
-      }
+    if (this.latest && !merged.has(this.latest.id)) {
+      const next = this.history[0]
+      this.latest = next ? { id: next.id, title: next.title, at: next.at, scene: this.scenes.get(next.id) ?? null } : null
     }
     const latest = this.latest
-    if (latest) await writeFile(join(dir, 'scenes', `${latest.id}.json`), JSON.stringify(latest.scene), 'utf8')
+    // A row restored from the pointer has no geometry in memory: writing it
+    // back would store `null` over a perfectly good scene file.
+    if (latest && latest.scene && typeof latest.scene === 'object') {
+      await writeFile(join(dir, 'scenes', `${latest.id}.json`), JSON.stringify(latest.scene), 'utf8')
+    }
     const pointer = {
       runtime: { ...this.status(), version: this.kernelVersion || '' },
       latest: latest ? { id: latest.id, title: latest.title, at: latest.at } : null,
@@ -984,8 +991,15 @@ class FreeCadBridge {
       if (prev) id = prev.id
     }
     if (!id && typeof opts.id === 'string' && /^scene-\d+$/.test(opts.id)) id = opts.id
-    if (!id) id = `scene-${++this.seq}`
-    else this.seq = Math.max(this.seq, Number(id.slice('scene-'.length)))
+    if (!id) {
+      // Another process may have taken the next number while this one was
+      // alive: an id is a filename, so take the first one that is still free
+      // instead of writing over someone else's scene.
+      let n = ++this.seq
+      while (existsSync(join(FreeCadBridge.dataDir, 'scenes', `scene-${n}.json`))) n = ++this.seq
+      this.seq = n
+      id = `scene-${n}`
+    } else this.seq = Math.max(this.seq, Number(id.slice('scene-'.length)))
     if (docKey) {
       scene.docKey = docKey
       scene.appearance = this.appearances[docKey] ?? null
@@ -1049,6 +1063,7 @@ class FreeCadBridge {
     const row = this.history.find((h) => h.id === key)
     if (!row) throw new Error(`没有这个场景：${key}（可用 ${this.history.map((h) => h.id).join(', ') || '（无）'}）`)
     const snapshot = JSON.parse(JSON.stringify(row))
+    this.droppedScenes.add(key)
     let bytes = null
     if (opts.journal !== false) {
       try { bytes = await readFile(join(FreeCadBridge.dataDir, 'scenes', `${key}.json`)) } catch {}
@@ -1056,6 +1071,7 @@ class FreeCadBridge {
         kind: 'scene',
         label: `delete ${key}`,
         undo: async () => {
+          this.droppedScenes.delete(key)
           this.history = [snapshot, ...this.history.filter((h) => h.id !== key)]
           if (bytes) await writeFile(join(FreeCadBridge.dataDir, 'scenes', `${key}.json`), bytes)
           this.latest = { id: snapshot.id, title: snapshot.title, at: snapshot.at, scene: this.scenes.get(key) ?? null }

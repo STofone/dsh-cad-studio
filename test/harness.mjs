@@ -1254,6 +1254,28 @@ endsolid t
   ok('sketch angle: 60 deg constraint solves and passes its own re-measure', ang.ok === true && (ang.volume ?? 0) > 0, `ok=${ang.ok} vol=${ang.volume} err=${String(ang.error ?? '').slice(0, 100)}`)
 }
 
+// ---- 7aa. a second process must not wipe the rows it never loaded --------
+{
+  const { execFileSync } = await import('node:child_process')
+  const worker = '/workspace/cad-studio/test/scene-worker.mjs'
+  const before = await call('cad_studio_scene', { action: 'list' })
+  const rowsOf = (out) => out.items || out.rows || []
+  const beforeCount = rowsOf(before).length
+  const beforeNewest = rowsOf(before)[0]?.id ?? ''
+  const raw = execFileSync(process.execPath, [worker, 'merge'], { encoding: 'utf8', env: { ...process.env } })
+  const published = JSON.parse(raw.trim().split('\n').pop() || '{}')
+  // The union happens when this process persists: a publish must carry the
+  // worker's row along instead of overwriting the file with memory's view.
+  const mine = await call('cad_studio_run', { code: 'import Part\nscene = Part.makeSphere(4)', title: 'after worker' })
+  const after = await call('cad_studio_scene', { action: 'list' })
+  const rows = rowsOf(after)
+  const ids = rows.map((r) => r.id)
+  ok('persist: a second process publishing one scene keeps the earlier rows',
+    published.ok === true && mine.ok === true && rows.length >= Math.min(beforeCount + 2, 30)
+      && ids.includes(published.sceneId) && ids.includes(mine.sceneId),
+    `before=${beforeCount} after=${rows.length} worker=${published.sceneId}(in=${ids.includes(published.sceneId)}) mine=${mine.sceneId}(in=${ids.includes(mine.sceneId)}) head=${ids.slice(0,4).join(',')}`)
+}
+
 // ---- 7ab. the journal survives a restart ---------------------------------
 {
   const { execFileSync } = await import('node:child_process')
