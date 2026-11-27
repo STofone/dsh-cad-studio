@@ -661,6 +661,7 @@ window.__ModuleLoader__.load({
       const partIndex = new Map((payload.parts || []).map((p, i) => [p.id, i]))
       let triangles = 0
       let volume = 0
+      let skipped = 0
 
       for (const inst of payload.instances || []) {
         const part = parts.get(inst.part)
@@ -669,10 +670,15 @@ window.__ModuleLoader__.load({
         // would build an indexed geometry with an empty index: three.js then
         // computes a NaN bounding sphere and every later frame/camera fit is
         // polluted. Skip it instead of drawing nothing but breaking the view.
-        if (!part.tris || part.tris.length < 3) continue
+        if (!part.tris || part.tris.length < 3) { skipped += 1; continue }
+        // Both buffers must be typed arrays. `setIndex(plainArray)` keeps a JSON
+        // array as-is, and three then uploads a non-typed-array (WebGL
+        // "bufferData: no data" + "onUploadCallback is not a function") — which
+        // is what an older/other three build does where a newer one tolerated it.
+        if (!part.verts || part.verts.length < 9) { skipped += 1; continue }
         const geometry = new THREE.BufferGeometry()
         geometry.setAttribute('position', new THREE.Float32BufferAttribute(part.verts, 3))
-        if (part.tris && part.tris.length) geometry.setIndex(part.tris)
+        geometry.setIndex(new THREE.Uint32BufferAttribute(part.tris, 1))
         geometry.computeVertexNormals()
         // Precedence: a colour the user picked in the tree > the model's own
         // colour > the palette slot.
@@ -832,6 +838,19 @@ window.__ModuleLoader__.load({
     function renderScene(THREE, host, payload, visibility, options, theme) {
       const sceneTheme = SCENE_THEMES[theme] || SCENE_THEMES.light
       const graph = buildGraph(THREE, payload, visibility, options, theme)
+      // Nothing drawable but the scene claims instances: the panel and the host
+      // disagree about where geometry lives (0.33 moved it to the .dcs companion,
+      // so a page loaded before that renders nothing). Say so instead of showing
+      // a black canvas that looks like a broken plugin.
+      if (!graph.meshes.size && (payload.instances || []).length) {
+        const note = document.createElement('div')
+        note.setAttribute('data-cad-geom-missing', '1')
+        note.style.cssText = 'position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);max-width:82%;'
+          + 'padding:10px 12px;border-radius:8px;font:12px/1.6 system-ui,sans-serif;text-align:center;'
+          + 'background:rgba(127,127,127,.12);color:inherit;pointer-events:none;z-index:5'
+        note.textContent = '这个画面没有可绘制的几何：页面版本与宿主版本不一致（几何数据改走二进制传输）。刷新页面即可。'
+        host.appendChild(note)
+      }
       const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true })
       renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2))
       host.style.background = sceneTheme.canvas
