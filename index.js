@@ -822,14 +822,14 @@ if _MEASURE:
     _rows = []
     for _k, _inst in enumerate(_INSTS):
         _s = _placed[_k]
-        _bb = _s.BoundBox
+        _bb = _s.optimalBoundingBox()
         _rows.append({
             "name": _inst["name"], "part": _inst["part"],
             "volume": round(float(_s.Volume), 3), "solids": len(_s.Solids),
             "bounds": {"min": [round(_bb.XMin, 3), round(_bb.YMin, 3), round(_bb.ZMin, 3)],
                        "max": [round(_bb.XMax, 3), round(_bb.YMax, 3), round(_bb.ZMax, 3)]},
         })
-    _box = Part.makeCompound(_placed).BoundBox
+    _box = Part.makeCompound(_placed).optimalBoundingBox()
     __out["measure"] = {
         "instances": _rows,
         "totalVolume": round(sum(r["volume"] for r in _rows), 3),
@@ -1846,17 +1846,56 @@ print("${BEGIN}" + __json.dumps(_safe(_payload)) + "${END}", flush=True)\n`
       else delete clean.stderr
       return clean
     } finally {
-      await rm(dir, { recursive: true, force: true }).catch(() => {})
+      // CAD_KEEP_JOB keeps the scratch dir so a failing script can be read back
+      // and diffed; it is off unless explicitly set.
+      if (!process.env.CAD_KEEP_JOB) await rm(dir, { recursive: true, force: true }).catch(() => {})
     }
   }
 }
 
 /** Shared Python prelude for tool scripts: geometry helpers + scene building. */
 const PRELUDE = `
+
+def _write_text(path, text):
+    _d = os.path.dirname(path)
+    if _d and not os.path.isdir(_d):
+        os.makedirs(_d, exist_ok=True)
+    with open(path, "w", encoding="utf-8", newline="\\n") as _fh:
+        _fh.write(text)
 import json, math
 import Part, Import, FreeCAD
 import Mesh, MeshPart  # only used by cad_studio_mesh, but a missing import here fails the whole job
 Vector = FreeCAD.Vector
+
+_VIEW_DIRS = {"front": (0.0, -1.0, 0.0), "top": (0.0, 0.0, 1.0), "right": (1.0, 0.0, 0.0)}
+# Per view: the linear map from TechDraw raw coordinates to the reading frame,
+# scaled by s. projectToSVG emits an inner scale(1,-1) of its own, so these
+# coefficients already account for it (getting this wrong mirrors the drawing).
+_VIEW_MAT = {"front": (0.0, 1.0, -1.0, 0.0), "top": (1.0, 0.0, 0.0, 1.0), "right": (0.0, -1.0, 1.0, 0.0)}
+_VIEW_MINMAX = {"front": ("XMin", "ZMax"), "top": ("XMin", "YMax"), "right": ("YMin", "ZMax")}
+_VIEW_EXT = {"front": ("XLength", "ZLength"), "top": ("XLength", "YLength"), "right": ("YLength", "ZLength")}
+
+def _view_ext(view, bb):
+    """Upright 2D extent of a view: width along the reading axis, height up."""
+    return (getattr(bb, _VIEW_EXT[view][0]), getattr(bb, _VIEW_EXT[view][1]))
+
+def _view_place(view, bb, px, py, s):
+    """Placement for a TechDraw.projectToSVG fragment.
+
+    The fragment is already in TechDraw's own (u, v) basis, which is NOT the
+    reading basis (front comes out rotated 90 deg and with +Z downward).  Do not
+    rewrite the path data: wrap it in one matrix that rotates it upright, then a
+    scale that flips SVG's y down, then a translate into the cell.  Path arcs
+    survive because nothing here parses path data.
+    """
+    a, b, c, d = _VIEW_MAT[view]
+    minu = getattr(bb, _VIEW_MINMAX[view][0])
+    maxv = getattr(bb, _VIEW_MINMAX[view][1])
+    # SVG's matrix() takes SIX numbers: a b c d e f.  Emitting only four makes
+    # the whole transform invalid and Chromium silently drops it (the drawing
+    # then renders at the origin, clipped) -- verified in the browser.
+    return "translate(%.4f %.4f) matrix(%.6f %.6f %.6f %.6f 0 0)" % (
+        px - minu * s, py + maxv * s, a * s, b * s, c * s, d * s)
 
 def _safe(v):
     # DSH rejects -0 and NaN in tool output; FreeCAD hands both out freely.
@@ -1871,7 +1910,7 @@ def _safe(v):
     return v
 
 def _bounds(shape):
-    b = shape.BoundBox
+    b = shape.optimalBoundingBox()
     return {"x": [b.XMin, b.XMax], "y": [b.YMin, b.YMax], "z": [b.ZMin, b.ZMax], "diagonal": b.DiagonalLength}
 
 def _mesh(shape, deflection=0.25):
@@ -2220,7 +2259,7 @@ def _prim(op, _cur=None):
             _wires.append(_w)
         _lofted = Part.makeLoft(_wires, True)
         if abs(_lofted.Volume) < 1e-9 and len(_wires) > 1:
-            _z = [round(w.BoundBox.ZMin, 3) for w in _wires]
+            _z = [round(w.optimalBoundingBox().ZMin, 3) for w in _wires]
             raise RuntimeError("loft 得到零体积：所有截面在同一平面上（z=%s）。给 section 加 at:[0,0,z] 把它们分层" % str(_z))
         return _lofted
     if k == "sweep":
@@ -2284,12 +2323,12 @@ def _core_of(s):
     except Exception:
         pass
     try:
-        return s.BoundBox.Center
+        return s.optimalBoundingBox().Center
     except Exception:
         return Vector(0.0, 0.0, 0.0)
 
 def _center_of(_it):
-    _b = _it.BoundBox
+    _b = _it.optimalBoundingBox()
     return Vector((_b.XMin + _b.XMax) / 2.0, (_b.YMin + _b.YMax) / 2.0, (_b.ZMin + _b.ZMax) / 2.0)
 
 
@@ -2412,7 +2451,7 @@ for _idx, _op in enumerate(_OPS):
                 # opening exactly where the selector pointed.
                 _hollow = _shape.makeOffsetShape(-_t, 1e-6)
                 _shell = _shape.cut(_hollow)
-                _far = (_shape.BoundBox.DiagonalLength or 100.0) * 2.0
+                _far = (_shape.optimalBoundingBox().DiagonalLength or 100.0) * 2.0
                 for _f in _open_faces:
                     _cls = _f.Surface.__class__.__name__
                     if _cls != "Plane":
@@ -2437,7 +2476,7 @@ for _idx, _op in enumerate(_OPS):
             _inner = _shape.makeOffsetShape(-_t, 1e-6)
             _shell = _shape.cut(_inner)
             if _open in ("top", "bottom"):
-                _b = _shape.BoundBox
+                _b = _shape.optimalBoundingBox()
                 _zw = (_b.ZMax - _t) if _open == "top" else _b.ZMin
                 _box = Part.makeBox(_b.XLength * 2 + 10, _b.YLength * 2 + 10, _t * 6,
                                     Vector(_b.XMin - _b.XLength / 2 - 5, _b.YMin - _b.YLength / 2 - 5, _zw - (_t * 6 if _open == "bottom" else 0)))
@@ -3087,7 +3126,7 @@ else:
                     _lines.append("  vertex %r %r %r" % (_p.x, _p.y, _p.z))
                 _lines.append(" endloop\\nendfacet")
             _lines.append("endsolid cad_studio")
-        open(_target, "w").write("\\n".join(_lines) + "\\n")
+        _write_text(_target, "\\n".join(_lines) + "\\n")
     else:
         raise RuntimeError("unsupported export format: ." + _fmt + " (use .step/.stp/.brep/.iges/.igs/.stl)")
     _stl = None
@@ -3102,7 +3141,7 @@ else:
                 for _p in (_a, _b, _c):
                     _lines.append("  vertex %r %r %r" % (_p.x, _p.y, _p.z))
                 _lines.append(" endloop\\nendfacet")
-        open(_stl, "w").write("solid cad_studio\\n" + "\\n".join(_lines) + "\\nendsolid cad_studio\\n")
+        _write_text(_stl, "solid cad_studio\\n" + "\\n".join(_lines) + "\\nendsolid cad_studio\\n")
     __out = {"ok": True, "path": _target, "format": _fmt, "bytes": os.path.getsize(_target),
              "solids": len(_shapes), "volume": round(sum(float(x.Volume) for x in _shapes), 3),
              "sourceSolids": len(_solids), "sourceVolume": round(sum(float(x.Volume) for x in _solids), 3),
@@ -3169,6 +3208,7 @@ else:
         target: { type: 'string', description: 'Absolute .svg output path.' },
         source: { type: 'string', description: 'Existing BRep model file (STEP/IGES/BREP).' },
         code: { type: 'string', description: 'FreeCAD Python that binds `scene` or `export_shapes`.' },
+        model: { type: 'string', description: 'Saved document name to draw (a document under the model directory). Use this instead of source/code when the geometry already lives in a model.' },
         views: { type: 'array', items: { type: 'string' }, description: 'Subset of ["top","front","right"] (default all three).' },
         scale: { type: 'number', description: 'Drawing scale (default 1.0).' },
       },
@@ -3179,44 +3219,59 @@ else:
       schema: { type: 'object', properties: { ok: { type: 'boolean' }, path: { type: 'string' }, views: { type: 'array', items: { type: 'string' } } } },
       render: (_a, v) => [{ type: 'text', text: JSON.stringify(v, null, 2) }],
     },
-    execute: async ({ target, source, code, views, scale }) => {
-      const src = shapesFrom({ source, code })
-      if (!src) return { ok: false, error: 'pass either source (a model file) or code (FreeCAD Python)' }
+    execute: async ({ target, source, code, model, views, scale }) => {
+      let src = ''
+      if (typeof model === 'string' && model) {
+        src = await modelShapes(model)
+        if (!src) return { ok: false, error: `没有这个模型：${model}` }
+      } else {
+        src = shapesFrom({ source, code })
+        if (!src) return { ok: false, error: 'pass either source (a model file), model (a saved document) or code (FreeCAD Python)' }
+      }
       const wanted = Array.isArray(views) && views.length ? views : ['top', 'front', 'right']
       const py = `${PRELUDE}
 ${src}
-import os, TechDraw
-_dirs = {"top": (0, 0, 1), "front": (0, -1, 0), "right": (1, 0, 0)}
+import os, re, TechDraw
 _scale = float(${Number(scale) || 1})
+_lw = 0.25 / max(_scale, 1e-6)
 if not _shapes:
     __out = {"ok": False, "error": "nothing to draw: pass a source path or bind scene / export_shapes"}
 else:
-    _shape = _shapes[0]
-    _bb = _shape.BoundBox
-    _w, _h, _d = _bb.XLength, _bb.YLength, _bb.ZLength
-    _wanted = [v for v in ${JSON.stringify(wanted)} if v in _dirs] or ["top", "front", "right"]
-    # Sheet layout: top view above, front below-left, right to its right.
+    _shape = _shapes[0] if len(_shapes) == 1 else Part.makeCompound(_shapes)
+    _bb = _shape.optimalBoundingBox()
+    _wanted = [v for v in ${JSON.stringify(wanted)} if v in _VIEW_DIRS] or ["top", "front", "right"]
     _gap = 20.0
-    _top = _bb.XLength, _bb.YLength
-    _front = _bb.XLength, _bb.ZLength
-    _right = _bb.YLength, _bb.ZLength
-    _cells = {"top": (0.0, 0.0, _top), "front": (0.0, _top[1] + _gap, _front), "right": (_front[0] + _gap, _top[1] + _gap, _right)}
-    _sheet_w = max(c[0] + c[2][0] for c in _cells.values()) * _scale + 2 * _gap
-    _sheet_h = max(c[1] + c[2][1] for c in _cells.values()) * _scale + 2 * _gap
+    _ext = {}
+    for _v in _VIEW_DIRS:
+        _ext[_v] = _view_ext(_v, _bb)
+    _cells = {
+        "top": (0.0, 0.0),
+        "front": (0.0, _ext["top"][1] + _gap),
+        "right": (_ext["front"][0] + _gap, _ext["top"][1] + _gap),
+    }
+    _sheet_w = 2 * _gap + _scale * max([_cells[_v][0] + _ext[_v][0] for _v in _wanted] + [0.0])
+    _sheet_h = 2 * _gap + _scale * max([_cells[_v][1] + _ext[_v][1] for _v in _wanted] + [0.0])
     _body = []
     for _v in _wanted:
-        _dx, _dy, _size = _cells[_v]
-        _frag = TechDraw.projectToSVG(_shape, FreeCAD.Vector(*_dirs[_v]))
-        _body.append('<g transform="translate(%r %r) scale(%r)">%s</g>' % (
-            _gap + _dx * _scale, _gap + _dy * _scale, _scale, _frag))
-    _svg = ('<svg xmlns="http://www.w3.org/2000/svg" width="%rmm" height="%rmm" viewBox="0 0 %r %r">'
+        _px = _gap + _cells[_v][0] * _scale
+        _py = _gap + _cells[_v][1] * _scale
+        _frag = TechDraw.projectToSVG(_shape, FreeCAD.Vector(*_VIEW_DIRS[_v]))
+        # The fragment carries stroke-width="1.0" itself, which would override
+        # anything set on the wrapping group and print as a fat line once the
+        # view is scaled. Rewrite it so the line is 0.25 mm on paper.
+        _frag = re.sub('stroke-width="[^"]*"', 'stroke-width="%r"' % _lw, _frag)
+        _body.append('<g fill="none" stroke="#111" stroke-linejoin="round" stroke-linecap="round" '
+                     'transform="%s">%s</g>' % (_view_place(_v, _bb, _px, _py, _scale), _frag))
+    _svg = ('<?xml version="1.0" encoding="UTF-8"?>\\n'
+            '<svg xmlns="http://www.w3.org/2000/svg" width="%rmm" height="%rmm" viewBox="0 0 %r %r">'
             '<rect width="100%%" height="100%%" fill="white"/>'
-            '<g transform="translate(0 %r) scale(1 -1)" stroke="#111" stroke-width="0.3" fill="none">%s</g></svg>'
-            ) % (_sheet_w, _sheet_h, _sheet_w, _sheet_h, _sheet_h, "".join(_body))
+            '<g stroke="#111" stroke-width="0.3" fill="none">%s</g></svg>'
+            ) % (_sheet_w, _sheet_h, _sheet_w, _sheet_h, "".join(_body))
     os.makedirs(os.path.dirname(${JSON.stringify(target)}) or ".", exist_ok=True)
-    open(${JSON.stringify(target)}, "w").write(_svg)
+    _write_text(${JSON.stringify(target)}, _svg)
     __out = {"ok": True, "path": ${JSON.stringify(target)}, "bytes": os.path.getsize(${JSON.stringify(target)}),
-             "views": _wanted, "sheet_mm": [round(_sheet_w, 1), round(_sheet_h, 1)]}
+             "views": _wanted, "sheet_mm": [round(_sheet_w, 1), round(_sheet_h, 1)],
+             "extents": {_v: [round(_ext[_v][0], 2), round(_ext[_v][1], 2)] for _v in _wanted}}
 `
       return bridge.run(py, { title: `drawing → ${target}`, publishHint: false })
     },
@@ -3265,108 +3320,30 @@ else:
 ${src}
 import os, re, TechDraw
 _SIZES = {"A4": (297.0, 210.0), "A3": (420.0, 297.0), "A2": (594.0, 420.0)}
-# (view direction, horizontal model axis, vertical model axis) — the pair is what
-# a reader expects: front shows width x height, top shows width x depth.
-_WANT = {"front": ("X", "Z"), "top": ("X", "Y"), "right": ("Y", "Z")}
-_CAND = {"front": ((0, -1, 0), (0, 1, 0)), "top": ((0, 0, 1), (0, 0, -1)), "right": ((1, 0, 0), (-1, 0, 0))}
 _M = 10.0
 _TBW, _TBH = 180.0, 40.0
 _GAP = 26.0
-_PL = 10.0  # probe segment length (mm)
-
-def _seg(vec):
-    return Part.makeLine(FreeCAD.Vector(0, 0, 0), FreeCAD.Vector(*vec))
-
-def _nums(d):
-    return [float(x) for x in re.findall(r'-?[0-9]+(?:[.][0-9]+)?(?:[eE]-?[0-9]+)?', d)]
-
-def _axis_vectors(dv):
-    """Fragment-space image of each model axis, as a unit vector (+-1, 0).
-
-    One 10 mm edge per axis, projected on its own: an axis pointing along the
-    view direction collapses to nothing, the other two give their direction in
-    the fragment. Probing beats guessing — TechDraw's basis is not the naive
-    "front shows X-Z" one.
-    """
-    out = {}
-    for name, vec in (("X", (_PL, 0, 0)), ("Y", (0, _PL, 0)), ("Z", (0, 0, _PL))):
-        frag = TechDraw.projectToSVG(_seg(vec), FreeCAD.Vector(*dv))
-        ds = re.findall(r'd="([^"]+)"', frag)
-        if not ds:
-            continue
-        ns = _nums(ds[0])
-        if len(ns) < 4:
-            continue
-        dx, dy = ns[-2] - ns[0], ns[-1] - ns[1]
-        ln = math.hypot(dx, dy)
-        if ln < 1e-6:
-            continue  # this axis is the view direction
-        out[name] = (round(dx / ln), round(dy / ln))
-    return out
-
-def _solve(view):
-    """Pick a projection direction whose fragment basis is a rotation.
-
-    F maps read-space (u', v') to fragment-space (u, v): its columns are the
-    fragment images of the two read axes. det(F) < 0 means the drawing would be
-    mirrored (a reader would see the part the wrong way round), so the opposite
-    candidate direction wins instead.
-    """
-    pa, pb = _WANT[view]
-    for dv in _CAND[view]:
-        vec = _axis_vectors(dv)
-        if pa not in vec or pb not in vec:
-            continue
-        fu, fv = vec[pa], vec[pb]
-        det = fu[0] * fv[1] - fu[1] * fv[0]
-        if det <= 0:
-            continue
-        inv = (fv[1] / det, -fv[0] / det, -fu[1] / det, fu[0] / det)
-        return {"dir": dv, "inv": inv}
-    return None
-
-def _remap(frag, inv):
-    """Rewrite the fragment paths in read-space, y flipped for SVG."""
-    ia, ib, ic, id_ = inv
-    out = []
-    for d in re.findall(r'd="([^"]+)"', frag):
-        ns = _nums(d)
-        pts = [(ns[i], ns[i + 1]) for i in range(0, len(ns) - 1, 2)]
-        if not pts:
-            continue
-        q = [(ia * x + ib * y, -(ic * x + id_ * y)) for x, y in pts]
-        out.append("M " + " L ".join("%r %r" % p for p in q))
-    return out
 
 if not _shapes:
     __out = {"ok": False, "error": "nothing to draw: pass a source path, a model, or bind scene / export_shapes"}
 else:
     _shape = _shapes[0] if len(_shapes) == 1 else Part.makeCompound(_shapes)
     _SW, _SH = _SIZES.get(str(${JSON.stringify(String(size || 'A3').toUpperCase())}).upper(), _SIZES["A3"])
-    _wanted = [v for v in ${JSON.stringify(wanted)} if v in _WANT] or ["front", "top", "right"]
+    _wanted = [v for v in ${JSON.stringify(wanted)} if v in _VIEW_DIRS] or ["front", "top", "right"]
+    _bb = _shape.optimalBoundingBox()
     _views = {}
     _missing = []
     for _v in _wanted:
-        _sol = _solve(_v)
-        if not _sol:
+        if _v not in _VIEW_DIRS:
             _missing.append(_v)
             continue
-        _paths = _remap(TechDraw.projectToSVG(_shape, FreeCAD.Vector(*_sol["dir"])), _sol["inv"])
-        _pts = []
-        for _d in _paths:
-            _ns = _nums(_d)
-            _pts += [(_ns[i], _ns[i + 1]) for i in range(0, len(_ns) - 1, 2)]
-        if not _pts:
-            _missing.append(_v)
-            continue
-        _xs = [p[0] for p in _pts]; _ys = [p[1] for p in _pts]
-        _views[_v] = {"paths": _paths, "dir": _sol["dir"],
-                      "box": (min(_xs), min(_ys), max(_xs), max(_ys))}
+        _views[_v] = {"ext": _view_ext(_v, _bb), "dir": _VIEW_DIRS[_v],
+                      "frag": TechDraw.projectToSVG(_shape, FreeCAD.Vector(*_VIEW_DIRS[_v]))}
     if _missing:
         __out = {"ok": False, "error": "无法为这些视图找到保持手性的投影方向：" + ", ".join(_missing)}
     else:
-        _need_w = max(_views[v]["box"][2] - _views[v]["box"][0] for v in _wanted) + _GAP
-        _need_h = max(_views[v]["box"][3] - _views[v]["box"][1] for v in _wanted) + _GAP
+        _need_w = max(_views[v]["ext"][0] for v in _wanted) + _GAP
+        _need_h = max(_views[v]["ext"][1] for v in _wanted) + _GAP
         _avail_w = _SW - 2 * _M
         _avail_h = _SH - 2 * _M - _TBH - 6.0
         _fit = min(_avail_w / max(_need_w, 1e-6), _avail_h / max(_need_h, 1e-6))
@@ -3383,8 +3360,8 @@ else:
                 _scale = _fit
 
         def _size(view):
-            _bx = _views[view]["box"]
-            return ((_bx[2] - _bx[0]) * _scale, (_bx[3] - _bx[1]) * _scale)
+            _ex = _views[view]["ext"]
+            return (_ex[0] * _scale, _ex[1] * _scale)
 
         _first = str(${JSON.stringify(String(projection || 'first').toLowerCase())}).lower() != "third"
         _cells = {}
@@ -3402,22 +3379,24 @@ else:
         _offx = _M + (_avail_w - (_maxx - _minx)) / 2.0 - _minx
         _offy = _M + (_avail_h - (_maxy - _miny)) / 2.0 - _miny
 
-        _views_svg = []; _dims_svg = []; _labels = []; _dim_list = []
+        _views_svg = []; _dims_svg = []; _labels = []; _dim_list = []; _layout = []
         _draw_dims = bool(${dims === false ? 'False' : 'True'})
         for _v in _wanted:
             _vv = _views[_v]
-            _n0x, _n0y, _n1x, _n1y = _vv["box"]
-            _bw = _n1x - _n0x; _bh = _n1y - _n0y
+            _bw, _bh = _vv["ext"]
             _cx, _cy, _w, _h = _cells[_v]
             _px = _cx + _offx; _py = _cy + _offy
-            # The paths are already in read-space (y down); place the bbox corner
-            # at the cell corner and scale.
-            _views_svg.append('<g fill="none" stroke="#111" stroke-width="0.25" stroke-linejoin="round" stroke-linecap="round" '
-                              'transform="translate(%r %r) scale(%r)">%s</g>' % (
-                                  _px - _n0x * _scale, _py - _n0y * _scale, _scale,
-                                  "".join('<path d="%s"/>' % _d for _d in _vv["paths"])))
+            # One matrix per view: rotate the fragment upright and flip SVG's y.
+            # Path data is never parsed, so arcs and splines survive intact.
+            _lw = 0.25 / max(_scale, 1e-6)
+            _frag = re.sub('stroke-width="[^"]*"', 'stroke-width="%r"' % _lw, _vv["frag"])
+            _views_svg.append('<g fill="none" stroke="#111" stroke-linejoin="round" stroke-linecap="round" '
+                              'transform="%s">%s</g>' % (
+                                  _view_place(_v, _bb, _px, _py, _scale), _frag))
             _labels.append('<text x="%r" y="%r" font-size="3.0" fill="#555" font-family="sans-serif" text-anchor="middle">%s</text>' % (
-                _px + _w / 2.0, _py - 3.0, {"front": "主视图", "top": "俯视图", "right": "左视图"}.get(_v, _v)))
+                _px + _w / 2.0, _py - 3.0, {"front": "主视图", "top": "俯视图", "right": "右视图"}.get(_v, _v)))
+            _layout.append({"view": _v, "x": round(_px, 2), "y": round(_py, 2),
+                            "w": round(_w, 2), "h": round(_h, 2)})
             _wm = round(_bw, 2); _hm = round(_bh, 2)
             _dim_list.append({"view": _v, "width_mm": _wm, "height_mm": _hm})
             if _draw_dims and _w > 1e-6 and _h > 1e-6:
@@ -3469,13 +3448,13 @@ else:
             _tb_x + 103.0, _tb_y + 31.4, str(${JSON.stringify(String(size || 'A3').toUpperCase())})))
         _tb.append('<text x="%r" y="%r" font-size="2.8" fill="#666" font-family="sans-serif">%s</text>' % (
             _tb_x + 103.0, _tb_y + 8.4, __import__("datetime").date.today().isoformat()))
-        _svg = ('<svg xmlns="http://www.w3.org/2000/svg" width="%rmm" height="%rmm" viewBox="0 0 %r %r">'
+        _svg = ('<?xml version="1.0" encoding="UTF-8"?>\\n' + '<svg xmlns="http://www.w3.org/2000/svg" width="%rmm" height="%rmm" viewBox="0 0 %r %r">'
                 '<rect width="100%%" height="100%%" fill="white"/>%s%s%s%s%s</svg>') % (
             _SW, _SH, _SW, _SH, _frame, "".join(_views_svg), "".join(_dims_svg), "".join(_labels), "".join(_tb))
         os.makedirs(os.path.dirname(${JSON.stringify(target)}) or ".", exist_ok=True)
-        open(${JSON.stringify(target)}, "w").write(_svg)
+        _write_text(${JSON.stringify(target)}, _svg)
         __out = {"ok": True, "path": ${JSON.stringify(target)}, "bytes": os.path.getsize(${JSON.stringify(target)}),
-                 "sheet_mm": [_SW, _SH], "scale": round(_scale, 4), "views": _wanted,
+                 "sheet_mm": [_SW, _SH], "scale": round(_scale, 4), "views": _wanted, "layout": _layout,
                  "projection": "first" if _first else "third", "dimensions": _dim_list,
                  "directions": {v: list(_views[v]["dir"]) for v in _wanted}}
 `
@@ -3535,7 +3514,7 @@ if not _shapes:
     __out = {"ok": False, "error": "nothing to measure"}
 else:
     _s = _shapes[0]
-    _bb = _s.BoundBox
+    _bb = _s.optimalBoundingBox()
     _c = getattr(_s, "CenterOfMass", None) or _bb.Center
     __out = {
         "ok": True,
@@ -3840,7 +3819,7 @@ def _unfold(_shape):
             for _m in _polys:
                 _d = " ".join("%.3f,%.3f" % (q[0] - _minx + 5, _maxy - q[1] + 5) for q in _m)
                 _parts.append('<polygon points="%s" fill="none" stroke="#111" stroke-width="0.3"/>' % _d)
-            open(_TARGET, "w").write('<svg xmlns="http://www.w3.org/2000/svg" width="%.2fmm" height="%.2fmm" viewBox="0 0 %.2f %.2f">%s</svg>' % (_w, _h, _w, _h, "".join(_parts)))
+            _write_text(_TARGET, '<?xml version="1.0" encoding="UTF-8"?>\\n' + '<svg xmlns="http://www.w3.org/2000/svg" width="%.2fmm" height="%.2fmm" viewBox="0 0 %.2f %.2f">%s</svg>' % (_w, _h, _w, _h, "".join(_parts)))
         else:
             _wires = []
             for _m in _polys:
@@ -3879,7 +3858,7 @@ __out = _out
         deflection: { type: 'number', description: 'Linear deflection in mm (smaller = finer, default 0.2).' },
         angular: { type: 'number', description: 'Angular deflection in radians (default 0.5).' },
         targetSize: { type: 'integer', description: 'Decimate down to at most this many facets (optional).' },
-        fillHoles: { type: 'number', description: 'Fill holes whose edges are shorter than this many mm (0 = skip, default 0).' },
+        fillHoles: { type: 'integer', minimum: 0, description: 'Merge holes bounded by at most this many edges (integer, 0 = skip). Not a length: fillupHoles takes an edge count.' },
         repair: { type: 'boolean', description: 'Dedupe points/facets, fix deformations, harmonize normals (default true).' },
       },
       additionalProperties: false,
@@ -3894,7 +3873,7 @@ __out = _out
       const defl = Number.isFinite(deflection) ? Number(deflection) : 0.2
       const ang = Number.isFinite(angular) ? Number(angular) : 0.5
       const size = Number.isInteger(targetSize) && targetSize > 0 ? targetSize : 0
-      const hole = Number.isFinite(fillHoles) ? Number(fillHoles) : 0
+      const hole = Number.isFinite(fillHoles) ? Math.max(0, Math.round(Number(fillHoles))) : 0
       const doRepair = repair !== false
       const src = shapesFrom({ source, code })
       // Meshing is a different pipeline from the BRep checks: a shape can be a
@@ -3915,8 +3894,9 @@ else:
         except Exception:
             pass
         _m.harmonizeNormals()
-        if ${JSON.stringify(hole)} > 0:
-            _m.fillupHoles(${JSON.stringify(hole)})
+        _hole_edges = int(round(${JSON.stringify(hole)}))
+        if _hole_edges > 0:
+            _m.fillupHoles(_hole_edges)
     _mid = {"facets": int(_m.CountFacets), "points": int(_m.CountPoints)}
     _decimated = False
     if ${JSON.stringify(size)} and _m.CountFacets > ${JSON.stringify(size)}:
@@ -3924,7 +3904,7 @@ else:
         _decimated = True
     _m.write(${JSON.stringify(String(target))})
     import os
-    _bb = _body.BoundBox
+    _bb = _body.optimalBoundingBox()
     __out = {
         "ok": True,
         "target": ${JSON.stringify(String(target))},
@@ -3957,7 +3937,7 @@ else:
       additionalProperties: false,
     },
     output: {
-      schema: { type: 'object', properties: { ok: { type: 'boolean' }, loops: { type: 'number' }, area: { type: 'number' }, perimeter: { type: 'number' } } },
+      schema: { type: 'object', properties: { ok: { type: 'boolean' }, loops: { type: 'number' }, area: { type: 'number' }, perimeter: { type: 'number' }, rings: { type: 'array', description: 'Per-loop area/perimeter/centre and whether it is a hole' } } },
       render: (_a, v) => [{ type: 'text', text: JSON.stringify(v, null, 2) }],
     },
     execute: async ({ source, code, axis = 'Z', at = 0, target }) => {
@@ -3975,8 +3955,7 @@ if not _shapes:
 else:
     _loops = []
     _wl = []
-    _area = 0.0
-    _per = 0.0
+    _raw = []
     for _s in _shapes:
         try:
             _ws = _s.slice(_N, _AT)
@@ -3984,20 +3963,59 @@ else:
             _ws = []
         for _w in _ws:
             _wl.append(_w)
-            _pts = _w.discretize(Deflection=0.15)
+            try:
+                _pts = _w.discretize(Deflection=0.15)
+            except Exception:
+                _pts = []
             if len(_pts) < 3:
                 continue
             _loops.append(_pts)
             try:
-                _per += _w.Length
+                _a = float(Part.Face(_w).Area)
             except Exception:
-                pass
+                _a = 0.0
             try:
-                _area += Part.Face(Part.makePolygon(_pts + [_pts[0]])).Area
+                _p = float(_w.Length)
             except Exception:
-                pass
+                _p = 0.0
+            _raw.append({"pts": _pts, "area": _a, "perimeter": _p})
+
+    def _uv(_p, _ax):
+        return (_p.y, _p.z) if _ax == "X" else ((_p.x, _p.z) if _ax == "Y" else (_p.x, _p.y))
+
+    def _inside_poly(_q, _poly):
+        _x, _y = _q
+        _hit = False
+        _n = len(_poly)
+        for _i in range(_n):
+            _x1, _y1 = _poly[_i]
+            _x2, _y2 = _poly[(_i + 1) % _n]
+            if (_y1 > _y) != (_y2 > _y):
+                _xi = _x1 + (_y - _y1) * (_x2 - _x1) / (_y2 - _y1)
+                if _x < _xi:
+                    _hit = not _hit
+        return _hit
+
+    _polys = [[_uv(_p, _AX) for _p in _r["pts"]] for _r in _raw]
+    _area = 0.0
+    _per = 0.0
+    _rings = []
+    for _i in range(len(_raw)):
+        _q = _polys[_i][0]
+        _depth = 0
+        for _j in range(len(_polys)):
+            if _j != _i and _inside_poly(_q, _polys[_j]):
+                _depth += 1
+        _hole = (_depth % 2) == 1
+        _area += (-_raw[_i]["area"] if _hole else _raw[_i]["area"])
+        _per += _raw[_i]["perimeter"]
+        _n = float(len(_polys[_i]))
+        _cx = sum(_p[0] for _p in _polys[_i]) / _n
+        _cy = sum(_p[1] for _p in _polys[_i]) / _n
+        _rings.append({"area": round(_raw[_i]["area"], 3), "perimeter": round(_raw[_i]["perimeter"], 3),
+                       "center": [round(_cx, 2), round(_cy, 2)], "hole": bool(_hole)})
     __out = {"ok": True, "axis": _AX, "at": _AT, "loops": len(_loops),
-             "area": round(_area, 3), "perimeter": round(_per, 3)}
+             "area": round(_area, 3), "perimeter": round(_per, 3), "rings": _rings}
     _svg = ${target && !/\.dxf$/i.test(String(target)) ? JSON.stringify(String(target)) : 'None'}
     _dxf = ${target && /\.dxf$/i.test(String(target)) ? JSON.stringify(String(target)) : 'None'}
     if _svg and _loops:
@@ -4024,8 +4042,7 @@ else:
         _dir = os.path.dirname(_svg)
         if _dir:
             os.makedirs(_dir, exist_ok=True)
-        with open(_svg, "w") as _f:
-            _f.write("\\n".join(_parts))
+        _write_text(_svg, "\\n".join(_parts))
         __out["svg"] = _svg
         __out["svg_size"] = [round(_w, 2), round(_h, 2)]
     if _wl and _svg is None and _dxf:
@@ -5716,9 +5733,20 @@ except Exception:
     if (!existsSync(join(dir, `${name}.json`))) return ''
     const doc = await readModel(name, dir)
     bridge.noteModelsDir(dir)
-    return doc.kind === 'features'
+    const head = doc.kind === 'features'
       ? featuresScript(featureOps(doc), '', { sketches: doc.sketches })
       : `${PRELUDE}\nP = ${JSON.stringify(doc.params ?? {})}\n${doc.script}\n`
+    // The drawing/sheet/section scripts consume `_shapes`; a document binds its
+    // result to `scene` (or `_shape`), so bridge the two here instead of asking
+    // every caller to know which name a document happens to use.
+    return `${head}
+_shapes = []
+for _n in ("scene", "_shape", "shape", "result"):
+    _cand = globals().get(_n)
+    if _cand is not None and hasattr(_cand, "tessellate"):
+        _shapes = [_cand]
+        break
+`
   }
 
   async function exportModelStep(doc, target, opts = {}) {

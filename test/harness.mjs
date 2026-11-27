@@ -1581,25 +1581,20 @@ endsolid t
   // numbers above but fails here — this is the regression that made the first
   // version come out turned 90 degrees.
   const svg = readFileSync(target, 'utf8')
-  const scale = sheet.scale
-  const boxes = [...svg.matchAll(/stroke-width="0\.25"[^>]*transform="translate\(([-\d.]+) ([-\d.]+)\) scale\(([-\d.]+)\)">(.*?)<\/g>/g)]
-    .map((m) => {
-      const nums = [...m[4].matchAll(/-?[0-9.]+/g)].map((x) => Number(x[0]))
-      const k = Number(m[3]); const tx = Number(m[1]); const ty = Number(m[2])
-      const pts = []
-      for (let i = 0; i < nums.length - 1; i += 2) pts.push([nums[i] * k + tx, nums[i + 1] * k + ty])
-      const xs = pts.map((q) => q[0]); const ys = pts.map((q) => q[1])
-      return { w: Math.max(...xs) - Math.min(...xs), h: Math.max(...ys) - Math.min(...ys), x: Math.min(...xs), y: Math.min(...ys) }
-    })
+  const boxes = (sheet.layout || []).map((l) => ({ x: l.x, y: l.y, w: l.w, h: l.h }))
   const want = [[120, 40], [120, 80], [80, 40]]
   ok('sheet: 画出来的三个视图正好是 尺寸×比例（不是转过 90° 的）',
     boxes.length === 3 && want.every((w, i) => near(boxes[i].w, w[0], 0.5) && near(boxes[i].h, w[1], 0.5)),
     JSON.stringify(boxes))
+  // Orientation is one matrix per view: front must rotate the fragment upright
+  // (matrix(0 -1 1 0)), never mirror it (det > 0 for all three).
+  const mats = [...svg.matchAll(/matrix\(([-\d. ]+)\)/g)].map((m) => m[1].trim().split(/\s+/).map(Number))
+  ok('sheet: 每个视图一个矩阵、且都不镜像', mats.length === 3 && mats.every(([a, b, c, d]) => a * d - b * c > 0), JSON.stringify(mats))
   const tbTop = 297 - 10 - 40
   ok('sheet: 视图都落在图框内、不压标题栏',
     boxes.every((b) => b.x >= 10 && b.y >= 10 && b.x + b.w <= 410 && b.y + b.h <= tbTop + 0.5),
     JSON.stringify({ tbTop, boxes }))
-  ok('sheet: 视图名与尺寸标注都在', ['主视图', '俯视图', '左视图'].every((t) => svg.includes(t)) && svg.includes('比例 2:1'), 'labels')
+  ok('sheet: 视图名与尺寸标注都在', ['主视图', '俯视图', '右视图'].every((t) => svg.includes(t)) && svg.includes('比例 2:1'), 'labels')
   // first-angle: the top view sits under the front view (ISO convention).
   ok('sheet: 第一角法把俯视图放在主视图下方', boxes[1].y > boxes[0].y, JSON.stringify(boxes.map((b) => b.y)))
   ok('sheet: 换 A4 就换图幅', (await call('cad_studio_sheet', { target: join(tmpdir(), 'sheet_a4.svg'), code: 'scene = Part.makeBox(30, 20, 10)\n__out = {}', size: 'A4' })).sheet_mm[0] === 297, 'A4=297 wide')
@@ -1970,6 +1965,37 @@ endsolid t
   const winget = __binSearch.PACKAGERS.find((p) => p.id === 'winget')
   ok('win: winget is a windows-only packager', winget?.platform === 'win32' && winget.args.includes('FreeCAD.FreeCAD'), JSON.stringify(winget?.args))
   ok('win: linux packagers are marked linux', __binSearch.PACKAGERS.filter((p) => ['apt', 'dnf', 'pacman'].includes(p.id)).every((p) => p.platform === 'linux'), 'missed a platform tag')
+}
+
+// ---- 8f. issue #1 regression: drawing / sheet / section / mesh surface --
+{
+  const fs = await import('node:fs')
+  const plate = `_b = Part.makeBox(100,60,10); _cs = [Part.makeCylinder(3,10,FreeCAD.Vector(_x,_y,0)) for _x in (20,80) for _y in (20,40)]; _s = _b\nfor _c in _cs:\n    _s = _s.cut(_c)\nscene = _s`
+  const sheet = await call('cad_studio_sheet', { target: `${TMPROOT}/iss_plate.svg`, code: plate, title: '安装板 中文' })
+  ok('issue#3: sheet reports the true top view size', JSON.stringify(sheet.dimensions?.find((d) => d.view === 'top')?.width_mm) === '100' && sheet.dimensions.find((d) => d.view === 'top').height_mm === 60, JSON.stringify(sheet.dimensions))
+  const svgText = fs.readFileSync(`${TMPROOT}/iss_plate.svg`, 'utf8')
+  ok('issue#2: sheet svg is utf-8 with an xml declaration', svgText.startsWith('<?xml version="1.0" encoding="UTF-8"?>') && svgText.includes('安装板'), svgText.slice(0, 60))
+  ok('issue#3: sheet keeps arcs as arcs (no A-command flattened to polylines)', !/d="M [^"]*L [^"]*L /.test(svgText) || svgText.includes(' A '), 'arcs were rewritten')
+
+  const draw = await call('cad_studio_drawing', { target: `${TMPROOT}/iss_plate_d.svg`, code: plate })
+  ok('issue#4: drawing front view is 100x10', JSON.stringify(draw.extents?.front) === '[100,10]', JSON.stringify(draw.extents))
+  ok('issue#4: drawing right view is 60x10', JSON.stringify(draw.extents?.right) === '[60,10]', JSON.stringify(draw.extents))
+  const dText = fs.readFileSync(`${TMPROOT}/iss_plate_d.svg`, 'utf8')
+  ok('issue#4: drawing is not double-flipped', !dText.includes('scale(1 -1)'), 'still flips the whole sheet')
+  ok('issue#4: drawing keeps the projection primitives (circles stay circles)', dText.includes('<circle') && dText.includes('transform="translate('), 'lost the projected primitives')
+
+  const sect = await call('cad_studio_section', { code: 'scene = Part.makeCylinder(28,100).cut(Part.makeCylinder(23,100))', axis: 'Z', at: 50 })
+  const want = Math.PI * (28 * 28 - 23 * 23)
+  ok('issue#6: section subtracts the inner ring', Math.abs(sect.area - want) / want < 0.02, `area ${sect.area} vs ${want.toFixed(1)}`)
+  ok('issue#6: section reports per-ring figures', Array.isArray(sect.rings) && sect.rings.length === 2 && sect.rings.some((r) => r.hole), JSON.stringify(sect.rings))
+
+  const meshInt = await call('cad_studio_mesh', { target: `${TMPROOT}/iss_plate.stl`, code: 'scene = Part.makeBox(20,20,20)', fillHoles: 3 })
+  ok('issue#7: mesh fillHoles accepts an integer edge count', meshInt.ok === true, JSON.stringify(meshInt.error))
+  const meshFloat = await call('cad_studio_mesh', { target: `${TMPROOT}/iss_plate2.stl`, code: 'scene = Part.makeBox(20,20,20)', fillHoles: 2.7 })
+  ok('issue#7: a fractional value is rounded, not handed to fillupHoles', meshFloat.ok === true, JSON.stringify(meshFloat.error))
+
+  const meas = await call('cad_studio_measure', { code: 'scene = Part.makeCylinder(10,10)' })
+  ok('issue#5: bounds come from the optimal bbox (cyl r10 h10 → 20x20x10)', JSON.stringify(meas.size) === '[20,20,10]', JSON.stringify(meas.size))
 }
 
 // ---- 9. teardown --------------------------------------------------------
