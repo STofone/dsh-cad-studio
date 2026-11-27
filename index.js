@@ -87,7 +87,10 @@ const PACKAGERS = [
   { id: 'brew', platform: 'darwin', probe: '/opt/homebrew/bin/brew', cmd: 'brew', args: ['install', '--cask', 'freecad'], update: null, hint: 'brew install --cask freecad' },
   // Windows: winget ships with Windows 10 1809+/11; choco only when the user
   // installed it. Neither has a probe path — they live wherever they were put.
-  { id: 'winget', platform: 'win32', probe: null, cmd: 'winget', args: ['install', '--id', 'FreeCAD.FreeCAD', '-e', '--accept-package-agreements', '--accept-source-agreements', '--silent'], update: null, hint: 'winget install --id FreeCAD.FreeCAD -e' },
+  // `winget source update` first: a fresh Windows has an empty source index and
+  // `winget install` answers "No package found matching input criteria" until it
+  // has been refreshed once (measured on Windows 11 26200, winget 1.11.510).
+  { id: 'winget', platform: 'win32', probe: null, cmd: 'winget', args: ['install', '--id', 'FreeCAD.FreeCAD', '-e', '--source', 'winget', '--accept-package-agreements', '--accept-source-agreements', '--silent'], update: ['source', 'update'], hint: 'winget install --id FreeCAD.FreeCAD -e' },
   { id: 'choco', platform: 'win32', probe: null, cmd: 'choco', args: ['install', 'freecad', '-y', '--no-progress'], update: null, hint: 'choco install freecad -y' },
 ]
 
@@ -99,6 +102,16 @@ function commandExists(cmd, platform = process.platform, env = process.env) {
     for (const ext of exts) {
       if (existsSync(j(dir, cmd + ext))) return true
     }
+  }
+  // Windows ships some commands as app-execution aliases: `winget.exe` under
+  // %LOCALAPPDATA%\Microsoft\WindowsApps is a reparse point that existsSync
+  // reports as missing, so a scan of PATH alone says "no winget" on a machine
+  // where `winget --version` works. `where` resolves those aliases.
+  if (platform === 'win32') {
+    try {
+      const r = spawnSync('where', [cmd], { windowsHide: true, timeout: 4000, encoding: 'utf8', env })
+      if (r.status === 0 && String(r.stdout || '').trim()) return true
+    } catch {}
   }
   return false
 }
@@ -253,7 +266,7 @@ function installFreeCad(bridge, { timeoutMs = 900000 } = {}) {
   }
   const chunks = []
   const run = (args) => {
-    const res = spawnSync(packager.cmd, args, { encoding: 'utf8', timeout: timeoutMs })
+    const res = spawnSync(packager.cmd, args, { encoding: 'utf8', timeout: timeoutMs, windowsHide: true })
     chunks.push(`$ ${packager.cmd} ${args.join(' ')}\n${res.stdout || ''}${res.stderr || ''}`)
     return res
   }

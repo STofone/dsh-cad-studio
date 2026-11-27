@@ -98,7 +98,26 @@ node test\win-probe.mjs
 
 它打印 `platform` / `searchDirs()` / 找到的 `binary` / doctor 的每一行。没装 FreeCAD 也应该能跑通（`available: false` + 提示里有路径），说明插件本身在 Windows 上是活的。
 
-已知限制：Windows 上没有做过的验证项（Win10 21H2 以上、无管理员权限、非 C 盘安装）会在你遇到时按上面的提示报出来；`winget` 依赖 App Installer 版本，太老的系统里 `winget --version` 会失败，面板会退回提示手动安装。
+### 在真 Windows 上验证过（2026-11-27，Windows 11 build 26200 + FreeCAD 1.1.4）
+
+新装一台 Windows、只做 `winget install --id FreeCAD.FreeCAD -e`，然后跑 `node test\win-probe.mjs`：
+
+```
+env.binary   C:\Program Files\FreeCAD 1.1\bin\freecadcmd.exe
+env.available true
+doctor.kernel C:\Program Files\FreeCAD 1.1\bin\freecadcmd.exe · 1.1.4
+ok 运行平台: win32 x64 · 找的可执行文件: freecadcmd.exe / FreeCADCmd.exe
+ok 数据目录（场景与缓存）: C:\Users\<user>\AppData\Local\Temp\dsh-cad-studio
+ok 模型目录: 跟随会话工作区（<cwd>/cad-models）
+```
+
+三个只有真机才暴露的坑，都已经修在这个版本里：
+
+1. **`winget` 会被误判成不存在**。`winget.exe` 是 App Execution Alias，`existsSync` 看不到它，于是 doctor 说「没找到包管理器」。现在 win32 上扫 PATH 失败后用 `where <cmd>` 兜底。
+2. **新装的 Windows 直接 `winget install` 会报 `No package found matching input criteria`**（源索引还是空的）。自动安装前现在先跑一次 `winget source update`，并固定 `--source winget`。
+3. **FreeCAD 的安装目录带空格和版本号**（`Program Files\FreeCAD 1.1`），按前缀 `FreeCAD*` 扫才能同时认 0.20 / 1.0 / 1.1；写死目录名的代码在 1.1 上会找不到。
+
+已知限制：Win10 21H2 以下、无管理员权限、非 C 盘安装没有实测；`winget` 依赖 App Installer 版本，太老的系统里 `winget --version` 会失败，面板会退回提示手动安装（FreeCAD 官方 installer 也可，装完插件按上面的路径自动发现）。
 
 ## 子形状选择器
 
