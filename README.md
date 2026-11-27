@@ -96,6 +96,21 @@ npm 包：<https://www.npmjs.com/package/dsh-cad-studio>（`dsh plugin` / DSH �
 
 验证：`cad_studio_setup {action:"install"}` 在已装环境下 **44 ms** 返回；`freeCadDirsUnder('<local>/Programs')` 能列出 `FreeCAD 1.1\bin`。
 
+## issue #3：检测吃的是驱动后的位姿（0.40.0）
+
+`measure` / `interference` 以前把**本次入参里的原始摆放**交给 Python，而面板显示的是**关节/mate/爆炸求解后**的位姿——两条真相源。于是把关节驱动到让两块完全重合，`interference` 照样报 `[]`，并且这次「看一眼检测」还会把面板场景写回原始摆放（关节滑条却仍是驱动值）。
+
+现在：
+
+- **检测与发布同一个位姿**：重建已有装配时，先用 `assembleScene(record)` 求出位姿（含本次 `joints` 入参），再把 3×3 + 平移作为矩阵交给 Python 建 `Placement`。`measure` 的 bounds、`interference` 的体积、面板里看到的，现在是同一次求解的结果。
+- **检测不再改动位姿**：`base`（关节锚定的未驱动摆放）单独保留，发布出去的求解位姿绝不会被当成 `base` 写回——否则下一次驱动会把关节算两遍。调用检测前后，`scene.instances` 与 `joint.value` 都不变。
+- **新建装配同时声明关节**：这条路径原来只在基础位姿上算检测，现在声明完关节会再算一次（`publish:false`，不多发场景）。
+- **`cad_studio_drive` 回传位姿**：返回 `translate`（如线性关节滑到 `[0,0,0]`）与 9 个数的 `rot`，来自发布后的场景，而不是关节对象（它上面从来没有这两个字段）。
+- **`assembly:"new"` 不再把标题写成 `new`**：`title` 现在会被采纳；其它字符串仍按「标题即名字」处理（历史行为）。
+- **原地重建可以只给 id**：`{assembly:"asm-5", measure:true}` 不再要求重发 `parts` / `instances`，缺的参数从 `record.spec` 补全；显式传入的仍以调用方为准。
+
+验证（`test/harness.mjs` 第 8g 节 12 条）：100×60×10 两块，B 在 z=30，线性关节 `-30` → `interference` 报 `[{a:"A",b:"B",volume:60000}]`、`measure` 里 B 的 bounds 为 `[0,0,0]..[100,60,10]`；再调一次检测后场景平移仍是 `[0,0,0]`、关节值仍是 `-30`；`drive` 回 `translate:[0,0,0]`、`rot` 长度 9。
+
 ## issue #1 的 7 条缺陷（0.37.0 修完）
 
 上游仓库 issue #1 报的 7 条，逐条的状态与验证方式：

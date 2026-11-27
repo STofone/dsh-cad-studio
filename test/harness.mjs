@@ -2025,6 +2025,73 @@ endsolid t
   ok('appA: unfold takes model=', dA.ok === true && dA.areaFlat > 0, String(dA.areaFlat))
 }
 
+// ---- 8g. issue #3: measure/interference must describe the driven pose ----
+{
+  const dir = mkdtempSync(join(tmpdir(), 'cad-harness-issue3-'))
+  const box = `${dir}/box100.step`
+  await call('cad_studio_export', { target: box, code: 'import Part\nscene = Part.makeBox(100, 60, 10)' })
+  const parts = [{ name: 'box', path: box }]
+  const raw = [
+    { name: 'A', part: 'box', at: [0, 0, 0] },
+    { name: 'B', part: 'box', at: [0, 0, 30] },
+  ]
+  const first = await call('cad_studio_assembly', {
+    parts,
+    instances: raw,
+    assembly: 'issue3',
+    joints: [{ id: 'drop', instance: 'B', type: 'linear', axis: [0, 0, 1], value: 0, min: -60, max: 0 }],
+    measure: true,
+    interference: true,
+  })
+  ok('issue#3: baseline reports no interference', first.ok === true && JSON.stringify(first.interference) === '[]', JSON.stringify(first.interference))
+  const bare = JSON.stringify(first.measure.instances.find((r) => r.name === 'B').bounds.min)
+  ok('issue#3: baseline B sits at z=30', bare === '[0,0,30]', bare)
+
+  const asmId = first.assembly
+  const driven = await call('cad_studio_drive', { assembly: asmId, joint: 'drop', value: -30 })
+  ok('issue#3: drive reports the solved pose', driven.ok === true && JSON.stringify(driven.translate) === '[0,0,0]' && Array.isArray(driven.rot) && driven.rot.length === 9, JSON.stringify({ t: driven.translate, r: driven.rot && driven.rot.length }))
+
+  // The repro: a bare rebuild with measure+interference used to report the raw
+  // placement and then write that raw pose back over the published scene.
+  const checked = await call('cad_studio_assembly', { assembly: asmId, measure: true, interference: true })
+  ok('issue#3: rebuild accepts just the assembly id', checked.ok === true, JSON.stringify(checked).slice(0, 120))
+  const hitPair = checked.interference?.[0]
+  const overlap = hitPair ? hitPair.volume ?? hitPair[2] ?? 0 : 0
+  ok('issue#3: interference sees the driven overlap', Math.abs(Number(overlap) - 60000) < 1, JSON.stringify(checked.interference))
+  const measB = checked.measure.instances.find((r) => r.name === 'B').bounds
+  ok('issue#3: measure reports the driven bounds', JSON.stringify(measB.min) === '[0,0,0]' && JSON.stringify(measB.max) === '[100,60,10]', JSON.stringify(measB))
+
+  const scene = await loadSceneGeom(checked.sceneId)
+  const posedB = scene.instances.find((i) => i.name === 'B')
+  ok('issue#3: the measure call does not reset the pose', JSON.stringify(posedB.translate) === '[0,0,0]', JSON.stringify(posedB.translate))
+  const jointsNow = JSON.parse((await hit('/cad-studio/assembly')).body).assemblies.find((a) => a.id === asmId)
+  ok('issue#3: the joint value survives the measure call', Number(jointsNow?.joints?.[0]?.value) === -30, JSON.stringify(jointsNow?.joints))
+  ok('issue#3: scene and joint agree on the pose', JSON.stringify(posedB.translate) === '[0,0,0]' && Number(jointsNow?.joints?.[0]?.value) === -30, 'consistent')
+
+  // A rebuild with no title keeps the old title; "new" keeps the given one.
+  const renamed = await call('cad_studio_assembly', { assembly: asmId, title: 'issue3_改名' })
+  const rows = JSON.parse((await hit('/cad-studio/assembly')).body).assemblies
+  ok('issue#3: an in-place rebuild keeps the given title', renamed.ok === true && rows.find((a) => a.id === asmId)?.title === 'issue3_改名', JSON.stringify(rows.find((a) => a.id === asmId)?.title))
+
+  // Declaring a joint in the same call must also be measured on the solved
+  // pose, not on the base one.
+  const fresh = await call('cad_studio_assembly', {
+    parts,
+    instances: raw,
+    title: 'issue3_一次到位',
+    joints: [{ id: 'drop', instance: 'B', type: 'linear', axis: [0, 0, 1], value: -30, min: -60, max: 0 }],
+    measure: true,
+    interference: true,
+  })
+  const freshHit = fresh.interference?.[0]
+  const freshVol = freshHit ? freshHit.volume ?? freshHit[2] ?? 0 : 0
+  ok('issue#3: joints declared at creation are measured solved', Math.abs(Number(freshVol) - 60000) < 1, JSON.stringify(fresh.interference))
+
+  const copy = await call('cad_studio_assembly', { assembly: 'new', parts, instances: raw, title: 'issue3_副本' })
+  const rows2 = JSON.parse((await hit('/cad-studio/assembly')).body).assemblies
+  ok('issue#3: assembly:"new" stores the title, not the word new', copy.ok === true && rows2.find((a) => a.id === copy.assembly)?.title === 'issue3_副本', JSON.stringify({ id: copy.assembly, title: rows2.find((a) => a.id === copy.assembly)?.title }))
+}
+
 // ---- 9. teardown --------------------------------------------------------
 for (const d of disposed.reverse()) { try { d() } catch (e) { console.log('  [dispose warn]', e.message) } }
 ok('all tools unregistered on dispose', tools.size === 0, [...tools.keys()].join(','))

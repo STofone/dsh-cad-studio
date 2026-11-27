@@ -480,6 +480,11 @@ function partLocalBox(parts, partId) {
 }
 
 /** World-space centre of one instance (used as the explode direction). */
+/** Degrees (rx, ry, rz) → row-major 3x3, matching assemblyScript's Rz*Ry*Rx. */
+function eulerMatrix(rot) {
+  const [rx, ry, rz] = [Number(rot?.[0] ?? 0), Number(rot?.[1] ?? 0), Number(rot?.[2] ?? 0)]
+  return mulMat(axisAngle([0, 0, 1], rz), mulMat(axisAngle([0, 1, 0], ry), axisAngle([1, 0, 0], rx)))
+}
 function instanceCenter(parts, inst) {
   const box = partLocalBox(parts, inst.part)
   if (!box) return inst.translate.slice()
@@ -834,7 +839,9 @@ function assemblyScript(parts, instances, target, measure, interference) {
 ` + `
 import os
 _PART_FILES = ${JSON.stringify(parts.map((p) => (p.color ? { name: p.name, path: p.path, color: p.color } : { name: p.name, path: p.path })))}
-_INSTS = ${JSON.stringify(instances.map((i) => ({ name: i.name, part: i.part, at: i.at ?? [0, 0, 0], rot: i.rot ?? [0, 0, 0] })))}
+_INSTS = ${JSON.stringify(instances.map((i) => (i.m
+    ? { name: i.name, part: i.part, m: i.m }
+    : { name: i.name, part: i.part, at: i.at ?? [0, 0, 0], rot: i.rot ?? [0, 0, 0] })))}
 _TARGET = ${target ? JSON.stringify(target) : 'None'}
 
 _shapes = {}
@@ -856,15 +863,29 @@ _instances = []
 for _i in _INSTS:
     if _i["part"] not in _shapes:
         raise RuntimeError("instance '" + _i["name"] + "' references unknown part '" + _i["part"] + "'")
-    _rx, _ry, _rz = _i["rot"]
-    _R = FreeCAD.Rotation(FreeCAD.Vector(0, 0, 1), _rz) * FreeCAD.Rotation(FreeCAD.Vector(0, 1, 0), _ry) * FreeCAD.Rotation(FreeCAD.Vector(1, 0, 0), _rx)
-    _ax = _R.multVec(FreeCAD.Vector(1, 0, 0))
-    _ay = _R.multVec(FreeCAD.Vector(0, 1, 0))
-    _az = _R.multVec(FreeCAD.Vector(0, 0, 1))
-    _rot = [_ax.x, _ay.x, _az.x, _ax.y, _ay.y, _az.y, _ax.z, _ay.z, _az.z]
-    _instances.append({"name": _i["name"], "part": _i["part"], "rot": _rot, "translate": [float(c) for c in _i["at"]]})
+    if "m" in _i:
+        # A solved pose (base placement + joints/mates/explode already applied):
+        # the row-major 3x3 plus the translation, exactly what assembleScene emits.
+        _f = [float(c) for c in _i["m"]]
+        _rot = _f[0:9]
+        _tr = _f[9:12]
+        _mat = FreeCAD.Matrix(_f[0], _f[1], _f[2], _f[9],
+                              _f[3], _f[4], _f[5], _f[10],
+                              _f[6], _f[7], _f[8], _f[11],
+                              0, 0, 0, 1)
+        _pl = FreeCAD.Placement(_mat)
+    else:
+        _rx, _ry, _rz = _i["rot"]
+        _R = FreeCAD.Rotation(FreeCAD.Vector(0, 0, 1), _rz) * FreeCAD.Rotation(FreeCAD.Vector(0, 1, 0), _ry) * FreeCAD.Rotation(FreeCAD.Vector(1, 0, 0), _rx)
+        _ax = _R.multVec(FreeCAD.Vector(1, 0, 0))
+        _ay = _R.multVec(FreeCAD.Vector(0, 1, 0))
+        _az = _R.multVec(FreeCAD.Vector(0, 0, 1))
+        _rot = [_ax.x, _ay.x, _az.x, _ax.y, _ay.y, _az.y, _ax.z, _ay.z, _az.z]
+        _tr = [float(c) for c in _i["at"]]
+        _pl = FreeCAD.Placement(FreeCAD.Vector(*_i["at"]), _R)
+    _instances.append({"name": _i["name"], "part": _i["part"], "rot": _rot, "translate": _tr})
     _copy = _shapes[_i["part"]].copy()
-    _copy.Placement = FreeCAD.Placement(FreeCAD.Vector(*_i["at"]), _R)
+    _copy.Placement = _pl
     _placed.append(_copy)
 
 _MEASURE = ${measure ? 'True' : 'False'}
@@ -1402,7 +1423,7 @@ class FreeCadBridge {
   }
 
   /** Register the base placements of a published assembly so joints can move it. */
-  registerAssembly({ title, sceneId, scene, joints, id: givenId, spec = null }) {
+  registerAssembly({ title, sceneId, scene, joints, id: givenId, spec = null, base = null }) {
     const id = givenId ?? `asm-${++this.assemblySeq}`
     const seq = /^asm-(\d+)$/.exec(id)
     if (seq) this.assemblySeq = Math.max(this.assemblySeq, Number(seq[1]))
@@ -1411,7 +1432,8 @@ class FreeCadBridge {
       title,
       sceneId,
       parts: scene.parts,
-      base: scene.instances.map((inst) => ({
+      // `base` when the published pose already had joints/mates applied.
+      base: base ?? scene.instances.map((inst) => ({
         name: inst.name,
         part: inst.part,
         rot: inst.rot.slice(),
@@ -1434,11 +1456,14 @@ class FreeCadBridge {
   /** Replace the parts/placements of an existing assembly, keeping its joints,
    * mates and saved look. Re-running `cad_studio_assembly` with `assembly` uses
    * this: the model keeps its identity while its geometry changes. */
-  rebaseAssembly(record, { title, sceneId, scene }) {
+  rebaseAssembly(record, { title, sceneId, scene, base = null }) {
     record.title = title ?? record.title
     record.sceneId = sceneId
     record.parts = scene.parts
-    record.base = scene.instances.map((inst) => ({
+    // `base` is the un-driven placement list. When the caller published a pose
+    // that already had joints applied, keeping `scene.instances` as the base
+    // would drive the joint twice on the next republish.
+    record.base = base ?? scene.instances.map((inst) => ({
       name: inst.name,
       part: inst.part,
       rot: inst.rot.slice(),
@@ -4243,22 +4268,9 @@ else:
       render: (_a, v) => [{ type: 'text', text: JSON.stringify(v, null, 2) }],
     },
     execute: async ({ parts, instances, target, title, assembly, joints, measure, interference, follow }) => {
-      if (!Array.isArray(parts) || !parts.length) return { ok: false, error: 'parts must be a non-empty array' }
-      if (!Array.isArray(instances) || !instances.length) return { ok: false, error: 'instances must be a non-empty array' }
-      // Only referenced parts are read and tessellated: an export set often
-      // carries bodies no instance places, and pushing those into the scene
-      // bloats the payload and mislabels the part count.
-      const referenced = new Set(instances.map((i) => i.part))
-      const missing = [...referenced].filter((name) => !parts.some((p) => p.name === name))
-      if (missing.length) return { ok: false, error: `instances reference unknown parts: ${missing.slice(0, 5).join(', ')}` }
-      const used = parts.filter((p) => referenced.has(p.name))
-      const py = assemblyScript(used, instances, target, measure, interference)
-      // Allocate the assembly id before publishing: the scene carries `asm:<id>`
-      // so later joint moves rewrite this same entry instead of adding one.
-      // Re-running with `assembly` rebuilds THAT assembly in place: same id, so
-      // its joints, mates and saved look survive a change to the parts.
-      // `assembly` is an id when it looks like one (`asm-3`) and a display name
-      // otherwise — older callers passed a title here.
+      // Resolve the target record FIRST: a rebuild is allowed to omit parts and
+      // instances (they live in record.spec), and the solved pose needs the
+      // record's joints before anything is tessellated.
       let reuse = null
       let reusedBy = ''
       let sameTitle = []
@@ -4276,27 +4288,93 @@ else:
         reuse = live ?? sameTitle[0] ?? null
         if (reuse) reusedBy = 'title'
       }
+      // Omitting them on a rebuild means "the same build as last time".
+      const specParts = reuse?.spec?.parts ?? null
+      const specInstances = reuse?.spec?.instances ?? null
+      if ((!Array.isArray(parts) || !parts.length) && reuse) parts = specParts
+      if ((!Array.isArray(instances) || !instances.length) && reuse) instances = specInstances
+      if (!Array.isArray(parts) || !parts.length) return { ok: false, error: 'parts must be a non-empty array（新建装配必须给 parts；原地重建可以省略）' }
+      if (!Array.isArray(instances) || !instances.length) return { ok: false, error: 'instances must be a non-empty array（新建装配必须给 instances；原地重建可以省略）' }
+      // Only referenced parts are read and tessellated: an export set often
+      // carries bodies no instance places, and pushing those into the scene
+      // bloats the payload and mislabels the part count.
+      const referenced = new Set(instances.map((i) => i.part))
+      const missing = [...referenced].filter((name) => !parts.some((p) => p.name === name))
+      if (missing.length) return { ok: false, error: `instances reference unknown parts: ${missing.slice(0, 5).join(', ')}` }
+      const used = parts.filter((p) => referenced.has(p.name))
+      // What gets measured and what gets published must be the SAME pose. The
+      // scene is the solved one (base placement + joints + mates + explode), so
+      // the geometry/measure/interference run is fed that pose too — otherwise
+      // interference reports on a pose nobody is looking at.
+      let solved = null
+      if (reuse) {
+        const ghost = { ...reuse, joints: (reuse.joints ?? []).map((j) => ({ ...j })), mates: (reuse.mates ?? []).map((m) => ({ ...m })) }
+        for (const spec of joints ?? []) {
+          try { bridge.setJoint(ghost, spec) } catch {}
+        }
+        try {
+          solved = assembleScene(ghost).instances.map((inst) => ({ name: inst.name, part: inst.part, m: [...inst.rot, ...inst.translate] }))
+        } catch { solved = null }
+      }
+      const ranPose = solved ?? instances
+      const py = assemblyScript(used, ranPose, target, measure, interference)
       const asmId = reuse ? reuse.id : bridge.reserveAssemblyId()
-      const out = await bridge.run(py, { title: title ?? 'assembly', docKey: `asm:${asmId}` })
+      const out = await bridge.run(py, { title: title ?? (wantsNew ? 'assembly' : (reuse?.title ?? 'assembly')), docKey: `asm:${asmId}` })
       if (!out.ok || !out.sceneId) return out
-      // Keep the base placements: without them a joint has nothing to move.
-      const scene = bridge.scenes.get(out.sceneId)
+      // The base is what joints are anchored to: the un-driven placements. A
+      // published solved pose must never become the base, or the next drive
+      // applies the joint twice.
+      const baseFromSpec = (insts) => insts.map((i) => {
+        const rot = eulerMatrix(i.rot ?? [0, 0, 0])
+        const translate = (i.at ?? [0, 0, 0]).map(Number)
+        return { name: i.name, part: i.part, rot, translate, center: instanceCenter(bridge.scenes.get(out.sceneId).parts, { part: i.part, rot, translate }) }
+      })
+      let scene = bridge.scenes.get(out.sceneId)
       if (!scene) return out
       const record = reuse
-        ? bridge.rebaseAssembly(reuse, { title: title || reuse.title, sceneId: out.sceneId, scene })
+        ? bridge.rebaseAssembly(reuse, {
+          title: title || reuse.title,
+          sceneId: out.sceneId,
+          scene,
+          base: Array.isArray(instances) && instances !== specInstances ? baseFromSpec(instances) : reuse.base,
+        })
         : bridge.registerAssembly({
           id: asmId,
-          title: assembly || title || 'assembly',
+          // `assembly:'new'` is a verb, not a title: it used to be stored as the
+          // literal string "new" (asm-4/asm-5), so a later rebuild by title could
+          // not find itself. Any other string is a title — that is how callers
+          // have always named an assembly.
+          title: wantsNew
+            ? (title || 'assembly')
+            : (String(assembly ?? '').trim() || title || 'assembly'),
           sceneId: out.sceneId,
           scene,
           joints: [],
           spec: { parts: used.map((p) => ({ name: p.name, path: p.path, ...(p.color ? { color: p.color } : {}) })), instances },
+          base: baseFromSpec(instances),
         })
       for (const spec of joints ?? []) {
         try {
           bridge.setJoint(record, spec)
         } catch (error) {
           out.jointWarning = String(error?.message ?? error)
+        }
+      }
+      // A new assembly that declared joints never went through the solved path;
+      // republish once so what the panel gets is the driven pose, not the base.
+      if (!solved && record.joints.length) {
+        const published = await bridge.republishAssembly(record)
+        out.sceneId = published.id
+        scene = bridge.scenes.get(out.sceneId)
+        // measure/interference were computed against the base pose: redo them on
+        // the solved one, otherwise the first call after declaring joints lies.
+        if (measure || interference) {
+          const posed = assembleScene(record).instances.map((inst) => ({ name: inst.name, part: inst.part, m: [...inst.rot, ...inst.translate] }))
+          const again = await bridge.run(assemblyScript(used, posed, '', measure, interference), { publish: false })
+          if (again.ok) {
+            if (again.measure) out.measure = again.measure
+            if (again.interference) out.interference = again.interference
+          }
         }
       }
       scene.assembly = {
@@ -4623,6 +4701,11 @@ else:
       if (!moved) return { ok: false, error: `没有这个关节：${id}（现有 ${record.joints.map((j) => j.id).join(', ')}）` }
       const published = await bridge.republishAssembly(record)
       bridge.endAssemblyEdit(edit, record)
+      // The caller needs to know where the part ended up, not just the angle: a
+      // joint solved from a different pivot is visually obvious but silent. The
+      // joint object carries no pose — the published scene does.
+      // publishScene returns { id, stats } — the placements live in memory.
+      const posed = (bridge.scenes.get(published.id)?.instances ?? []).find((inst) => inst.name === moved.instance) ?? null
       return {
         ok: true,
         assembly: record.id,
@@ -4630,10 +4713,8 @@ else:
         joint: moved.id,
         instance: moved.instance,
         value: round6(moved.value),
-        // The caller needs to know where the part ended up, not just the angle:
-        // a joint solved from a different pivot is visually obvious but silent.
-        translate: moved.translate ?? null,
-        rot: moved.rot ?? null,
+        translate: posed ? posed.translate.map(round6) : null,
+        rot: posed ? posed.rot.map(round6) : null,
         instances: published.stats.instances,
         volume: round6(published.stats.volume),
       }
