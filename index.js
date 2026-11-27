@@ -15,6 +15,7 @@
  */
 import { spawn, spawnSync } from 'node:child_process'
 import { existsSync, mkdirSync, readdirSync, rmSync, statSync, statfsSync, unwatchFile, watchFile, writeFileSync } from 'node:fs'
+import { win32 as winPath, posix as posixPath } from 'node:path'
 import crypto from 'node:crypto'
 import { mkdtemp, mkdir, readdir, readFile, rm, stat, unlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -80,14 +81,33 @@ function freecadVersion(bin) {
 
 /** Package managers we know how to drive; the first present one wins. */
 const PACKAGERS = [
-  { id: 'apt', probe: '/usr/bin/apt-get', cmd: 'apt-get', args: ['install', '-y', '--no-install-recommends', 'freecad'], update: ['update'], hint: 'apt install freecad' },
-  { id: 'dnf', probe: '/usr/bin/dnf', cmd: 'dnf', args: ['install', '-y', 'freecad'], update: null, hint: 'dnf install freecad' },
-  { id: 'pacman', probe: '/usr/bin/pacman', cmd: 'pacman', args: ['-S', '--noconfirm', 'freecad'], update: null, hint: 'pacman -S freecad' },
-  { id: 'brew', probe: '/opt/homebrew/bin/brew', cmd: 'brew', args: ['install', '--cask', 'freecad'], update: null, hint: 'brew install --cask freecad' },
+  { id: 'apt', platform: 'linux', probe: '/usr/bin/apt-get', cmd: 'apt-get', args: ['install', '-y', '--no-install-recommends', 'freecad'], update: ['update'], hint: 'apt install freecad' },
+  { id: 'dnf', platform: 'linux', probe: '/usr/bin/dnf', cmd: 'dnf', args: ['install', '-y', 'freecad'], update: null, hint: 'dnf install freecad' },
+  { id: 'pacman', platform: 'linux', probe: '/usr/bin/pacman', cmd: 'pacman', args: ['-S', '--noconfirm', 'freecad'], update: null, hint: 'pacman -S freecad' },
+  { id: 'brew', platform: 'darwin', probe: '/opt/homebrew/bin/brew', cmd: 'brew', args: ['install', '--cask', 'freecad'], update: null, hint: 'brew install --cask freecad' },
+  // Windows: winget ships with Windows 10 1809+/11; choco only when the user
+  // installed it. Neither has a probe path — they live wherever they were put.
+  { id: 'winget', platform: 'win32', probe: null, cmd: 'winget', args: ['install', '--id', 'FreeCAD.FreeCAD', '-e', '--accept-package-agreements', '--accept-source-agreements', '--silent'], update: null, hint: 'winget install --id FreeCAD.FreeCAD -e' },
+  { id: 'choco', platform: 'win32', probe: null, cmd: 'choco', args: ['install', 'freecad', '-y', '--no-progress'], update: null, hint: 'choco install freecad -y' },
 ]
 
+/** True when `cmd` resolves on PATH (Windows needs the extension spelled out). */
+function commandExists(cmd, platform = process.platform, env = process.env) {
+  const j = joinFor(platform)
+  const exts = platform === 'win32' ? ['.exe', '.cmd', '.bat', ''] : ['']
+  for (const dir of pathDirs(platform, env)) {
+    for (const ext of exts) {
+      if (existsSync(j(dir, cmd + ext))) return true
+    }
+  }
+  return false
+}
+
 function findPackager() {
-  return PACKAGERS.find((p) => existsSync(p.probe))
+  return PACKAGERS.find((p) => {
+    if (p.platform && p.platform !== process.platform) return false
+    return p.probe ? existsSync(p.probe) : commandExists(p.cmd)
+  })
 }
 
 /** Everything the panel and the tool need to answer "can I just install it?". */
@@ -106,7 +126,7 @@ function setupStatus(bridge, { withVersion = true } = {}) {
     canInstall,
     reason: bin ? '' : (packager
       ? (canInstall ? '' : '当前进程不是 root，无法自动装包；用 root 执行上面的命令或设置 freecadPath')
-      : '没找到包管理器（apt/dnf/pacman/brew 都没有）；手动安装 FreeCAD 后设置 freecadPath'),
+      : '没找到包管理器（apt/dnf/pacman/brew/winget/choco 都没有）；手动安装 FreeCAD 后设置 freecadPath'),
   }
 }
 
@@ -131,6 +151,14 @@ function diagnose(bridge, cfg = {}) {
       : (kernel.reason || '请手动安装 FreeCAD，再把 freecadPath 指到 freecadcmd')),
     action: kernel.available ? '' : (kernel.canInstall ? 'install' : ''),
     packageManager: kernel.packageManager || '',
+  })
+  checks.push({
+    id: 'platform',
+    label: '运行平台',
+    required: false,
+    ok: true,
+    detail: `${process.platform} ${process.arch} · 找的可执行文件：${BINARY_NAMES().join(' / ')}`,
+    fix: '',
   })
   let writable = false
   try {
@@ -185,6 +213,17 @@ function diagnose(bridge, cfg = {}) {
   }
 }
 
+/** Kill a run on timeout; on Windows the launcher may own a child process. */
+function killTree(child) {
+  if (!child || child.exitCode !== null) return
+  if (process.platform === 'win32' && child.pid) {
+    try { spawnSync('taskkill', ['/pid', String(child.pid), '/T', '/F'], { windowsHide: true, stdio: 'ignore' }) } catch {}
+    try { child.kill() } catch {}
+    return
+  }
+  try { child.kill('SIGKILL') } catch {}
+}
+
 const defined = (obj) => Object.fromEntries(Object.entries(obj).filter(([, v]) => v !== undefined))
 const renderUndo = (v) => {
   if (!v || v.ok === false) return `✗ ${v?.error ?? '没有可撤销的操作'}`
@@ -224,17 +263,54 @@ function installFreeCad(bridge, { timeoutMs = 900000 } = {}) {
   return { ok: after.available, ...after, log: chunks.join('\n').slice(-4000) }
 }
 
-const CANDIDATES = [
-  '/usr/bin/freecadcmd',
-  '/usr/local/bin/freecadcmd',
-  '/usr/bin/FreeCADCmd',
-  '/opt/freecad/bin/freecadcmd',
-  '/Applications/FreeCAD.app/Contents/MacOS/FreeCADCmd',
-]
+/** The console binary is called differently (and lives elsewhere) per platform. */
+const BINARY_NAMES = (platform = process.platform) => (platform === 'win32' ? ['freecadcmd.exe', 'FreeCADCmd.exe'] : ['freecadcmd', 'FreeCADCmd'])
+const joinFor = (platform = process.platform) => (platform === 'win32' ? winPath.join : posixPath.join)
 
-function probeBinary(configured) {
+/**
+ * Every directory an install may have put the console binary in. Windows
+ * installers name the folder after the version (`FreeCAD 0.20`, `FreeCAD 1.0`),
+ * so the Program Files root is scanned instead of enumerated — otherwise a new
+ * point release silently breaks discovery.
+ */
+function searchDirs(platform = process.platform, env = process.env) {
+  const j = joinFor(platform)
+  if (platform === 'win32') {
+    const out = []
+    const roots = [env.ProgramW6432, env.ProgramFiles, env['ProgramFiles(x86)']].filter(Boolean)
+    for (const root of roots) {
+      out.push(j(root, 'FreeCAD', 'bin'))
+      try {
+        for (const entry of readdirSync(root)) {
+          if (/^FreeCAD/i.test(entry)) out.push(j(root, entry, 'bin'))
+        }
+      } catch {}
+    }
+    if (env.LOCALAPPDATA) out.push(j(env.LOCALAPPDATA, 'Programs', 'FreeCAD', 'bin'))
+    return [...new Set(out)]
+  }
+  if (platform === 'darwin') {
+    return ['/Applications/FreeCAD.app/Contents/MacOS', '/opt/homebrew/bin', '/usr/local/bin']
+  }
+  return ['/usr/bin', '/usr/local/bin', '/opt/freecad/bin', '/snap/bin', '/usr/lib/freecad/bin', '/usr/lib/freecad-python3/bin']
+}
+
+function pathDirs(platform = process.platform, env = process.env) {
+  const sep = platform === 'win32' ? ';' : ':'
+  return String(env.PATH ?? '').split(sep).map((d) => d.trim().replace(/^"|"$/g, '')).filter(Boolean)
+}
+
+/** Configured path wins; then the standard install locations; then PATH. */
+function probeBinary(configured, platform = process.platform, env = process.env) {
   if (configured) return existsSync(configured) ? configured : undefined
-  return CANDIDATES.find((p) => existsSync(p))
+  const j = joinFor(platform)
+  for (const dir of [...searchDirs(platform, env), ...pathDirs(platform, env)]) {
+    for (const name of BINARY_NAMES(platform)) {
+      const candidate = j(dir, name)
+      if (existsSync(candidate)) return candidate
+    }
+  }
+  return undefined
 }
 
 /** JSON markers; the helper prints exactly one RESULT block per script. */
@@ -1671,7 +1747,9 @@ class FreeCadBridge {
   async run(code, { title, publishHint = true, publish = true, meta = null, docKey = '', sceneId = '' } = {}) {
     const bin = this.refresh()
     if (!bin) {
-      return { ok: false, error: 'freecadcmd not found; set freecadPath in the plugin config' }
+      return { ok: false, error: process.platform === 'win32'
+        ? '没有找到 freecadcmd.exe；在插件配置里设置 freecadPath（通常在 C:\\Program Files\\FreeCAD 0.20\\bin\\freecadcmd.exe）'
+        : 'freecadcmd not found; set freecadPath in the plugin config' }
     }
     const cfg = this.getConfig()
     const dir = await mkdtemp(join(tmpdir(), 'cad-studio-'))
@@ -1699,10 +1777,10 @@ print("${BEGIN}" + __json.dumps(_safe(_payload)) + "${END}", flush=True)\n`
     await writeFile(script, wrapped, 'utf8')
     try {
       const result = await new Promise((resolvePromise) => {
-        const child = spawn(bin, [script], { stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, PYTHONUNBUFFERED: '1' } })
+        const child = spawn(bin, [script], { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true, env: { ...process.env, PYTHONUNBUFFERED: '1' } })
         let out = ''
         let err = ''
-        const timer = setTimeout(() => child.kill('SIGKILL'), cfg.timeoutMs)
+        const timer = setTimeout(() => killTree(child), cfg.timeoutMs)
         child.stdout.on('data', (b) => { out += b })
         child.stderr.on('data', (b) => { err += b })
         child.on('close', (rc) => {
@@ -2780,7 +2858,7 @@ __out = {
 
   tool({
     name: 'cad_studio_setup',
-    description: 'Check whether freecadcmd is installed and, when it is missing, install FreeCAD through the system package manager (apt/dnf/pacman/brew). action=check reports binary, version, package manager and the exact command; action=install runs it (needs root on apt) and re-probes afterwards.',
+    description: 'Check whether freecadcmd is installed and, when it is missing, install FreeCAD through the system package manager (apt/dnf/pacman/brew on Linux/macOS, winget/choco on Windows). action=check reports binary, version, package manager and the exact command; action=install runs it (needs root on apt) and re-probes afterwards.',
     parameters: {
       type: 'object',
       properties: {
@@ -6444,3 +6522,7 @@ __out = {"ok": True, "exported": ${JSON.stringify(target)}, "volume": round(scen
     ctx.logger?.warn?.('cad-studio: route %s not remounted (%s); restart dsh web to reclaim it', ROUTE_PREFIX, String(error?.message ?? error))
   }
 }
+
+// Test seam: the platform-dependent discovery is pure over (platform, env), so
+// the suite can assert the Windows rules without a Windows box.
+export const __binSearch = { searchDirs, pathDirs, probeBinary, commandExists, BINARY_NAMES, PACKAGERS }

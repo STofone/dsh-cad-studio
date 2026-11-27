@@ -40,12 +40,24 @@ DeepSeek Harness 的 CAD 插件：**把 FreeCAD 桥接成给 AI 用的工具**�
 
 ## 安装
 
-需要本机有 `freecadcmd`（FreeCAD ≥ 0.20）。装插件不等于装 FreeCAD——它是外部程序，213 MB 左右，不随 npm 包分发。
+需要本机有 `freecadcmd`（FreeCAD ≥ 0.20）。装插件不等于装 FreeCAD——它是外部程序，200 MB 上下，不随 npm 包分发。Linux / macOS / Windows 都一样：先有 FreeCAD，再让插件找到它。
 
 装法二选一：
 
-1. **让面板装**：打开右栏「CAD 工作室」→ 信息（i）→ 看到黄框点「自动安装 FreeCAD」。后端 `cad_studio_setup` 会自动识别 apt / dnf / pacman / brew 并执行（apt 需要 root）。
-2. **自己装**：`apt install freecad`，然后在插件配置里留空 `freecadPath`（自动探测 `/usr/bin/freecadcmd` 等 5 个位置）或显式指定。
+1. **让面板装**：打开右栏「CAD 工作室」→ 信息（i）→ 看到黄框点「自动安装 FreeCAD」。后端 `cad_studio_setup` 按平台识别包管理器并执行：Linux 用 apt / dnf / pacman（apt 需要 root）、macOS 用 brew、Windows 用 winget 或 choco（winget 装在用户态，不需要管理员）。
+2. **自己装**：下面的命令装完后，插件配置里 `freecadPath` 留空即可——它自己按平台去找（Linux `/usr/bin`、`/usr/local/bin`、`/opt/freecad/bin`、`/snap/bin`、`/usr/lib/freecad*/bin`；macOS 的 `FreeCAD.app/Contents/MacOS/FreeCADCmd` 与 Homebrew；Windows 的 `C:\Program Files\FreeCAD*\bin\freecadcmd.exe`、`%LOCALAPPDATA%\Programs\FreeCAD\bin`、PATH）。
+
+```bash
+# Linux
+apt install freecad        # Debian/Ubuntu；Fedora: dnf install freecad；Arch: pacman -S freecad
+# macOS
+brew install --cask freecad
+```
+```powershell
+# Windows（任选其一；装完不用配路径，插件会扫 C:\Program Files\FreeCAD*\bin）
+winget install --id FreeCAD.FreeCAD -e --accept-package-agreements --accept-source-agreements
+choco install freecad -y
+```
 
 ```bash
 # 从 npm 装（推荐）
@@ -69,6 +81,24 @@ npm 包：<https://www.npmjs.com/package/dsh-cad-studio>（`dsh plugin` / DSH �
 | `trustedHosts` | `[]` | 额外允许访问 `/cad-studio/*` 的主机名（本机回环默认允许） |
 
 `autoOpen: 'session'` 的判据是宿主侧的两个信号：这个会话最近一次发布过场景（`lastSession`），或它拥有更早发布过的场景。也就是说——只有真正在这里建过模的对话，右栏才会自动让出位置；别的对话不受打扰。
+
+## Windows 支持（0.36.0）
+
+Windows 上插件的差别只有三处，都在 host 侧，面板 UI 完全一样：
+
+- **找 FreeCAD**：按 `ProgramW6432` / `ProgramFiles` / `ProgramFiles(x86)` 扫 `FreeCAD*\bin\freecadcmd.exe`（版本号目录名会变，所以按前缀扫而不是写死 `FreeCAD 0.20`），另加 `%LOCALAPPDATA%\Programs\FreeCAD\bin` 与 PATH（Windows 上用 `;` 分隔，并补 `.exe/.cmd/.bat` 后缀）。找不到时的提示会给出 `C:\Program Files\FreeCAD 0.20\bin\freecadcmd.exe` 这样的具体位置，而不是一句 "not found"。
+- **跑子进程**：加 `windowsHide`（否则每次建模都闪一个黑框）；超时不是 `SIGKILL` 而是 `taskkill /pid <pid> /T /F`——`freecadcmd.exe` 会派生 Python 子进程，只杀父进程会留下孤儿继续吃 CPU。
+- **包管理器**：`winget` / `choco` 被认成可选安装器，面板的「自动安装 FreeCAD」在 Windows 上走它们。
+
+在真的 Windows 机器上核对发现路径：
+
+```powershell
+node test\win-probe.mjs
+```
+
+它打印 `platform` / `searchDirs()` / 找到的 `binary` / doctor 的每一行。没装 FreeCAD 也应该能跑通（`available: false` + 提示里有路径），说明插件本身在 Windows 上是活的。
+
+已知限制：Windows 上没有做过的验证项（Win10 21H2 以上、无管理员权限、非 C 盘安装）会在你遇到时按上面的提示报出来；`winget` 依赖 App Installer 版本，太老的系统里 `winget --version` 会失败，面板会退回提示手动安装。
 
 ## 子形状选择器
 

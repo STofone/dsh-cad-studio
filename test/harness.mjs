@@ -9,7 +9,7 @@ import { readFile, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { copyFileSync, existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
-import { apply } from '../index.js'
+import { apply, __binSearch } from '../index.js'
 
 const tools = new Map()
 let handler = null
@@ -1942,6 +1942,29 @@ endsolid t
   const sceneMeta = sceneId ? JSON.parse((await hit(`/cad-studio/scene/${sceneId}`)).body) : {}
   ok('paramdoc: the published scene carries the descriptions', sceneMeta?.paramMeta?.['高']?.description === '面板写的说明', JSON.stringify(sceneMeta?.paramMeta))
   await call('cad_studio_doc', { action: 'delete', name }).catch(() => {})
+}
+
+// ---- 8e. windows compatibility -----------------------------------------
+{
+  // Discovery is pure over (platform, env), so the Windows rules can be pinned
+  // here instead of "it should be fine on Windows".
+  const fake = { ProgramFiles: 'C:\\Program Files', LOCALAPPDATA: 'C:\\Users\\tester\\AppData\\Local' }
+  const dirs = __binSearch.searchDirs('win32', fake)
+  ok('win: looks under Program Files\\FreeCAD\\bin', dirs.includes('C:\\Program Files\\FreeCAD\\bin'), JSON.stringify(dirs))
+  ok('win: looks under LOCALAPPDATA Programs', dirs.some((d) => d.endsWith('Programs\\FreeCAD\\bin')), JSON.stringify(dirs))
+  ok('win: uses backslashes only', dirs.every((d) => !d.includes('/') && /^[A-Za-z]:\\/.test(d)), JSON.stringify(dirs))
+  ok('win: expects freecadcmd.exe', __binSearch.BINARY_NAMES('win32').includes('freecadcmd.exe'), __binSearch.BINARY_NAMES('win32').join(','))
+  ok('linux: expects freecadcmd without .exe', __binSearch.BINARY_NAMES('linux').join(',') === 'freecadcmd,FreeCADCmd', __binSearch.BINARY_NAMES('linux').join(','))
+  const winPathDirs = __binSearch.pathDirs('win32', { PATH: 'C:\\Tools;C:\\FreeCAD\\bin' })
+  ok('win: PATH splits on semicolon', winPathDirs.length === 2 && winPathDirs[1] === 'C:\\FreeCAD\\bin', JSON.stringify(winPathDirs))
+  const posixPathDirs = __binSearch.pathDirs('linux', { PATH: '/usr/bin:/opt/bin' })
+  ok('linux: PATH splits on colon', posixPathDirs.length === 2 && posixPathDirs[1] === '/opt/bin', JSON.stringify(posixPathDirs))
+  // No such binary on this box — the point is that it answers instead of throwing.
+  ok('win: probing a missing install returns undefined', __binSearch.probeBinary(undefined, 'win32', fake) === undefined, 'threw or found something')
+  ok('win: commandExists does not throw on a bare PATH', __binSearch.commandExists('winget', 'win32', { PATH: 'C:\\nothing' }) === false, 'not false')
+  const winget = __binSearch.PACKAGERS.find((p) => p.id === 'winget')
+  ok('win: winget is a windows-only packager', winget?.platform === 'win32' && winget.args.includes('FreeCAD.FreeCAD'), JSON.stringify(winget?.args))
+  ok('win: linux packagers are marked linux', __binSearch.PACKAGERS.filter((p) => ['apt', 'dnf', 'pacman'].includes(p.id)).every((p) => p.platform === 'linux'), 'missed a platform tag')
 }
 
 // ---- 9. teardown --------------------------------------------------------
