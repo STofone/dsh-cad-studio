@@ -26,6 +26,10 @@ apply(ctx, {})
 
 let pass = 0
 const fail = []
+// Fixtures follow the platform: /tmp does not exist on Windows and a hardcoded
+// POSIX path made every file-based case fail there.
+const TMPROOT = tmpdir().replace(/\\/g, '/')
+
 const ok = (name, cond, detail = '') => {
   if (cond) { pass++; console.log(`PASS  ${name}${detail ? '  ' + detail : ''}`) }
   else { fail.push(name); console.log(`FAIL  ${name}  ${detail}`) }
@@ -63,7 +67,7 @@ ok('every tool has an output schema', [...tools.values()].every((d) => d.output?
 // ---- 1. env -------------------------------------------------------------
 const env = await call('cad_studio_env')
 ok('env.available', env.available === true, JSON.stringify(env))
-ok('env.binary is freecadcmd', /freecadcmd$/.test(env.binary), env.binary)
+ok('env.binary is freecadcmd', /freecadcmd(\.exe)?$/i.test(env.binary), env.binary)
 ok('env strings never null', typeof env.latest === 'string' && typeof env.binary === 'string')
 
 // ---- 2. run: primitive + scene publish ----------------------------------
@@ -92,11 +96,12 @@ ok('cut volume 43978.76', near(cut.volume, 43978.76, 1), String(cut.volume))
 ok('cut publishes scene-2', cut.sceneId === 'scene-2', String(cut.sceneId))
 
 // ---- 4. STEP export then open ------------------------------------------
+const partPath = `${TMPROOT}/harness_part.step`
 await call('cad_studio_run', {
-  code: "s = Part.makeBox(40,30,10)\ns.exportStep('/tmp/harness_part.step')\n__out = {'ok': True, 'path': '/tmp/harness_part.step'}",
+  code: 's = Part.makeBox(40,30,10)\ns.exportStep(' + JSON.stringify(partPath) + ")\n__out = {'ok': True, 'path': " + JSON.stringify(partPath) + '}',
   title: 'harness-export',
 })
-const opened = await call('cad_studio_open', { path: '/tmp/harness_part.step' })
+const opened = await call('cad_studio_open', { path: `${TMPROOT}/harness_part.step` })
 ok('open ok', opened.ok === true, JSON.stringify(opened).slice(0, 200))
 ok('open volume 12000', near(opened.volume, 12000, 1), String(opened.volume))
 ok('open triangles > 0', opened.triangles > 0, String(opened.triangles))
@@ -107,7 +112,7 @@ const badPy = await call('cad_studio_run', { code: 'raise RuntimeError("boom")\n
 ok('python error returns ok:false', badPy.ok === false, JSON.stringify(badPy).slice(0, 160))
 ok('python error carries stderr', typeof badPy.stderr === 'string' && badPy.stderr.includes('boom'))
 
-const badOpen = await call('cad_studio_open', { path: '/tmp/does-not-exist.step' })
+const badOpen = await call('cad_studio_open', { path: `${TMPROOT}/does-not-exist.step` })
 ok('missing file returns ok:false', badOpen.ok === false, JSON.stringify(badOpen).slice(0, 160))
 
 // env must still work after failures (bridge not wedged)
@@ -239,7 +244,7 @@ const post = async (url, bodyObj, host = '127.0.0.1:3180') => {
   return out
 }
 
-const openedRoute = await post('/cad-studio/open', { path: '/tmp/harness_part.step' })
+const openedRoute = await post('/cad-studio/open', { path: `${TMPROOT}/harness_part.step` })
 const openedJson = JSON.parse(openedRoute.body || '{}')
 ok('POST /open 200', openedRoute.status === 200, `status=${openedRoute.status} body=${openedRoute.body.slice(0, 120)}`)
 ok('POST /open publishes scene', openedJson.ok === true && /^scene-\d+$/.test(String(openedJson.sceneId)), JSON.stringify(openedJson).slice(0, 160))
@@ -247,7 +252,7 @@ ok('POST /open result lossless', lossless(openedJson) === null, String(lossless(
 
 const relPath = await post('/cad-studio/open', { path: 'relative/x.step' })
 ok('POST /open relative path 400', relPath.status === 400, String(relPath.status))
-const missing = await post('/cad-studio/open', { path: '/tmp/nope-xyz.step' })
+const missing = await post('/cad-studio/open', { path: `${TMPROOT}/nope-xyz.step` })
 ok('POST /open missing file 404', missing.status === 404, String(missing.status))
 const notFile = await post('/cad-studio/open', { path: '/tmp' })
 ok('POST /open directory 400', notFile.status === 400, String(notFile.status))
@@ -279,11 +284,11 @@ ok('no-scene carries hint', typeof noScene.hint === 'string' && noScene.hint.len
 
 // ---- 7f. unsupported file type + decoded FreeCAD errors -----------------
 {
-  const bad = await call('cad_studio_open', { path: '/tmp/whatever.FCStd' })
+  const bad = await call('cad_studio_open', { path: `${TMPROOT}/whatever.FCStd` })
   ok('open rejects .FCStd before spawning', bad.ok === false && /unsupported file type: \.fcstd/i.test(String(bad.error)), JSON.stringify(bad).slice(0, 200))
   ok('rejection carries supported-format hint', /step/.test(String(bad.hint)) && /stl/.test(String(bad.hint)), String(bad.hint).slice(0, 120))
 
-  const junk = '/tmp/harness_unknown_ext.unknown'
+  const junk = `${TMPROOT}/harness_unknown_ext.unknown`
   await writeFile(junk, 'not a cad file')
   const decoded = await call('cad_studio_run', {
     code: `import Part\ns = Part.Shape()\ns.read(${JSON.stringify(junk)})\nscene = s`,
@@ -536,7 +541,7 @@ endsolid t
 // ---- 7j2. assembly without an export target (publish only) ---------------
 {
   const asm2 = await call('cad_studio_assembly', {
-    parts: [{ name: 'p1', path: '/tmp/harness_part.step' }],
+    parts: [{ name: 'p1', path: `${TMPROOT}/harness_part.step` }],
     instances: [{ name: 'p1', part: 'p1', at: [0, 0, 0] }, { name: 'p2', part: 'p1', at: [50, 0, 0], rot: [0, 0, 45] }],
     title: 'no-target',
   })
@@ -547,15 +552,15 @@ endsolid t
 {
   const asm3 = await call('cad_studio_assembly', {
     parts: [
-      { name: 'used', path: '/tmp/harness_part.step' },
-      { name: 'unused', path: '/tmp/does-not-exist.step' },
+      { name: 'used', path: `${TMPROOT}/harness_part.step` },
+      { name: 'unused', path: `${TMPROOT}/does-not-exist.step` },
     ],
     instances: [{ name: 'a', part: 'used', at: [0, 0, 0] }],
     title: 'prune',
   })
   ok('assembly ignores unreferenced parts', asm3.ok === true && asm3.parts === 1, JSON.stringify({ ok: asm3.ok, parts: asm3.parts, err: asm3.error }))
   const asm4 = await call('cad_studio_assembly', {
-    parts: [{ name: 'p1', path: '/tmp/harness_part.step' }],
+    parts: [{ name: 'p1', path: `${TMPROOT}/harness_part.step` }],
     instances: [{ name: 'a', part: 'nope', at: [0, 0, 0] }],
   })
   ok('assembly names the unknown part', asm4.ok === false && /unknown parts: nope/.test(String(asm4.error)), String(asm4.error).slice(0, 50))
@@ -563,12 +568,12 @@ endsolid t
 
 // ---- 7j4. colours: host must not force one blue on every part -----------
 {
-  const opened = await call('cad_studio_open', { path: '/tmp/harness_part.step' })
+  const opened = await call('cad_studio_open', { path: `${TMPROOT}/harness_part.step` })
   const scene = await loadSceneGeom(opened.sceneId)
   const part = (scene.parts || [])[0]
   ok('open() leaves part colour to the client palette', part && part.color === undefined, JSON.stringify(part && part.color))
   const asmC = await call('cad_studio_assembly', {
-    parts: [{ name: 'p1', path: '/tmp/harness_part.step', color: [1, 0, 0] }],
+    parts: [{ name: 'p1', path: `${TMPROOT}/harness_part.step`, color: [1, 0, 0] }],
     instances: [{ name: 'a', part: 'p1', at: [0, 0, 0] }],
     title: 'colour',
   })
@@ -673,7 +678,7 @@ endsolid t
 
 // ---- 7k. model documents default to the calling session's workspace -----
 {
-  const ws = '/tmp/cad-studio-ws-test'
+  const ws = `${TMPROOT}/cad-studio-ws-test`
   rmSync(join(ws, 'cad-models'), { recursive: true, force: true })
   const sessionExec = { agent: { session: { header: { cwd: ws } } } }
   const script = 'import Part\nscene = Part.makeBox(10, 10, 10)'
@@ -688,9 +693,9 @@ endsolid t
   // An explicit modelsDir in the row config still wins over the session.
   const tools2 = new Map()
   const ctx2 = { logger: ctx.logger, effect: (fn) => fn(), get: () => undefined, tools: { register: (d) => { tools2.set(d.name, d); return () => {} } }, webServer: { register: () => () => {} } }
-  apply(ctx2, { modelsDir: '/tmp/cad-studio-explicit' })
+  apply(ctx2, { modelsDir: `${TMPROOT}/cad-studio-explicit` })
   const explicit = await tools2.get('cad_studio_doc').execute({ action: 'list' }, sessionExec)
-  ok('explicit modelsDir beats the session workspace', explicit.dir === '/tmp/cad-studio-explicit', String(explicit.dir))
+  ok('explicit modelsDir beats the session workspace', explicit.dir === `${TMPROOT}/cad-studio-explicit`, String(explicit.dir))
 }
 
 // ---- 7l. setup: report the binary, and install is a no-op when present --
@@ -1699,8 +1704,8 @@ endsolid t
     'b = Part.makeBox(60,40,20); b.translate(Vector(60,0,0))',
     'scene = a.fuse(b)',
   ].join('\n')
-  const raw = await call('cad_studio_export', { code: seam, target: '/tmp/harness_seam_raw.step', unify: false })
-  const uni = await call('cad_studio_export', { code: seam, target: '/tmp/harness_seam_uni.step' })
+  const raw = await call('cad_studio_export', { code: seam, target: `${TMPROOT}/harness_seam_raw.step`, unify: false })
+  const uni = await call('cad_studio_export', { code: seam, target: `${TMPROOT}/harness_seam_uni.step` })
   ok('export: unify merges coplanar seams', uni.ok === true && raw.ok === true && uni.faces < raw.faces,
     JSON.stringify({ raw: raw.faces, uni: uni.faces }))
   ok('export: volume is identical, so faces are the only tell',
@@ -1718,7 +1723,7 @@ endsolid t
   ok('doc: a script model publishes merged faces (not the raw fuse topology)',
     seamCreated.ok === true && seamCreated.faces === 6 && near(seamCreated.volume, 96000, 1),
     JSON.stringify({ faces: seamCreated.faces, v: seamCreated.volume }))
-  const seamExport = await call('cad_studio_export', { model: seamDoc, target: '/tmp/harness_seam_model.step' })
+  const seamExport = await call('cad_studio_export', { model: seamDoc, target: `${TMPROOT}/harness_seam_model.step` })
   ok('export: a document export reports solids/faces/fingerprint as well',
     seamExport.ok === true && seamExport.faces === 6 && seamExport.fingerprint && seamExport.fingerprint.faces === 6,
     JSON.stringify({ faces: seamExport.faces, fp: seamExport.fingerprint }))
@@ -1742,15 +1747,15 @@ endsolid t
 
   // ⑤ A STEP on disk could not become a document; now it can, and the path is
   //    kept in params so updates/exports keep working.
-  await call('cad_studio_export', { code: 'import Part\nscene = Part.makeBox(30,20,10)', target: '/tmp/harness_import.step' })
-  const imported = await call('cad_studio_doc', { action: 'create', name: 'harness_导入件', from: '/tmp/harness_import.step' })
+  await call('cad_studio_export', { code: 'import Part\nscene = Part.makeBox(30,20,10)', target: `${TMPROOT}/harness_import.step` })
+  const imported = await call('cad_studio_doc', { action: 'create', name: 'harness_导入件', from: `${TMPROOT}/harness_import.step` })
   ok('doc: create from a STEP file builds an import document',
     imported.ok === true && near(imported.volume, 6000, 1), JSON.stringify({ ok: imported.ok, v: imported.volume }))
   const impShown = await call('cad_studio_doc', { action: 'show', name: 'harness_导入件' })
   ok('doc: the import keeps its source path in params',
-    impShown.ok === true && impShown.params && impShown.params.source === '/tmp/harness_import.step',
+    impShown.ok === true && impShown.params && impShown.params.source === `${TMPROOT}/harness_import.step`,
     JSON.stringify(impShown.params))
-  const missingFrom = await call('cad_studio_doc', { action: 'create', name: 'harness_缺文件', from: '/tmp/definitely-not-here.step' })
+  const missingFrom = await call('cad_studio_doc', { action: 'create', name: 'harness_缺文件', from: `${TMPROOT}/definitely-not-here.step` })
   ok('doc: a missing import source is refused', missingFrom.ok === false && /找不到要导入的文件/.test(String(missingFrom.error)),
     JSON.stringify(missingFrom.error))
   await call('cad_studio_doc', { action: 'delete', name: 'harness_导入件' })

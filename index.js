@@ -18,7 +18,7 @@ import { existsSync, mkdirSync, readdirSync, rmSync, statSync, statfsSync, unwat
 import { win32 as winPath, posix as posixPath } from 'node:path'
 import crypto from 'node:crypto'
 import { mkdtemp, mkdir, readdir, readFile, rm, stat, unlink, writeFile } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
+import { homedir, tmpdir } from 'node:os'
 import { gzipSync } from 'node:zlib'
 import { fileURLToPath } from 'node:url'
 import { dirname, join, resolve } from 'node:path'
@@ -2540,7 +2540,12 @@ function sharedState(resolved, logger) {
 
 const MODELS_DIRNAME = 'cad-models'
 /** Fallback when neither config nor the session provides a workspace (e.g. a test stub). */
-const GLOBAL_MODELS_DIR = '/workspace/cad-models'
+// On POSIX the harness container keeps models at /workspace/cad-models, which is
+// also where an unconfigured session lands. Windows has no /workspace (it would
+// mean C:\workspace), so fall back to the user's home there.
+const GLOBAL_MODELS_DIR = process.platform === 'win32'
+  ? join(homedir(), 'cad-models')
+  : '/workspace/cad-models'
 
 /** The calling session's workspace directory, when the runtime exposes one. */
 function sessionWorkspace(exec) {
