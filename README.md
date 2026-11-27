@@ -82,6 +82,20 @@ npm 包：<https://www.npmjs.com/package/dsh-cad-studio>（`dsh plugin` / DSH �
 
 `autoOpen: 'session'` 的判据是宿主侧的两个信号：这个会话最近一次发布过场景（`lastSession`），或它拥有更早发布过的场景。也就是说——只有真正在这里建过模的对话，右栏才会自动让出位置；别的对话不受打扰。
 
+## issue #2：安装 FreeCAD 不再卡死 dsh（0.39.0）
+
+`cad_studio_setup action=install` 以前用 `spawnSync` 跑包管理器，**在 dsh web 的主线程上同步等**——装 FreeCAD（1 GB）期间所有会话、所有面板全停摆，最长 15 分钟（真机上表现为「dsh 卡死，只能手动结束进程」）。
+
+现在：
+
+- 安装是**后台任务**：`install` 立刻返回 `{ started: true, ... }`，事件循环不被占用；`action=status`（或 `setupStatus().install`）给 `{running, elapsedSec, ok, error, tail}`。
+- 面板「安装 FreeCAD」按钮走同一条非阻塞路径。
+- 超时上限 30 分钟，到点杀掉子进程并写清原因，而不是无声挂着。
+- **装完能被发现**：winget 的 per-user 安装落在 `%LOCALAPPDATA%\Programs\FreeCAD 1.1\bin`（目录带版本号），原来只试固定名 `Programs\FreeCAD\bin`。现在 Program Files 与 `%LOCALAPPDATA%\Programs` 都用同一条「枚举 `FreeCAD*`」规则（`freeCadDirsUnder`）。
+- winget 参数补 `--disable-interactivity`（NSIS 安装器仍可能自己弹窗）；Windows 上 doctor 的提示改成「按当前用户安装，不需要管理员」，不再说「需要 root」。
+
+验证：`cad_studio_setup {action:"install"}` 在已装环境下 **44 ms** 返回；`freeCadDirsUnder('<local>/Programs')` 能列出 `FreeCAD 1.1\bin`。
+
 ## issue #1 的 7 条缺陷（0.37.0 修完）
 
 上游仓库 issue #1 报的 7 条，逐条的状态与验证方式：

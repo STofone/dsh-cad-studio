@@ -90,7 +90,7 @@ const PACKAGERS = [
   // `winget source update` first: a fresh Windows has an empty source index and
   // `winget install` answers "No package found matching input criteria" until it
   // has been refreshed once (measured on Windows 11 26200, winget 1.11.510).
-  { id: 'winget', platform: 'win32', probe: null, cmd: 'winget', args: ['install', '--id', 'FreeCAD.FreeCAD', '-e', '--source', 'winget', '--accept-package-agreements', '--accept-source-agreements', '--silent'], update: ['source', 'update'], hint: 'winget install --id FreeCAD.FreeCAD -e' },
+  { id: 'winget', platform: 'win32', probe: null, cmd: 'winget', args: ['install', '--id', 'FreeCAD.FreeCAD', '-e', '--source', 'winget', '--accept-package-agreements', '--accept-source-agreements', '--silent', '--disable-interactivity'], update: ['source', 'update'], hint: 'winget install --id FreeCAD.FreeCAD -e' },
   { id: 'choco', platform: 'win32', probe: null, cmd: 'choco', args: ['install', 'freecad', '-y', '--no-progress'], update: null, hint: 'choco install freecad -y' },
 ]
 
@@ -140,6 +140,7 @@ function setupStatus(bridge, { withVersion = true } = {}) {
     reason: bin ? '' : (packager
       ? (canInstall ? '' : '当前进程不是 root，无法自动装包；用 root 执行上面的命令或设置 freecadPath')
       : '没找到包管理器（apt/dnf/pacman/brew/winget/choco 都没有）；手动安装 FreeCAD 后设置 freecadPath'),
+    install: installSummary(),
   }
 }
 
@@ -160,7 +161,9 @@ function diagnose(bridge, cfg = {}) {
     ok: kernel.available === true,
     detail: kernel.available ? [kernel.binary, kernel.version].filter(Boolean).join(' · ') : '没有找到 freecadcmd',
     fix: kernel.available ? '' : (kernel.canInstall
-      ? '点「安装 FreeCAD」自动装（需要 root），或手动执行：' + (kernel.command || 'apt install freecad')
+      ? (process.platform === 'win32'
+        ? '点「安装 FreeCAD」自动装（winget 按当前用户安装，不需要管理员），或手动执行：'
+        : '点「安装 FreeCAD」自动装（需要 root），或手动执行：') + (kernel.command || 'apt install freecad')
       : (kernel.reason || '请手动安装 FreeCAD，再把 freecadPath 指到 freecadcmd')),
     action: kernel.available ? '' : (kernel.canInstall ? 'install' : ''),
     packageManager: kernel.packageManager || '',
@@ -256,24 +259,80 @@ const renderDoctor = (v) => {
   return lines.join('\n')
 }
 
-function installFreeCad(bridge, { timeoutMs = 900000 } = {}) {
+// Installing is a background job, never a call that sits on the event loop.
+// `spawnSync` here froze every HTTP/SSE route and every session for the whole
+// download (up to 15 minutes, see issue #2) -- a GUI that looks dead. The tool
+// and the panel button return immediately and the caller polls the status.
+let installJob = null
+
+function installSummary() {
+  if (!installJob) return null
+  return {
+    running: installJob.running,
+    startedAt: new Date(installJob.startedAt).toISOString(),
+    elapsedSec: Math.round((Date.now() - installJob.startedAt) / 1000),
+    ok: installJob.ok,
+    error: installJob.error ?? '',
+    tail: installJob.log.slice(-1200),
+  }
+}
+
+function startInstallFreeCad(bridge, { timeoutMs = 1800000 } = {}) {
   const before = setupStatus(bridge)
-  if (before.available) return { ok: true, alreadyInstalled: true, ...before, log: '' }
+  if (before.available) return { ok: true, started: false, alreadyInstalled: true, ...before, install: installSummary() }
+  if (installJob?.running) {
+    return { ok: true, started: false, running: true, ...before, install: installSummary(), reason: '已经在安装了，用 action=status 看进度' }
+  }
   const packager = findPackager()
-  if (!packager) return { ok: false, ...before, log: '' }
+  if (!packager) return { ok: false, started: false, ...before, install: installSummary() }
   if (packager.id === 'apt' && typeof process.getuid === 'function' && process.getuid() !== 0) {
-    return { ok: false, ...before, log: '' }
+    return { ok: false, started: false, ...before, install: installSummary(), reason: 'apt 需要 root；用 root 执行上面的命令，或设置 freecadPath' }
   }
-  const chunks = []
-  const run = (args) => {
-    const res = spawnSync(packager.cmd, args, { encoding: 'utf8', timeout: timeoutMs, windowsHide: true })
-    chunks.push(`$ ${packager.cmd} ${args.join(' ')}\n${res.stdout || ''}${res.stderr || ''}`)
-    return res
+  const job = { running: true, startedAt: Date.now(), log: '', ok: null, error: null, child: null, timer: null }
+  installJob = job
+  const steps = packager.update ? [packager.update, packager.args] : [packager.args]
+  const finish = (err) => {
+    if (!job.running) return
+    job.running = false
+    if (job.timer) clearTimeout(job.timer)
+    try { job.child?.kill() } catch {}
+    const after = setupStatus(bridge)
+    job.ok = !err && after.available
+    job.error = err ? String(err?.message ?? err) : (after.available ? '' : '安装进程结束，但仍找不到 freecadcmd（见下面的日志）')
+    job.log += `\n[完成] ${job.ok ? 'ok' : 'failed'}：${job.error || 'freecadcmd 可用'}\n`
   }
-  if (packager.update) run(packager.update)
-  const res = run(packager.args)
-  const after = setupStatus(bridge)
-  return { ok: after.available, ...after, log: chunks.join('\n').slice(-4000) }
+  const step = (index) => {
+    if (index >= steps.length) return finish(null)
+    const args = steps[index]
+    job.log += `$ ${packager.cmd} ${args.join(' ')}\n`
+    const child = spawn(packager.cmd, args, { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] })
+    job.child = child
+    const onData = (buf) => { job.log = (job.log + String(buf)).slice(-20000) }
+    child.stdout?.on('data', onData)
+    child.stderr?.on('data', onData)
+    child.on('error', (err) => finish(err))
+    child.on('close', (code) => (code === 0 ? step(index + 1) : finish(new Error(`包管理器退出码 ${code}`))))
+  }
+  job.timer = setTimeout(() => finish(new Error(`超过 ${Math.round(timeoutMs / 60000)} 分钟未完成，已结束`)), timeoutMs)
+  job.timer?.unref?.()
+  step(0)
+  return { ok: true, started: true, ...setupStatus(bridge), install: installSummary() }
+}
+
+/**
+ * `...\Programs\FreeCAD\bin` plus every versioned sibling (`FreeCAD 1.1`).
+ * Installers name the folder after the version, so a fixed name misses the
+ * install that just succeeded -- measured on a winget per-user install
+ * (issue #2). Split out so the enumeration is testable off Windows.
+ */
+function freeCadDirsUnder(programs, j = joinFor()) {
+  const out = [j(programs, 'FreeCAD', 'bin')]
+  try {
+    for (const entry of readdirSync(programs)) {
+      if (/^FreeCAD/i.test(entry)) out.push(j(programs, entry, 'bin'))
+    }
+  } catch {}
+  return out
 }
 
 /** The console binary is called differently (and lives elsewhere) per platform. */
@@ -292,14 +351,12 @@ function searchDirs(platform = process.platform, env = process.env) {
     const out = []
     const roots = [env.ProgramW6432, env.ProgramFiles, env['ProgramFiles(x86)']].filter(Boolean)
     for (const root of roots) {
-      out.push(j(root, 'FreeCAD', 'bin'))
-      try {
-        for (const entry of readdirSync(root)) {
-          if (/^FreeCAD/i.test(entry)) out.push(j(root, entry, 'bin'))
-        }
-      } catch {}
+      out.push(...freeCadDirsUnder(root, j))
     }
-    if (env.LOCALAPPDATA) out.push(j(env.LOCALAPPDATA, 'Programs', 'FreeCAD', 'bin'))
+    // winget's per-user install lands in `%LOCALAPPDATA%\Programs\FreeCAD 1.1\bin`
+    // -- the folder carries the version, so a fixed name silently misses the
+    // install that just succeeded (issue #2).
+    if (env.LOCALAPPDATA) out.push(...freeCadDirsUnder(j(env.LOCALAPPDATA, 'Programs'), j))
     return [...new Set(out)]
   }
   if (platform === 'darwin') {
@@ -2919,7 +2976,7 @@ __out = {
     parameters: {
       type: 'object',
       properties: {
-        action: { type: 'string', enum: ['check', 'install'], description: 'check (default) or install.' },
+        action: { type: 'string', enum: ['check', 'install', 'status'], description: 'check (default), install (starts a background install and returns at once), or status (progress of that install).' },
       },
       additionalProperties: false,
     },
@@ -2943,7 +3000,7 @@ __out = {
     },
     execute: async (args) => {
       if ((args.action || 'check') === 'install') {
-        const out = installFreeCad(bridge)
+        const out = startInstallFreeCad(bridge)
         const clean = { ...out }
         for (const key of ['log', 'reason']) if (!clean[key]) delete clean[key]
         clean.installed = Boolean(clean.available) && !clean.alreadyInstalled
@@ -6372,7 +6429,7 @@ __out = {"ok": True, "exported": ${JSON.stringify(target)}, "volume": round(scen
         // both report identical fields.
         let action = 'check'
         try { action = (await bodyOf()).action || 'check' } catch {}
-        const out = action === 'install' ? installFreeCad(bridge) : setupStatus(bridge)
+        const out = action === 'install' ? startInstallFreeCad(bridge) : setupStatus(bridge)
         return send(200, JSON.stringify(out))
       }
 
@@ -6587,4 +6644,4 @@ __out = {"ok": True, "exported": ${JSON.stringify(target)}, "volume": round(scen
 
 // Test seam: the platform-dependent discovery is pure over (platform, env), so
 // the suite can assert the Windows rules without a Windows box.
-export const __binSearch = { searchDirs, pathDirs, probeBinary, commandExists, BINARY_NAMES, PACKAGERS }
+export const __binSearch = { freeCadDirsUnder, searchDirs, pathDirs, probeBinary, commandExists, BINARY_NAMES, PACKAGERS }

@@ -1,6 +1,6 @@
 {
   "name": "dsh-cad-studio",
-  "version": "0.38.0",
+  "version": "0.39.0",
   "type": "module",
   "description": "CAD Studio — FreeCAD 桥（给 AI 的 14 个工具）+ Web 右栏 3D 面板：建模/装配/关节运动/出图/多页签查看",
   "exports": {

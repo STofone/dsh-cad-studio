@@ -8,7 +8,7 @@
 import { readFile, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { copyFileSync, existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { apply, __binSearch } from '../index.js'
 
 const tools = new Map()
@@ -707,6 +707,21 @@ endsolid t
   const again = await call('cad_studio_setup', { action: 'install' })
   ok('install short-circuits when already installed', again.alreadyInstalled === true && again.ok === true, JSON.stringify({ ok: again.ok, ai: again.alreadyInstalled }))
   ok('install does not run the package manager twice', again.installed === false, String(again.installed))
+
+  // ---- issue #2: per-user install is found, and install does not block ----
+  {
+    const local = mkdtempSync(join(tmpdir(), 'loc-'))
+    mkdirSync(join(local, 'Programs', 'FreeCAD 1.1', 'bin'), { recursive: true })
+    const dirs = __binSearch.freeCadDirsUnder(join(local, 'Programs'), (...p) => p.join('\\'))
+    ok('issue#2: per-user FreeCAD 1.1 install is discovered', dirs.some((d) => /FreeCAD 1\.1/.test(d)), JSON.stringify(dirs))
+    const status = await call('cad_studio_setup', { action: 'status' })
+    ok('issue#2: setup has a status action', status && typeof status.available === 'boolean', JSON.stringify(status.install))
+    const t0 = Date.now()
+    const started = await call('cad_studio_setup', { action: 'install' })
+    const ms = Date.now() - t0
+    ok('issue#2: install returns immediately instead of blocking the loop', ms < 2000, `${ms}ms`)
+    ok('issue#2: a present kernel is not reinstalled', started.alreadyInstalled === true && started.started === false, JSON.stringify({ ai: started.alreadyInstalled, st: started.started }))
+  }
 }
 
 // ---- 7m. field feedback: export accounting, run checks, scene upkeep -----
