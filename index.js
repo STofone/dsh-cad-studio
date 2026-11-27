@@ -3071,6 +3071,14 @@ if not _shapes:
 `
   }
 
+  // Tools that take (source | code) also accept `model`: the geometry already
+  // lives in a saved document, and making callers rebuild it from a file path is
+  // how the same shape ends up described twice.
+  const srcFrom = async ({ source, code, model }) => {
+    if (typeof model === 'string' && model) return (await modelShapes(model)) || null
+    return shapesFrom({ source, code })
+  }
+
   const writeShapeFile = (target, src, opts = {}) => {
     const minVolume = Number.isFinite(opts.minVolume) && opts.minVolume > 0 ? Number(opts.minVolume) : 0
     const alsoStl = Boolean(opts.alsoStl)
@@ -3189,7 +3197,7 @@ else:
         const exported = await exportModelStep(doc, target, { unify })
         return { ...exported, source: `model:${model}` }
       }
-      const src = shapesFrom({ source, code })
+      const src = await srcFrom({ source, code, model })
       if (!src) return { ok: false, error: 'pass either source (a model file) or code (FreeCAD Python)' }
       const out = await writeShapeFile(target, src, { minVolume, alsoStl, unify })
       // Keep the two numbers apart on purpose: `volume` is what was written,
@@ -3494,6 +3502,7 @@ __out = {"ok": True, "path": _side, "bytes": os.path.getsize(_side)}
       properties: {
         source: { type: 'string', description: 'Existing model file (STEP/IGES/BREP/STL).' },
         code: { type: 'string', description: 'FreeCAD Python that binds `scene` or `export_shapes`.' },
+        model: { type: 'string', description: 'Saved document name (measure the geometry without exporting a file first).' },
         from: { type: 'array', items: { type: 'number' }, description: 'First point [x,y,z] for a distance measurement.' },
         to: { type: 'array', items: { type: 'number' }, description: 'Second point [x,y,z].' },
         density: { type: 'number', description: 'Material density in g/cm3 (e.g. 2.70 aluminium, 1.24 PLA, 7.85 steel) — adds mass in grams.' },
@@ -3504,9 +3513,9 @@ __out = {"ok": True, "path": _side, "bytes": os.path.getsize(_side)}
       schema: { type: 'object', properties: { ok: { type: 'boolean' }, volume: { type: 'number' }, area: { type: 'number' } } },
       render: (_a, v) => [{ type: 'text', text: JSON.stringify(v, null, 2) }],
     },
-    execute: async ({ source, code, from, to, density }) => {
-      if (!source && !code) return { ok: false, error: 'pass either source (a model file) or code (FreeCAD Python)' }
-      const src = shapesFrom({ source, code })
+    execute: async ({ source, code, model, from, to, density }) => {
+      if (!source && !code && !model) return { ok: false, error: 'pass source (a model file), model (a saved document) or code (FreeCAD Python)' }
+      const src = await srcFrom({ source, code, model })
       const pair = Array.isArray(from) && Array.isArray(to) && from.length === 3 && to.length === 3
       const py = `${PRELUDE}
 ${src}
@@ -3545,6 +3554,7 @@ ${pair ? `    __out["distance"] = round((FreeCAD.Vector(${JSON.stringify(from)})
       properties: {
         source: { type: 'string', description: 'Existing model file (STEP/IGES/BREP/STL).' },
         code: { type: 'string', description: 'FreeCAD Python that binds `scene` or `export_shapes`.' },
+        model: { type: 'string', description: 'Saved document name (check the geometry without exporting a file first).' },
         minVolume: { type: 'number', description: 'Flag solids below this volume in mm3 as suspicious (default 0.001).' },
       },
       additionalProperties: false,
@@ -3553,10 +3563,10 @@ ${pair ? `    __out["distance"] = round((FreeCAD.Vector(${JSON.stringify(from)})
       schema: { type: 'object', properties: { ok: { type: 'boolean' }, problems: { type: 'array', items: { type: 'string' } } } },
       render: (_a, v) => [{ type: 'text', text: JSON.stringify(v, null, 2) }],
     },
-    execute: async ({ source, code, minVolume }) => {
-      if (!source && !code) return { ok: false, error: 'pass either source (a model file) or code (FreeCAD Python)' }
+    execute: async ({ source, code, model, minVolume }) => {
+      if (!source && !code && !model) return { ok: false, error: 'pass source (a model file), model (a saved document) or code (FreeCAD Python)' }
       const floor = Number.isFinite(minVolume) ? Number(minVolume) : 0.001
-      const src = shapesFrom({ source, code })
+      const src = await srcFrom({ source, code, model })
       // Volume 0 with ShapeType "Solid" is a real failure mode on this kernel
       // (lofting two faces, revolving about an axis perpendicular to the profile),
       // so a file that opens and has faces can still be unprintable. Say it here.
@@ -3618,6 +3628,7 @@ __out = {
       properties: {
         source: { type: 'string', description: 'Existing model file (STEP/IGES/BREP).' },
         code: { type: 'string', description: 'FreeCAD Python that binds `scene` or `export_shapes`.' },
+        model: { type: 'string', description: 'Saved document name.' },
         target: { type: 'string', description: 'Absolute path: .dxf (polylines) or .svg (outline).' },
         deflection: { type: 'number', description: 'Curve sampling for the outline, mm (default 0.25).' },
         holes: { type: 'boolean', description: 'Include inner wires (holes) as separate closed outlines (default true).' },
@@ -3628,11 +3639,11 @@ __out = {
       schema: { type: 'object', properties: { ok: { type: 'boolean' }, unfolded: { type: 'number' }, areaModel: { type: 'number' }, areaFlat: { type: 'number' }, curvedSkipped: { type: 'number' }, target: { type: 'string' } } },
       render: (_a, v) => [{ type: 'text', text: JSON.stringify(v, null, 2) }],
     },
-    execute: async ({ source, code, target, deflection = 0.25, holes = true }) => {
-      if (!source && !code) return { ok: false, error: 'pass either source (a model file) or code (FreeCAD Python)' }
+    execute: async ({ source, code, model, target, deflection = 0.25, holes = true }) => {
+      if (!source && !code && !model) return { ok: false, error: 'pass source (a model file), model (a saved document) or code (FreeCAD Python)' }
       const absTarget = target ? String(target) : ''
       if (absTarget && !(absTarget.startsWith('/') || /^[A-Za-z]:[\\/]/.test(absTarget))) return { ok: false, error: 'target must be an absolute path' }
-      const src = shapesFrom({ source, code })
+      const src = await srcFrom({ source, code, model })
       const py = `${PRELUDE}
 ${src}
 _DEFL = float(${Number.isFinite(deflection) ? deflection : 0.25})
@@ -3867,15 +3878,15 @@ __out = _out
       schema: { type: 'object', properties: { ok: { type: 'boolean' }, facets: { type: 'number' }, points: { type: 'number' }, bytes: { type: 'number' } } },
       render: (_a, v) => [{ type: 'text', text: JSON.stringify(v, null, 2) }],
     },
-    execute: async ({ source, code, target, deflection, angular, targetSize, fillHoles, repair }) => {
-      if (!source && !code) return { ok: false, error: 'pass either source (a model file) or code (FreeCAD Python)' }
+    execute: async ({ source, code, model, target, deflection, angular, targetSize, fillHoles, repair }) => {
+      if (!source && !code && !model) return { ok: false, error: 'pass source (a model file), model (a saved document) or code (FreeCAD Python)' }
       if (!target) return { ok: false, error: 'target 是必填的：STL 写到哪里' }
       const defl = Number.isFinite(deflection) ? Number(deflection) : 0.2
       const ang = Number.isFinite(angular) ? Number(angular) : 0.5
       const size = Number.isInteger(targetSize) && targetSize > 0 ? targetSize : 0
       const hole = Number.isFinite(fillHoles) ? Math.max(0, Math.round(Number(fillHoles))) : 0
       const doRepair = repair !== false
-      const src = shapesFrom({ source, code })
+      const src = await srcFrom({ source, code, model })
       // Meshing is a different pipeline from the BRep checks: a shape can be a
       // valid solid and still mesh into duplicated points / flipped normals.
       const py = `${PRELUDE}
@@ -3932,6 +3943,7 @@ else:
         code: { type: 'string', description: 'FreeCAD Python that binds `scene` or `export_shapes`.' },
         axis: { type: 'string', enum: ['X', 'Y', 'Z'], description: 'Plane normal axis (default Z).' },
         at: { type: 'number', description: 'Plane offset along that axis, mm (default 0).' },
+        model: { type: 'string', description: 'Saved document name.' },
         target: { type: 'string', description: 'Write an SVG outline here (absolute path).' },
       },
       additionalProperties: false,
@@ -3940,11 +3952,11 @@ else:
       schema: { type: 'object', properties: { ok: { type: 'boolean' }, loops: { type: 'number' }, area: { type: 'number' }, perimeter: { type: 'number' }, rings: { type: 'array', description: 'Per-loop area/perimeter/centre and whether it is a hole' } } },
       render: (_a, v) => [{ type: 'text', text: JSON.stringify(v, null, 2) }],
     },
-    execute: async ({ source, code, axis = 'Z', at = 0, target }) => {
-      if (!source && !code) return { ok: false, error: 'pass either source (a model file) or code (FreeCAD Python)' }
+    execute: async ({ source, code, model, axis = 'Z', at = 0, target }) => {
+      if (!source && !code && !model) return { ok: false, error: 'pass source (a model file), model (a saved document) or code (FreeCAD Python)' }
       const absTarget = target ? String(target) : ''
       if (absTarget && !(absTarget.startsWith('/') || /^[A-Za-z]:[\\/]/.test(absTarget))) return { ok: false, error: 'target must be an absolute path' }
-      const src = shapesFrom({ source, code })
+      const src = await srcFrom({ source, code, model })
       const py = `${PRELUDE}
 ${src}
 _AX = ${JSON.stringify(String(axis || 'Z').toUpperCase())}
@@ -4561,6 +4573,10 @@ else:
         joint: moved.id,
         instance: moved.instance,
         value: round6(moved.value),
+        // The caller needs to know where the part ended up, not just the angle:
+        // a joint solved from a different pivot is visually obvious but silent.
+        translate: moved.translate ?? null,
+        rot: moved.rot ?? null,
         instances: published.stats.instances,
         volume: round6(published.stats.volume),
       }

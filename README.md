@@ -82,6 +82,22 @@ npm 包：<https://www.npmjs.com/package/dsh-cad-studio>（`dsh plugin` / DSH �
 
 `autoOpen: 'session'` 的判据是宿主侧的两个信号：这个会话最近一次发布过场景（`lastSession`），或它拥有更早发布过的场景。也就是说——只有真正在这里建过模的对话，右栏才会自动让出位置；别的对话不受打扰。
 
+## issue #1 的 7 条缺陷（0.37.0 修完）
+
+上游仓库 issue #1 报的 7 条，逐条的状态与验证方式：
+
+| # | 缺陷 | 处理 |
+|---|---|---|
+| 1 | Windows 上找不到 `freecadcmd`、也没有包管理器 | 0.36.0 发现路径 + winget/choco；真机 Windows 11 验证 `env.binary=C:\Program Files\FreeCAD 1.1\bin\freecadcmd.exe` |
+| 2 | 文本产物按系统码页写盘（中文 SVG 变乱码） | 所有文本走 `_write_text()`（UTF-8、`newline="\n"`），SVG 带 `<?xml version="1.0" encoding="UTF-8"?>` |
+| 3 | `sheet` 把圆弧拆成垃圾折线、尺寸全错 | 不再解析 `d=`：每个视图一个矩阵包住原样片段，圆弧/样条原样保留；回归断言 100×60 与 `<circle` 保留 |
+| 4 | `drawing` 视图被裁、前/右视转 90°、整图上下镜像 | 去掉整图 `scale(1,-1)`，每视图 `_view_place` 定位；前视 100×10、右视 60×10 成断言 |
+| 5 | `bounds` 用 `BoundBox` 偏大 | 11 处改 `optimalBoundingBox()`（干涉粗筛仍用 `BoundBox`，那是包络判断） |
+| 6 | `section` 把内孔也加进面积 | 按嵌套深度定符号，孔取负，并回报每环 `rings[{area,perimeter,center,hole}]` |
+| 7 | `mesh.fillHoles` 传 float 给 `fillupHoles(int)` | schema 改 `integer`，语义写明「按边数上限合并洞」，浮点会四舍五入 |
+
+附录 A 的工具面不一致也一并统一：`measure` / `check` / `section` / `unfold` 现在都接受 `model=`（不必先导出文件），`drawing` 也接受 `model=`；`cad_studio_drive` 的返回带上 `translate` / `rot`，能看出零件被驱动到哪里。
+
 ## Windows 支持（0.36.0）
 
 Windows 上插件的差别只有三处，都在 host 侧，面板 UI 完全一样：

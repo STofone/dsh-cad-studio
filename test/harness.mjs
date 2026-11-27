@@ -1996,6 +1996,18 @@ endsolid t
 
   const meas = await call('cad_studio_measure', { code: 'scene = Part.makeCylinder(10,10)' })
   ok('issue#5: bounds come from the optimal bbox (cyl r10 h10 → 20x20x10)', JSON.stringify(meas.size) === '[20,20,10]', JSON.stringify(meas.size))
+
+  // ---- appendix A: every measurement tool takes `model=` too -------------
+  await call('cad_studio_doc', { action: 'delete', name: 'appA' }).catch(() => {})
+  await call('cad_studio_doc', { action: 'create', name: 'appA', kind: 'features', features: [{ kind: 'box', size: [40, 20, 10] }] })
+  const mA = await call('cad_studio_measure', { model: 'appA' })
+  ok('appA: measure takes model=', Math.abs(mA.volume - 8000) < 1, JSON.stringify(mA.size))
+  const cA = await call('cad_studio_check', { model: 'appA' })
+  ok('appA: check takes model=', cA.ok === true && Array.isArray(cA.problems) && cA.problems.length === 0, JSON.stringify(cA.problems))
+  const sA = await call('cad_studio_section', { model: 'appA', axis: 'Z', at: 5 })
+  ok('appA: section takes model=', Math.abs(sA.area - 800) < 1, String(sA.area))
+  const dA = await call('cad_studio_unfold', { model: 'appA', target: join(tmpdir(), 'appA.dxf') })
+  ok('appA: unfold takes model=', dA.ok === true && dA.areaFlat > 0, String(dA.areaFlat))
 }
 
 // ---- 9. teardown --------------------------------------------------------
